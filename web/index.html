@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#181b1b" />
+    <meta name="description" content="A private, browser-based image editor. Your files stay on your device." />
+    <title>Pinta</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Pinta home">
+          <span class="brand-mark"><span></span><span></span><span></span><span></span></span>
+          <span>Pinta</span>
+        </a>
+        <div class="document-name" id="document-name">Untitled image</div>
+        <div class="top-actions">
+          <button class="icon-button" id="undo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled><i data-lucide="undo-2"></i></button>
+          <button class="icon-button" id="redo" title="Redo (Ctrl+Y)" aria-label="Redo" disabled><i data-lucide="redo-2"></i></button>
+          <span class="toolbar-divider"></span>
+          <button class="button button-secondary" id="open-file"><i data-lucide="folder-open"></i><span>Open</span></button>
+          <button class="button button-primary" id="save-file"><i data-lucide="download"></i><span>Export</span></button>
+        </div>
+      </header>
+
+      <main class="editor">
+        <aside class="tool-rail" aria-label="Drawing tools">
+          <div class="tool-group">
+            <button class="tool-button selected" data-tool="brush" title="Brush (B)" aria-label="Brush"><i data-lucide="brush"></i></button>
+            <button class="tool-button" data-tool="eraser" title="Eraser (E)" aria-label="Eraser"><i data-lucide="eraser"></i></button>
+            <span class="rail-divider"></span>
+            <button class="tool-button" data-tool="line" title="Line (L)" aria-label="Line"><i data-lucide="minus"></i></button>
+            <button class="tool-button" data-tool="rectangle" title="Rectangle (R)" aria-label="Rectangle"><i data-lucide="square"></i></button>
+            <button class="tool-button" data-tool="ellipse" title="Ellipse (O)" aria-label="Ellipse"><i data-lucide="circle"></i></button>
+          </div>
+          <div class="color-control">
+            <span class="rail-label">Color</span>
+            <label class="color-swatch" title="Choose a color">
+              <input id="color-picker" type="color" value="#e46f52" aria-label="Choose drawing color" />
+              <span id="color-preview"></span>
+            </label>
+            <div class="swatch-list" aria-label="Recent colors">
+              <button class="mini-swatch" data-color="#e46f52" style="--swatch:#e46f52" aria-label="Coral"></button>
+              <button class="mini-swatch" data-color="#ecc36a" style="--swatch:#ecc36a" aria-label="Gold"></button>
+              <button class="mini-swatch" data-color="#8ab49a" style="--swatch:#8ab49a" aria-label="Sage"></button>
+              <button class="mini-swatch" data-color="#f3f0e8" style="--swatch:#f3f0e8" aria-label="White"></button>
+            </div>
+          </div>
+          <div class="brush-control">
+            <label class="rail-label" for="brush-size">Size <output id="brush-size-value">8</output></label>
+            <input id="brush-size" type="range" min="1" max="80" value="8" aria-label="Brush size" />
+          </div>
+        </aside>
+
+        <section class="workspace" aria-label="Image workspace">
+          <div class="workspace-toolbar">
+            <div class="tool-context" id="tool-context">Brush <span>•</span> 8 px</div>
+            <div class="view-controls">
+              <button class="icon-button compact" id="zoom-out" title="Zoom out" aria-label="Zoom out"><i data-lucide="minus"></i></button>
+              <button class="zoom-label" id="zoom-fit" title="Fit image to workspace">Fit</button>
+              <button class="icon-button compact" id="zoom-in" title="Zoom in" aria-label="Zoom in"><i data-lucide="plus"></i></button>
+            </div>
+          </div>
+          <div class="stage" id="stage">
+            <div class="empty-state" id="empty-state">
+              <div class="empty-art" aria-hidden="true"><i data-lucide="image-plus"></i></div>
+              <h1>Start with an image</h1>
+              <p>Open an image from your device, or create a blank canvas.</p>
+              <div class="empty-actions">
+                <button class="button button-primary" id="empty-open"><i data-lucide="folder-open"></i><span>Open image</span></button>
+                <button class="button button-secondary" id="new-image"><i data-lucide="file-plus-2"></i><span>New canvas</span></button>
+              </div>
+              <span class="privacy-note"><i data-lucide="shield-check"></i> Files stay on your device</span>
+            </div>
+            <div class="paper-wrap" id="paper-wrap" hidden>
+              <div class="paper" id="paper">
+                <canvas id="image-canvas"></canvas>
+                <canvas id="preview-canvas"></canvas>
+              </div>
+            </div>
+            <input id="file-input" type="file" accept="image/*,.bmp" hidden />
+          </div>
+          <footer class="statusbar">
+            <span id="image-dimensions">No image</span>
+            <span class="status-spacer"></span>
+            <span class="status-dot"></span><span>Local only</span>
+          </footer>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="new-dialog" class="new-dialog">
+      <form id="new-form" method="dialog">
+        <div class="dialog-heading"><div><span class="eyebrow">NEW DOCUMENT</span><h2>Blank canvas</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-lucide="x"></i></button></div>
+        <div class="dimension-fields">
+          <label>Width <span class="number-field"><input name="width" type="number" min="1" max="10000" value="1200" required /><span>px</span></span></label>
+          <label>Height <span class="number-field"><input name="height" type="number" min="1" max="10000" value="800" required /><span>px</span></span></label>
+        </div>
+        <label class="background-choice">Background <select name="background"><option value="transparent">Transparent</option><option value="white">White</option></select></label>
+        <div class="dialog-actions"><button class="button button-secondary" value="cancel">Cancel</button><button class="button button-primary" id="create-canvas" value="create">Create canvas</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="export-dialog" class="new-dialog">
+      <form id="export-form" method="dialog">
+        <div class="dialog-heading"><div><span class="eyebrow">SAVE A COPY</span><h2>Export image</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-lucide="x"></i></button></div>
+        <label class="background-choice">File format <select name="format"><option value="image/png">PNG · transparent</option><option value="image/jpeg">JPEG · smaller file</option><option value="image/webp">WebP · smaller file</option></select></label>
+        <label class="background-choice">File name <span class="filename-field"><input name="filename" value="pinta-image" maxlength="120" required /><span id="export-extension">.png</span></span></label>
+        <p class="format-note" id="format-note">PNG preserves transparency and image detail.</p>
+        <div class="dialog-actions"><button class="button button-secondary" value="cancel">Cancel</button><button class="button button-primary" id="confirm-export" value="export"><i data-lucide="download"></i><span>Download</span></button></div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
