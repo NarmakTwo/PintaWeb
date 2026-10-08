@@ -264,6 +264,49 @@ test('scales a selection and deselects with Ctrl+D', async ({ page }) => {
   expect(center[1]).toBeLessThan(40);
 });
 
+test('shift during a scale or rotation constrains the original image', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  const fill = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(fill.x, fill.y);
+  await page.keyboard.press('Control+a');
+
+  await page.keyboard.down('Control');
+  const scaleStart = await paperPoint(page, 0.02, 0.5);
+  const scaleEnd = await paperPoint(page, 0.45, 0.5);
+  await page.mouse.move(scaleStart.x, scaleStart.y);
+  await page.mouse.down();
+  await page.mouse.move(scaleEnd.x, scaleEnd.y, { steps: 6 });
+  await page.keyboard.down('Shift');
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  await page.keyboard.up('Control');
+  const scaledEdge = await pixel(page, 0.5, 0);
+  expect(scaledEdge[3]).toBeLessThan(10);
+
+  await newCanvas(page);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  const refill = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(refill.x, refill.y);
+  await page.keyboard.press('Control+a');
+  await page.keyboard.down('Alt');
+  const rotateStart = await paperPoint(page, 0.9, 0.5);
+  const rotateEnd = await paperPoint(page, 0.9, 0.54);
+  await page.mouse.move(rotateStart.x, rotateStart.y);
+  await page.mouse.down();
+  await page.mouse.move(rotateEnd.x, rotateEnd.y, { steps: 4 });
+  await page.keyboard.down('Shift');
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  await page.keyboard.up('Alt');
+  const corner = await pixel(page, 0, 0);
+  expect(corner[0]).toBeGreaterThan(200);
+  expect(corner[3]).toBeGreaterThan(200);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

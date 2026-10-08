@@ -33,7 +33,7 @@ export const DEFAULT_PALETTE = [
 ];
 
 export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string; hint: string }[] = [
-  { id: 'move-pixels', label: 'Move Selected Pixels', shortcut: 'M', icon: 'move', hint: 'Drag to move the selection. Ctrl+drag scales it freely, Ctrl+Shift+drag scales it uniformly, Alt+drag rotates it, and Alt+Shift+drag rotates in 15° steps.' },
+  { id: 'move-pixels', label: 'Move Selected Pixels', shortcut: 'M', icon: 'move', hint: 'Drag to move the selection. Ctrl+drag scales it freely and Alt+drag rotates it. Hold Shift during either gesture to scale uniformly or rotate in 15° steps, measured from the image before the drag.' },
   { id: 'move-selection', label: 'Move Selection', shortcut: 'M', icon: 'move-diagonal', hint: 'Drag to move the selection outline without changing pixels.' },
   { id: 'zoom', label: 'Zoom', shortcut: 'Z', icon: 'zoom-in', hint: 'Click to zoom in. Alt-click or right-click to zoom out. Drag to zoom into a rectangle.' },
   { id: 'pan', label: 'Pan', shortcut: 'H', icon: 'hand', hint: 'Drag to move around the canvas. Hold Space to pan with any tool. Two fingers pan, and a pinch zooms.' },

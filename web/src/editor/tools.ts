@@ -192,7 +192,7 @@ export class ToolController {
   private baseMask: Uint8Array | null = null;
   private target: { r: number; g: number; b: number; a: number } | null = null;
   private source: HTMLCanvasElement | null = null;
-  private gesture: 'move' | 'scale' | 'uniform' | 'rotate' | 'rotate-step' = 'move';
+  private gesture: 'move' | 'scale' | 'rotate' = 'move';
 
   constructor(private readonly editor: Editor) {}
 
@@ -305,7 +305,7 @@ export class ToolController {
     else if (tool === 'pencil') this.pencil(this.last, point);
     else if (tool === 'recolor') this.recolor(point);
     else if (tool === 'clone') this.clone(point);
-    else if (tool === 'move-pixels' && editor.float) this.paintFloat(point);
+    else if (tool === 'move-pixels' && editor.float) this.paintFloat(point, event.shiftKey);
     else if (tool === 'move-selection' && this.baseMask && editor.doc) {
       editor.doc.selection = shiftMask(this.baseMask, editor.doc.width, editor.doc.height, Math.round(point.x - this.start.x), Math.round(point.y - this.start.y));
       editor.rebuildEdges();
@@ -493,9 +493,7 @@ export class ToolController {
       layer.ctx.putImageData(base, 0, 0);
     } else layer.ctx.clearRect(0, 0, doc.width, doc.height);
     const ctrl = event.ctrlKey || event.metaKey;
-    if (event.altKey && event.shiftKey) this.gesture = 'rotate-step';
-    else if (event.altKey) this.gesture = 'rotate';
-    else if (ctrl && event.shiftKey) this.gesture = 'uniform';
+    if (event.altKey) this.gesture = 'rotate';
     else if (ctrl) this.gesture = 'scale';
     else this.gesture = 'move';
     editor.float = { sprite, x: 0, y: 0, before: this.before, mask: doc.selection ? new Uint8Array(doc.selection) : null, frame: null };
@@ -503,7 +501,13 @@ export class ToolController {
     editor.renderScene();
   }
 
-  private paintFloat(point: Point): void {
+  syncConstraint(event: KeyboardEvent): void {
+    if (event.key !== 'Shift' || event.repeat || !this.drawing || !this.last || !this.editor.float) return;
+    if (this.gesture !== 'scale' && this.gesture !== 'rotate') return;
+    this.paintFloat(this.last, event.type === 'keydown');
+  }
+
+  private paintFloat(point: Point, shift: boolean): void {
     const editor = this.editor;
     const doc = editor.doc;
     const float = editor.float;
@@ -516,6 +520,7 @@ export class ToolController {
       editor.renderScene();
       return;
     }
+    const kind = this.gesture === 'scale' ? (shift ? 'uniform' : 'scale') : (shift ? 'rotate-step' : 'rotate');
     const bounds = float.mask ? boundsOf(float.mask, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
     if (!bounds) return;
     const frame = document.createElement('canvas');
@@ -524,7 +529,7 @@ export class ToolController {
     const ctx = frame.getContext('2d');
     if (!ctx) return;
     ctx.imageSmoothingEnabled = true;
-    transformAround(ctx, this.gesture, start, point, bounds);
+    transformAround(ctx, kind, start, point, bounds);
     ctx.drawImage(float.sprite, 0, 0);
     float.frame = frame;
     float.x = 0;
@@ -546,7 +551,7 @@ export class ToolController {
         }
         maskCtx.putImageData(image, 0, 0);
         outCtx.imageSmoothingEnabled = true;
-        transformAround(outCtx, this.gesture, start, point, bounds);
+        transformAround(outCtx, kind, start, point, bounds);
         outCtx.drawImage(maskCanvas, 0, 0);
         const sampled = outCtx.getImageData(0, 0, doc.width, doc.height);
         const next = new Uint8Array(doc.width * doc.height);

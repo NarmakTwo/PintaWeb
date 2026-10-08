@@ -336,6 +336,7 @@ function wire(editor: Editor, tools: ToolController): void {
   });
   window.addEventListener('keydown', event => onKey(event, editor, tools), true);
   window.addEventListener('keyup', event => {
+    tools.syncConstraint(event);
     if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'd') event.preventDefault();
     if (event.key === ' ') editor.space = false;
   }, true);
@@ -665,6 +666,7 @@ function askAdjust(title: string, fields: Field[], preview: ((values: AdjustValu
 }
 
 function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): void {
+  tools.syncConstraint(event);
   const key = event.key.toLowerCase();
   const ctrl = event.ctrlKey || event.metaKey;
   if (ctrl && !event.shiftKey && key === 'd') {
