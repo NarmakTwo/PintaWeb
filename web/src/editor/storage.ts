@@ -7,7 +7,20 @@ export interface StoredLayer {
   name: string;
   visible: boolean;
   opacity: number;
+  blend?: string;
+  clip?: boolean;
+  tag?: string | null;
+  parent?: number | null;
   png: Blob;
+}
+
+export interface StoredGroup {
+  id: number;
+  name: string;
+  visible: boolean;
+  collapsed: boolean;
+  tag: string | null;
+  parent: number | null;
 }
 
 export interface StoredDocument {
@@ -17,6 +30,7 @@ export interface StoredDocument {
   active: number;
   zoom: number;
   selection: Uint8Array | null;
+  groups?: StoredGroup[];
   layers: StoredLayer[];
 }
 

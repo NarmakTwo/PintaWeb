@@ -1,6 +1,6 @@
 import { createIcons, icons } from 'lucide';
 import { ADJUSTMENTS, ALL_EFFECTS, EFFECTS, performEffect, valuesFrom, type AdjustValues, type Field } from './commands.ts';
-import { Editor } from './document.ts';
+import { BLEND_MODES, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
 import { canvasToPng, downloadBlob, parsePalette, serializePalette } from './storage.ts';
 import { ToolController } from './tools.ts';
 import { boundsOf, DEFAULT_PALETTE, TOOLS, toolFromShortcut, type ToolId, type Unit } from './types.ts';
@@ -16,6 +16,7 @@ const EXT: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/webp': '.webp',
   'image/bmp': '.bmp',
+  'application/pinta': '.pinta',
 };
 
 function editing(): boolean {
@@ -34,16 +35,15 @@ function ask(id: string): Promise<string> {
 export async function start(): Promise<void> {
   const editor = new Editor();
   const tools = new ToolController(editor);
-  const status = $<HTMLElement>('engine-status');
   buildChrome(editor, tools);
   editor.attach($('image-canvas'), $('preview-canvas'), $('overlay-canvas'), $('paper'), $('stage'));
   editor.onChanged = () => sync(editor);
   editor.onScene = () => paintRulers(editor);
   editor.onToast = message => showToast(message);
   editor.onSave = state => {
-    const label = $<HTMLElement>('save-state');
-    label.textContent = state;
-    label.dataset.serial = String(editor.saveSerial);
+    const app = $('app');
+    app.dataset.saveState = state;
+    app.dataset.saveSerial = String(editor.saveSerial);
   };
   wire(editor, tools);
   try {
@@ -51,12 +51,11 @@ export async function start(): Promise<void> {
     const fresh = new URLSearchParams(location.search).has('fresh');
     const restored = fresh ? false : await editor.restore();
     if (!restored) editor.newDocument(800, 600, 'white');
-    status.dataset.state = 'ready';
-    status.textContent = 'Pixel engine ready';
+    document.documentElement.dataset.engine = 'ready';
     requestAnimationFrame(() => editor.doc && editor.fit());
   } catch (error) {
-    status.dataset.state = 'error';
-    status.textContent = error instanceof Error ? error.message : 'Pixel engine failed';
+    document.documentElement.dataset.engine = 'error';
+    editor.toast(error instanceof Error ? error.message : 'Pixel engine failed');
   }
   sync(editor);
   window.setInterval(() => {
@@ -97,6 +96,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
     button.innerHTML = `<i data-lucide="${tool.icon}"></i>`;
     button.addEventListener('click', () => {
       tools.commitText();
+      if (tool.id === 'picker') editor.rememberTool();
       editor.tool = tool.id;
       editor.notify();
     });
@@ -256,16 +256,51 @@ function wire(editor: Editor, tools: ToolController): void {
   };
   paper.addEventListener('pointerup', release);
   paper.addEventListener('pointercancel', release);
-  paper.addEventListener('contextmenu', event => event.preventDefault());
+  paper.addEventListener('contextmenu', event => {
+    event.preventDefault();
+    if (!editor.doc) return;
+    openContext(event.clientX, event.clientY, [
+      { label: 'Paste', action: () => void run(editor, tools, 'paste') },
+      { label: 'Select all', action: () => editor.selectAll() },
+      { label: 'Deselect', action: () => editor.deselect() },
+      { separator: true },
+      { label: 'Zoom in', action: () => editor.zoomAt(editor.doc!.zoom * 1.25, event.clientX, event.clientY) },
+      { label: 'Zoom out', action: () => editor.zoomAt(editor.doc!.zoom / 1.25, event.clientX, event.clientY) },
+      { label: 'Fit image', action: () => editor.fit() },
+      { separator: true },
+      { label: 'Flip horizontal', action: () => editor.flip(true, 'image') },
+      { label: 'Flip vertical', action: () => editor.flip(false, 'image') },
+    ]);
+  });
   paper.addEventListener('wheel', event => {
     if (!event.ctrlKey || !editor.doc) return;
     event.preventDefault();
     editor.zoomAt(editor.doc.zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
   }, { passive: false });
 
+  $('context-menu').addEventListener('click', event => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-action]');
+    if (!button) return;
+    const action = menuActions[Number(button.dataset.action)];
+    closeContext();
+    action?.();
+  });
+  $('context-menu').addEventListener('input', event => {
+    const input = event.target as HTMLInputElement;
+    if (!input.dataset.slider) return;
+    menuActions[Number(input.dataset.slider)]?.(Number(input.value));
+  });
+  $('context-menu').addEventListener('change', event => {
+    const input = event.target as HTMLInputElement;
+    if (!input.dataset.commit) return;
+    const action = menuActions[Number(input.dataset.commit)];
+    closeContext();
+    action?.(Number(input.value));
+  });
   document.addEventListener('pointerdown', event => {
     const target = event.target as HTMLElement;
     if (!target.closest('.menu-wrap')) closeMenus();
+    if (!target.closest('#context-menu')) closeContext();
   });
   document.querySelectorAll<HTMLButtonElement>('.menu-open').forEach(button => {
     button.addEventListener('click', () => {
@@ -295,11 +330,18 @@ function wire(editor: Editor, tools: ToolController): void {
     $('size-value').textContent = String(editor.size);
   });
   $<HTMLInputElement>('primary-input').addEventListener('input', event => {
-    editor.primary = (event.target as HTMLInputElement).value;
+    editor.colorSlot = 'primary';
+    editor.primary = withAlpha((event.target as HTMLInputElement).value, alphaOf(editor.primary));
     editor.notify();
   });
   $<HTMLInputElement>('secondary-input').addEventListener('input', event => {
-    editor.secondary = (event.target as HTMLInputElement).value;
+    editor.colorSlot = 'secondary';
+    editor.secondary = withAlpha((event.target as HTMLInputElement).value, alphaOf(editor.secondary));
+    editor.notify();
+  });
+  $<HTMLInputElement>('alpha-slider').addEventListener('input', event => {
+    const alpha = Number((event.target as HTMLInputElement).value);
+    editor[editor.colorSlot] = withAlpha(editor[editor.colorSlot], alpha);
     editor.notify();
   });
   $('swap-colors').addEventListener('click', () => swapColors(editor));
@@ -356,25 +398,123 @@ function wire(editor: Editor, tools: ToolController): void {
     const button = (event.target as HTMLElement).closest('button');
     if (!button?.dataset.color) return;
     event.preventDefault();
-    editor.secondary = button.dataset.color;
-    editor.notify();
+    const color = button.dataset.color;
+    openContext(event.clientX, event.clientY, [
+      { label: 'Use as primary', action: () => { editor.colorSlot = 'primary'; editor.primary = color; editor.notify(); } },
+      { label: 'Use as secondary', action: () => { editor.colorSlot = 'secondary'; editor.secondary = color; editor.notify(); } },
+      { label: 'Remove', action: () => { editor.palette = editor.palette.filter(item => item !== color); editor.notify(); } },
+    ]);
   });
-  $('layer-list').addEventListener('click', event => {
-    const row = (event.target as HTMLElement).closest<HTMLElement>('[data-layer]');
-    if (!row || !editor.doc) return;
-    const index = Number(row.dataset.layer);
-    if ((event.target as HTMLElement).closest('[data-visible]')) {
-      editor.doc.layers[index].visible = !editor.doc.layers[index].visible;
-      editor.checkpoint(editor.doc.layers[index].visible ? 'Show Layer' : 'Hide Layer');
+  let layerDrag: { from: number; x: number; y: number; pointer: number; active: boolean } | null = null;
+  let suppressLayerClick = false;
+  const clearDragOver = () => document.querySelectorAll('.layer-row.drag-over').forEach(row => row.classList.remove('drag-over'));
+  const rowAt = (y: number) => [...document.querySelectorAll<HTMLElement>('#layer-list .layer-row')].find(row => {
+    const box = row.getBoundingClientRect();
+    return y >= box.top && y <= box.bottom;
+  }) ?? null;
+  const placeLayer = (from: number, row: HTMLElement) => {
+    if (!editor.doc || Number.isNaN(from)) return;
+    if (row.dataset.group && !row.dataset.layer) {
+      const id = Number(row.dataset.group);
+      const last = editor.doc.layers.reduce((found, layer, index) => layer.parent === id ? index : found, -1);
+      editor.reorderLayer(from, last < 0 ? editor.doc.layers.length : last + 1, id);
       return;
     }
-    editor.doc.active = index;
+    if (!row.dataset.layer) return;
+    const to = Number(row.dataset.layer);
+    editor.reorderLayer(from, to, editor.doc.layers[to]?.parent ?? null);
+  };
+  $('layer-list').addEventListener('click', event => {
+    if (suppressLayerClick) {
+      suppressLayerClick = false;
+      return;
+    }
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-visible], [data-group-visible]')) return;
+    const collapse = target.closest<HTMLElement>('[data-collapse]');
+    if (collapse?.dataset.collapse) {
+      editor.toggleGroupCollapsed(Number(collapse.dataset.collapse));
+      return;
+    }
+    const row = target.closest<HTMLElement>('[data-layer]');
+    if (!row?.dataset.layer || !editor.doc) return;
+    editor.doc.active = Number(row.dataset.layer);
     editor.renderScene();
     editor.notify();
+  });
+  $('layer-list').addEventListener('change', event => {
+    const input = event.target as HTMLInputElement;
+    if (input.dataset.visible != null && input.dataset.layer) editor.setLayerVisible(Number(input.dataset.layer), input.checked);
+    if (input.dataset.groupVisible) editor.setGroupVisible(Number(input.dataset.groupVisible), input.checked);
+  });
+  $('layer-list').addEventListener('contextmenu', event => {
+    event.preventDefault();
+    const group = (event.target as HTMLElement).closest<HTMLElement>('[data-group]');
+    const row = (event.target as HTMLElement).closest<HTMLElement>('[data-layer]');
+    if (row?.dataset.layer) openContext(event.clientX, event.clientY, layerContext(editor, Number(row.dataset.layer)));
+    else if (group?.dataset.group) openContext(event.clientX, event.clientY, groupContext(editor, Number(group.dataset.group)));
+    else openContext(event.clientX, event.clientY, [
+      { label: 'Add layer', action: () => editor.addLayer() },
+      { label: 'Flatten image', action: () => editor.flatten() },
+    ]);
+  });
+  $('layer-list').addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('input, [data-collapse], .layer-rename')) return;
+    const row = target.closest<HTMLElement>('.layer-row[data-layer]');
+    if (!row?.dataset.layer) return;
+    layerDrag = { from: Number(row.dataset.layer), x: event.clientX, y: event.clientY, pointer: event.pointerId, active: false };
+    row.setPointerCapture(event.pointerId);
+  });
+  $('layer-list').addEventListener('pointermove', event => {
+    if (!layerDrag || event.pointerId !== layerDrag.pointer) return;
+    if (!layerDrag.active && Math.hypot(event.clientX - layerDrag.x, event.clientY - layerDrag.y) < 5) return;
+    layerDrag.active = true;
+    clearDragOver();
+    rowAt(event.clientY)?.classList.add('drag-over');
+  });
+  $('layer-list').addEventListener('pointerup', event => {
+    if (!layerDrag || event.pointerId !== layerDrag.pointer) return;
+    const drag = layerDrag;
+    layerDrag = null;
+    clearDragOver();
+    if (!drag.active) return;
+    suppressLayerClick = true;
+    const hit = rowAt(event.clientY);
+    if (hit) placeLayer(drag.from, hit);
+  });
+  $('layer-list').addEventListener('pointercancel', () => {
+    layerDrag = null;
+    clearDragOver();
   });
   $('history-list').addEventListener('click', event => {
     const row = (event.target as HTMLElement).closest<HTMLElement>('[data-cursor]');
     if (row) editor.jump(Number(row.dataset.cursor));
+  });
+  $('history-list').addEventListener('contextmenu', event => {
+    const row = (event.target as HTMLElement).closest<HTMLElement>('[data-cursor]');
+    if (!row) return;
+    event.preventDefault();
+    const cursor = Number(row.dataset.cursor);
+    openContext(event.clientX, event.clientY, [
+      { label: 'Revert to here', action: () => editor.jump(cursor) },
+    ]);
+  });
+  $('tabs').addEventListener('contextmenu', event => {
+    const tab = (event.target as HTMLElement).closest<HTMLElement>('[data-tab]');
+    if (!tab?.dataset.tab) return;
+    event.preventDefault();
+    const index = Number(tab.dataset.tab);
+    openContext(event.clientX, event.clientY, [
+      { label: 'Close', action: () => editor.close(index) },
+      { label: 'Close others', action: () => {
+        const keep = editor.docs[index];
+        for (let cursor = editor.docs.length - 1; cursor >= 0; cursor--) {
+          if (editor.docs[cursor] !== keep) editor.close(cursor);
+        }
+      } },
+    ]);
   });
   $('tabs').addEventListener('click', event => {
     const tab = (event.target as HTMLElement).closest<HTMLElement>('[data-tab]');
@@ -539,7 +679,8 @@ async function save(editor: Editor, saveAs: boolean): Promise<boolean> {
     const base = $<HTMLInputElement>('export-name').value.trim() || 'Untitled';
     filename = base.toLowerCase().endsWith(EXT[mime]) ? base : `${base}${EXT[mime]}`;
   }
-  await editor.exportImage(mime, filename);
+  if (mime === 'application/pinta') await editor.exportPinta(filename);
+  else await editor.exportImage(mime, filename);
   return true;
 }
 
@@ -699,7 +840,8 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   else if (!ctrl && event.shiftKey && key === 'f') { event.preventDefault(); editor.flip(false, 'layer'); }
   else if (event.key === 'F4') { event.preventDefault(); void run(editor, tools, 'layer-properties'); }
   else if (event.key === 'Escape') {
-    if (editor.float) editor.cancelFloat();
+    if (!$('context-menu').hidden) closeContext();
+    else if (editor.float) editor.cancelFloat();
     else editor.deselect();
   } else if (event.key === 'Delete' || event.key === 'Backspace') editor.eraseSelection();
   else if (event.key === '[') editor.size = Math.max(1, editor.size - 1);
@@ -710,6 +852,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     if (!next) return;
     event.preventDefault();
     tools.commitText();
+    if (next === 'picker') editor.rememberTool();
     editor.tool = next;
     editor.notify();
   }
@@ -717,6 +860,254 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
 }
 
 let optionTool: ToolId | null = null;
+
+interface ContextEntry {
+  label?: string;
+  checked?: boolean;
+  action?: () => void;
+  children?: ContextEntry[];
+  separator?: boolean;
+  slider?: { value: number; min: number; max: number; live: (value: number) => void; commit: (value: number) => void };
+}
+
+let menuActions: Array<((value?: number) => void) | undefined> = [];
+
+function closeContext(): void {
+  const menu = document.getElementById('context-menu');
+  if (menu) menu.hidden = true;
+  menuActions = [];
+}
+
+function openContext(x: number, y: number, entries: ContextEntry[]): void {
+  const menu = $('context-menu');
+  menuActions = [];
+  menu.innerHTML = contextHtml(entries);
+  menu.hidden = false;
+  menu.style.left = `${Math.max(8, x)}px`;
+  menu.style.top = `${Math.max(8, y)}px`;
+  const box = menu.getBoundingClientRect();
+  if (box.right > window.innerWidth - 8) menu.style.left = `${Math.max(8, window.innerWidth - box.width - 8)}px`;
+  if (box.bottom > window.innerHeight - 8) menu.style.top = `${Math.max(8, window.innerHeight - box.height - 8)}px`;
+}
+
+function contextHtml(entries: ContextEntry[]): string {
+  return entries.map(entry => {
+    if (entry.separator) return '<div class="menu-sep"></div>';
+    if (entry.slider) {
+      const live = menuActions.push(value => entry.slider?.live(value ?? entry.slider.value)) - 1;
+      const commit = menuActions.push(value => entry.slider?.commit(value ?? entry.slider.value)) - 1;
+      return `<label class="menu-slider">${escapeHtml(entry.label ?? '')}<input type="range" min="${entry.slider.min}" max="${entry.slider.max}" value="${entry.slider.value}" data-slider="${live}" data-commit="${commit}" /></label>`;
+    }
+    if (entry.children) {
+      return `<div class="menu-sub"><button type="button">${escapeHtml(entry.label ?? '')}<span>›</span></button><div class="submenu">${contextHtml(entry.children)}</div></div>`;
+    }
+    const index = menuActions.push(() => entry.action?.()) - 1;
+    return `<button type="button" data-action="${index}"><span>${escapeHtml(entry.label ?? '')}</span><i class="menu-mark${entry.checked ? ' on' : ''}"></i></button>`;
+  }).join('');
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
+}
+
+function rgbOf(hex: string): string {
+  const value = hex.replace('#', '');
+  const full = value.length === 3 ? value.split('').map(char => char + char).join('') : value;
+  return `#${(full.slice(0, 6) || '000000').padEnd(6, '0')}`;
+}
+
+function alphaOf(hex: string): number {
+  const value = hex.replace('#', '');
+  return value.length >= 8 ? Number.parseInt(value.slice(6, 8), 16) : 255;
+}
+
+function withAlpha(hex: string, alpha: number): string {
+  const byte = Math.max(0, Math.min(255, Math.round(alpha))).toString(16).padStart(2, '0');
+  return `${rgbOf(hex)}${byte}`;
+}
+
+function groupDepth(editor: Editor, parent: number | null): number {
+  const doc = editor.doc;
+  let depth = 0;
+  const seen = new Set<number>();
+  while (doc && parent != null && !seen.has(parent)) {
+    seen.add(parent);
+    depth += 1;
+    parent = doc.groups.find(group => group.id === parent)?.parent ?? null;
+  }
+  return depth;
+}
+
+function layerMarkup(editor: Editor): string {
+  const doc = editor.doc;
+  if (!doc) return '';
+  const seen = new Set<number>();
+  const rows: string[] = [];
+  for (let index = doc.layers.length - 1; index >= 0; index--) {
+    const layer = doc.layers[index];
+    const chain: number[] = [];
+    let parent = layer.parent;
+    const walked = new Set<number>();
+    while (parent != null && !walked.has(parent)) {
+      walked.add(parent);
+      chain.push(parent);
+      parent = doc.groups.find(group => group.id === parent)?.parent ?? null;
+    }
+    chain.reverse();
+    let hidden = false;
+    for (const id of chain) {
+      const group = doc.groups.find(item => item.id === id);
+      if (!group) continue;
+      if (!hidden && !seen.has(id)) {
+        seen.add(id);
+        rows.push(groupRow(group, groupDepth(editor, group.parent)));
+      }
+      if (group.collapsed) hidden = true;
+    }
+    if (hidden) continue;
+    rows.push(layerRow(layer, index, groupDepth(editor, layer.parent), index === doc.active));
+  }
+  for (const group of doc.groups) {
+    if (seen.has(group.id)) continue;
+    rows.push(groupRow(group, groupDepth(editor, group.parent)));
+  }
+  return rows.join('');
+}
+
+function groupRow(group: { id: number; name: string; visible: boolean; collapsed: boolean; tag: string | null }, depth: number): string {
+  return `<li class="layer-row group-row" data-group="${group.id}" style="padding-left:${depth * 12}px"><button type="button" class="chevron${group.collapsed ? ' collapsed' : ''}" data-collapse="${group.id}" aria-label="${group.collapsed ? 'Expand group' : 'Collapse group'}"></button><button type="button" class="layer" data-group="${group.id}"><i class="tag" style="background:${group.tag ?? 'transparent'}"></i><span class="layer-name">${escapeHtml(group.name)}</span></button><input type="checkbox" data-group-visible="${group.id}" ${group.visible ? 'checked' : ''} aria-label="Group visible" /></li>`;
+}
+
+function layerRow(layer: { name: string; visible: boolean; opacity: number; tag: string | null }, index: number, depth: number, active: boolean): string {
+  return `<li class="layer-row" data-layer="${index}" style="padding-left:${depth * 12}px"><button type="button" class="layer" data-layer="${index}" data-active="${active}"><i class="tag" style="background:${layer.tag ?? 'transparent'}"></i><span class="layer-name">${escapeHtml(layer.name)}</span><span class="layer-meta">${layer.opacity}%</span></button><input type="checkbox" data-visible data-layer="${index}" ${layer.visible ? 'checked' : ''} aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}" /></li>`;
+}
+
+function useLayer(editor: Editor, index: number): void {
+  if (editor.doc) editor.doc.active = index;
+}
+
+function tagMenu(apply: (tag: string | null) => void, current: string | null): ContextEntry {
+  return {
+    label: 'Color tag',
+    children: [
+      { label: 'None', checked: current == null, action: () => apply(null) },
+      ...LAYER_TAGS.map(tag => ({ label: tag, checked: current === tag, action: () => apply(tag) })),
+    ],
+  };
+}
+
+function layerContext(editor: Editor, index: number): ContextEntry[] {
+  const layer = editor.doc?.layers[index];
+  if (!layer) return [];
+  return [
+    { label: 'Rename', action: () => renameInline(editor, index) },
+    tagMenu(tag => editor.setLayerTag(index, tag), layer.tag),
+    {
+      label: 'Blending mode',
+      children: BLEND_MODES.map(mode => ({
+        label: mode,
+        checked: layer.blend === mode,
+        action: () => editor.setLayerBlend(index, mode as BlendMode),
+      })),
+    },
+    {
+      label: 'Opacity',
+      slider: {
+        value: layer.opacity,
+        min: 0,
+        max: 100,
+        live: value => editor.setLayerOpacity(index, value, false),
+        commit: value => editor.setLayerOpacity(index, value, true),
+      },
+    },
+    { separator: true },
+    { label: 'Duplicate layer', action: () => { useLayer(editor, index); editor.duplicateLayer(); } },
+    { label: 'Delete layer', action: () => { useLayer(editor, index); editor.deleteLayer(); } },
+    { label: 'Add layer above', action: () => { useLayer(editor, index); editor.insertLayer('above'); } },
+    { label: 'Add layer below', action: () => { useLayer(editor, index); editor.insertLayer('below'); } },
+    { label: 'Merge layer below', action: () => { useLayer(editor, index); editor.mergeDown(); } },
+    { label: 'Clipping mask', checked: layer.clip, action: () => editor.setLayerClip(index, !layer.clip) },
+    { separator: true },
+    { label: 'Group layer', action: () => editor.groupLayer(index) },
+    { label: 'Remove from group', action: () => editor.reorderLayer(index, index, null) },
+    { separator: true },
+    { label: 'Flip horizontal', action: () => { useLayer(editor, index); editor.flip(true, 'layer'); } },
+    { label: 'Flip vertical', action: () => { useLayer(editor, index); editor.flip(false, 'layer'); } },
+    { label: 'Invert colors', action: () => editor.invertLayer(index) },
+    { label: 'Clear layer', action: () => editor.clearLayer(index) },
+    { label: 'Select pixels', action: () => editor.selectLayerPixels(index) },
+    { separator: true },
+    { label: 'Flatten image', action: () => editor.flatten() },
+  ];
+}
+
+function groupContext(editor: Editor, id: number): ContextEntry[] {
+  const group = editor.doc?.groups.find(item => item.id === id);
+  if (!group) return [];
+  return [
+    { label: 'Rename', action: () => renameGroupInline(editor, id) },
+    tagMenu(tag => editor.setGroupTag(id, tag), group.tag),
+    { label: group.collapsed ? 'Expand group' : 'Collapse group', action: () => editor.toggleGroupCollapsed(id) },
+    { label: 'Add layer inside', action: () => editor.addLayerInGroup(id) },
+    { separator: true },
+    { label: 'Flatten group', action: () => editor.flattenGroup(id) },
+    { label: 'Ungroup', action: () => editor.ungroup(id) },
+    { separator: true },
+    { label: 'Flatten image', action: () => editor.flatten() },
+  ];
+}
+
+function renameInline(editor: Editor, index: number): void {
+  const name = document.querySelector<HTMLElement>(`.layer-row[data-layer="${index}"] .layer-name`);
+  const layer = editor.doc?.layers[index];
+  if (!name || !layer) return;
+  const input = document.createElement('input');
+  input.className = 'layer-rename';
+  input.value = layer.name;
+  name.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = () => {
+    if (done) return;
+    done = true;
+    editor.renameLayer(index, input.value);
+  };
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') commit();
+    if (event.key === 'Escape') {
+      done = true;
+      editor.notify();
+    }
+  });
+  input.addEventListener('blur', commit);
+}
+
+function renameGroupInline(editor: Editor, id: number): void {
+  const name = document.querySelector<HTMLElement>(`.group-row[data-group="${id}"] .layer-name`);
+  const group = editor.doc?.groups.find(item => item.id === id);
+  if (!name || !group) return;
+  const input = document.createElement('input');
+  input.className = 'layer-rename';
+  input.value = group.name;
+  name.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = () => {
+    if (done) return;
+    done = true;
+    editor.renameGroup(id, input.value);
+  };
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') commit();
+    if (event.key === 'Escape') {
+      done = true;
+      editor.notify();
+    }
+  });
+  input.addEventListener('blur', commit);
+}
 
 function sync(editor: Editor): void {
   const doc = editor.doc;
@@ -744,8 +1135,6 @@ function sync(editor: Editor): void {
   document.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach(button => {
     button.setAttribute('aria-pressed', String(button.dataset.tool === editor.tool));
   });
-  const tool = TOOLS.find(item => item.id === editor.tool);
-  $('tool-context').textContent = tool ? tool.hint : '';
   const slider = $<HTMLInputElement>('size-slider');
   if (document.activeElement !== slider) {
     slider.value = String(editor.size);
@@ -758,13 +1147,13 @@ function sync(editor: Editor): void {
   }
   paintSwatch('primary-swatch', editor.primary);
   paintSwatch('secondary-swatch', editor.secondary);
-  $<HTMLInputElement>('primary-input').value = editor.primary;
-  $<HTMLInputElement>('secondary-input').value = editor.secondary;
+  $<HTMLInputElement>('primary-input').value = rgbOf(editor.primary);
+  $<HTMLInputElement>('secondary-input').value = rgbOf(editor.secondary);
+  const alphaSlider = $<HTMLInputElement>('alpha-slider');
+  if (document.activeElement !== alphaSlider) alphaSlider.value = String(alphaOf(editor[editor.colorSlot]));
+  $('alpha-preview').style.setProperty('--alpha-color', rgbOf(editor[editor.colorSlot]));
   $('palette').innerHTML = editor.palette.map(color => `<button type="button" data-color="${color}" style="background:${color}" aria-label="${color}"></button>`).join('');
-  $('layer-list').innerHTML = doc ? [...doc.layers].reverse().map(layer => {
-    const index = doc.layers.indexOf(layer);
-    return `<li><button type="button" class="layer" data-layer="${index}" data-active="${index === doc.active}"><span class="vis${layer.visible ? ' on' : ''}" data-visible aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}"></span><span>${layer.name}</span><span>${layer.opacity}%</span></button></li>`;
-  }).join('') : '';
+  $('layer-list').innerHTML = layerMarkup(editor);
   $('history-list').innerHTML = doc ? doc.labels.map((label, index) => `<li><button type="button" class="history-item" data-cursor="${index}" ${index === doc.cursor ? 'aria-current="true"' : ''}>${label}</button></li>`).join('') : '';
   $('tabs').innerHTML = editor.docs.map((item, index) => `<div class="tab" data-tab="${index}" role="tab" aria-selected="${index === editor.index}"><span>${item.name}</span><button type="button" data-tab-close aria-label="Close ${item.name}">x</button></div>`).join('');
   paintRulers(editor);

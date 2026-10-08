@@ -186,14 +186,129 @@ kbd, .shortcut {
   gap: 8px;
 }
 
-.tool-context {
-  margin: 0 0 0 auto;
-  color: var(--muted);
-  max-width: 42%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.tool-context { display: none; }
+
+.alpha-control {
+  position: relative;
+  display: block;
+  height: 16px;
+  margin-top: 8px;
 }
+.alpha-checker {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--line);
+  background-image:
+    linear-gradient(90deg, transparent, var(--alpha-color, #000)),
+    repeating-conic-gradient(var(--checker) 0% 25%, var(--field) 0% 50%);
+  background-size: auto, 8px 8px;
+  pointer-events: none;
+}
+#alpha-slider {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+#alpha-slider::-webkit-slider-runnable-track { height: 16px; background: transparent; }
+#alpha-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 8px;
+  height: 16px;
+  background: var(--ink);
+  border: 1px solid var(--chrome);
+}
+#alpha-slider::-moz-range-track { height: 16px; background: transparent; border: 0; }
+#alpha-slider::-moz-range-thumb {
+  width: 8px;
+  height: 16px;
+  background: var(--ink);
+  border: 1px solid var(--chrome);
+}
+
+.menu-mark { width: 8px; height: 8px; flex: 0 0 auto; }
+.menu-mark.on { background: currentColor; }
+.layer-row { display: flex; align-items: center; gap: 4px; cursor: grab; user-select: none; }
+.layer-row .layer { flex: 1; min-width: 0; }
+.layer-row input[type="checkbox"] { flex: 0 0 auto; margin: 0; }
+.layer-row .tag { width: 8px; height: 8px; flex: 0 0 auto; background: transparent; }
+.layer-meta { margin-left: auto; color: var(--muted); font-size: 11px; }
+.chevron {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+}
+.chevron::before {
+  content: "";
+  display: block;
+  width: 0;
+  height: 0;
+  margin: 0 auto;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+}
+.chevron.collapsed::before {
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  border-right: 0;
+}
+.layer-row.drag-over { outline: 1px solid var(--accent); }
+
+#context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 210px;
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 4px;
+  background: var(--chrome);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+#context-menu[hidden] { display: none; }
+#context-menu button, .submenu button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+#context-menu button:hover, #context-menu button:focus-visible,
+.submenu button:hover, .submenu button:focus-visible { background: var(--hover); }
+.menu-sub { position: relative; }
+.submenu {
+  display: none;
+  position: absolute;
+  left: calc(100% - 4px);
+  top: 0;
+  min-width: 168px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 4px;
+  background: var(--chrome);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+.menu-sub:hover > .submenu, .menu-sub:focus-within > .submenu { display: block; }
+.menu-slider { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; color: var(--muted); font-size: 12px; }
+.menu-slider input { width: 100%; }
+.menu-sep { height: 1px; margin: 4px 0; background: var(--line); }
+
 
 #tool-extra { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
@@ -243,7 +358,8 @@ kbd, .shortcut {
   height: 28px;
   border: 1px solid var(--tick);
   overflow: hidden;
-  background: var(--field);
+  background-image: repeating-conic-gradient(var(--checker) 0% 25%, var(--field) 0% 50%);
+  background-size: 8px 8px;
 }
 
 .color-field.secondary { left: 16px; top: 16px; }
@@ -354,8 +470,6 @@ kbd, .shortcut {
   background: var(--selected);
 }
 .layer span, .tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vis { width: 10px; height: 10px; border: 1.5px solid currentColor; flex: 0 0 auto; }
-.vis.on { background: currentColor; }
 .icon-button { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; }
 .icon-button svg { width: 16px; height: 16px; }
 

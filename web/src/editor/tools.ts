@@ -228,9 +228,10 @@ export class ToolController {
     }
     if (editor.tool === 'picker') {
       const pixel = editor.layer.ctx.getImageData(Math.min(doc.width - 1, Math.floor(point.x)), Math.min(doc.height - 1, Math.floor(point.y)), 1, 1).data;
-      const hex = `#${[pixel[0], pixel[1], pixel[2]].map(value => value.toString(16).padStart(2, '0')).join('')}`;
+      const hex = `#${[pixel[0], pixel[1], pixel[2], pixel[3]].map(value => value.toString(16).padStart(2, '0')).join('')}`;
       if (event.button === 2) editor.secondary = hex;
       else editor.primary = hex;
+      editor.tool = editor.toolBeforePicker === 'picker' ? 'brush' : editor.toolBeforePicker;
       editor.notify();
       return;
     }

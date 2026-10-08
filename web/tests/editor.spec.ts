@@ -20,7 +20,7 @@ test.afterEach(async ({ page }) => {
 
 async function ready(page: Page): Promise<void> {
   await page.goto('/?fresh=1');
-  await expect(page.locator('#engine-status')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
 }
 
 async function newCanvas(page: Page, width = 64, height = 64): Promise<void> {
@@ -68,7 +68,7 @@ test('switches to dark mode and keeps the choice', async ({ page }) => {
   const background = await page.locator('body').evaluate(element => getComputedStyle(element).backgroundColor);
   expect(background).toBe('rgb(36, 36, 36)');
   await page.reload();
-  await expect(page.locator('#engine-status')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
 });
 
@@ -202,15 +202,15 @@ test('adds a layer and restores the image from IndexedDB', async ({ page }) => {
 
   await page.locator('[data-tool="pencil"]').click();
   await page.locator('#size-slider').fill('16');
-  await expect(page.locator('#save-state')).toHaveText('Saved locally');
-  const serial = await page.locator('#save-state').getAttribute('data-serial');
+  await expect(page.locator('#app')).toHaveAttribute('data-save-state', 'Saved locally');
+  const serial = await page.locator('#app').getAttribute('data-save-serial');
   await drag(page, 0.5, 0.5, 0.52, 0.52);
   await page.waitForFunction(previous => {
-    const label = document.querySelector('#save-state');
-    return label?.textContent === 'Saved locally' && label.getAttribute('data-serial') !== previous;
+    const app = document.querySelector('#app');
+    return app?.getAttribute('data-save-state') === 'Saved locally' && app.getAttribute('data-save-serial') !== previous;
   }, serial);
   await page.goto('/');
-  await expect(page.locator('#engine-status')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
   await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
 });
 
@@ -305,6 +305,274 @@ test('shift during a scale or rotation constrains the original image', async ({ 
   const corner = await pixel(page, 0, 0);
   expect(corner[0]).toBeGreaterThan(200);
   expect(corner[3]).toBeGreaterThan(200);
+});
+
+test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
+  await ready(page);
+  await expect(page.locator('#engine-status')).toHaveCount(0);
+  await expect(page.locator('#save-state')).toHaveCount(0);
+  await expect(page.locator('#tool-context')).toHaveCount(0);
+  await expect(page.locator('#alpha-slider')).toBeVisible();
+
+  await newCanvas(page, 48, 48);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('[data-tool="picker"]').click();
+  await expect(page.locator('[data-tool="picker"]')).toHaveAttribute('aria-pressed', 'true');
+  const sample = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(sample.x, sample.y);
+  await expect(page.locator('[data-tool="pencil"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#primary-input')).toHaveValue('#ffffff');
+  await page.locator('#alpha-slider').fill('128');
+  const swatch = await page.locator('#primary-swatch').evaluate(element => getComputedStyle(element).backgroundColor);
+  const channels = swatch.match(/[\d.]+/g)?.map(Number) ?? [];
+  expect(channels[3] ?? 1).toBeGreaterThan(0.4);
+  expect(channels[3] ?? 1).toBeLessThan(0.6);
+  await page.locator('#alpha-slider').fill('255');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  await page.mouse.click(sample.x, sample.y);
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('3');
+  const mark = await paperPoint(page, 0.2, 0.25);
+  await page.mouse.click(mark.x, mark.y);
+  expect((await pixel(page, 0.2, 0.25))[0]).toBeLessThan(40);
+  expect((await pixel(page, 0.7, 0.7))[0]).toBeGreaterThan(200);
+
+  const rows = () => page.locator('#layer-list .layer-row[data-layer]');
+  const menu = page.locator('#context-menu');
+  const openLayer = async (nth = 0) => {
+    await rows().nth(nth).click({ button: 'right' });
+    await expect(menu).toBeVisible();
+  };
+  const choose = async (name: string) => {
+    await menu.getByRole('button', { name, exact: true }).click();
+    await expect(menu).toBeHidden();
+  };
+
+  await openLayer();
+  const theme = await page.locator('html').getAttribute('data-theme');
+  await expect(menu).toHaveCSS('background-color', theme === 'dark' ? 'rgb(48, 48, 48)' : 'rgb(255, 255, 255)');
+  await page.keyboard.press('Escape');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="theme-dark"]').click();
+  await openLayer();
+  await expect(menu).toHaveCSS('background-color', theme === 'dark' ? 'rgb(255, 255, 255)' : 'rgb(48, 48, 48)');
+  await page.keyboard.press('Escape');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="theme-dark"]').click();
+
+  await openLayer();
+  await choose('Duplicate layer');
+  await expect(rows()).toHaveCount(2);
+
+  await openLayer();
+  await choose('Invert colors');
+  const inverted = await pixel(page, 0.7, 0.7);
+  expect(inverted[0]).toBeLessThan(20);
+  expect(inverted[1]).toBeGreaterThan(200);
+  expect(inverted[2]).toBeGreaterThan(200);
+  const whitened = await pixel(page, 0.2, 0.25);
+  expect(whitened[0]).toBeGreaterThan(200);
+  expect(whitened[1]).toBeGreaterThan(200);
+  expect(whitened[2]).toBeGreaterThan(200);
+
+  await openLayer();
+  await choose('Flip horizontal');
+  const flipped = await pixel(page, 0.8, 0.25);
+  expect(flipped[0]).toBeGreaterThan(200);
+  expect(flipped[1]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.2, 0.25))[1]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.2, 0.25))[0]).toBeLessThan(20);
+  await openLayer();
+  await choose('Flip vertical');
+  expect((await pixel(page, 0.8, 0.73))[0]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.8, 0.25))[0]).toBeLessThan(20);
+
+  await openLayer();
+  await choose('Select pixels');
+  await expect(page.locator('#selection-status')).toContainText('×');
+  await page.keyboard.press('Control+d');
+  await expect(page.locator('#selection-status')).toHaveText('No selection');
+
+  await openLayer();
+  await menu.locator('.menu-sub', { hasText: 'Blending mode' }).hover();
+  await choose('multiply');
+  expect((await pixel(page, 0.7, 0.7))[0]).toBeLessThan(20);
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeLessThan(20);
+  await openLayer();
+  await menu.locator('.menu-sub', { hasText: 'Blending mode' }).hover();
+  await choose('normal');
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeGreaterThan(200);
+  await openLayer();
+  await menu.locator('.menu-slider input').evaluate((input: HTMLInputElement) => {
+    input.value = '40';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  const faded = await pixel(page, 0.7, 0.7);
+  expect(faded[0]).toBeGreaterThan(120);
+  expect(faded[0]).toBeLessThan(190);
+  expect(faded[1]).toBeGreaterThan(70);
+  expect(faded[1]).toBeLessThan(140);
+  await openLayer();
+  await menu.locator('.menu-slider input').evaluate((input: HTMLInputElement) => {
+    input.value = '100';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeGreaterThan(200);
+
+  await openLayer(1);
+  await choose('Clear layer');
+  await rows().nth(1).locator('.layer').click();
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('8');
+  const dot = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(dot.x, dot.y);
+  await openLayer(0);
+  await choose('Clipping mask');
+  expect((await pixel(page, 0.08, 0.08))[3]).toBeLessThan(10);
+  expect((await pixel(page, 0.5, 0.5))[3]).toBeGreaterThan(200);
+  await openLayer(0);
+  await choose('Clipping mask');
+  expect((await pixel(page, 0.08, 0.08))[3]).toBeGreaterThan(200);
+  await rows().nth(1).locator('.layer').click();
+  await page.locator('[data-tool="bucket"]').click();
+  const empty = await paperPoint(page, 0.08, 0.08);
+  await page.mouse.click(empty.x, empty.y);
+  await page.locator('#layer-list input[data-visible]').first().uncheck();
+  expect((await pixel(page, 0.7, 0.7))[0]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeLessThan(30);
+  await page.locator('#layer-list input[data-visible]').first().check();
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeGreaterThan(200);
+
+  await openLayer();
+  await choose('Group layer');
+  await expect(page.locator('.group-row')).toHaveCount(1);
+  await page.locator('.group-row').click({ button: 'right' });
+  await choose('Rename');
+  await page.locator('.layer-rename').fill('Folder');
+  await page.locator('.layer-rename').press('Enter');
+  await expect(page.locator('.group-row .layer-name')).toHaveText('Folder');
+  await page.locator('.group-row').click({ button: 'right' });
+  await menu.locator('.menu-sub', { hasText: 'Color tag' }).hover();
+  await choose('#2ec27e');
+  await expect(page.locator('.group-row .tag')).toHaveCSS('background-color', 'rgb(46, 194, 126)');
+  await page.locator('[data-group-visible]').uncheck();
+  expect((await pixel(page, 0.7, 0.7))[0]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeLessThan(30);
+  await page.locator('[data-group-visible]').check();
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeGreaterThan(200);
+  await page.locator('[data-collapse]').click();
+  await expect(rows()).toHaveCount(1);
+  expect((await pixel(page, 0.7, 0.7))[1]).toBeGreaterThan(200);
+  await page.locator('[data-collapse]').click();
+  await page.locator('.group-row').click({ button: 'right' });
+  await choose('Add layer inside');
+  await expect(rows()).toHaveCount(3);
+  await openLayer();
+  await choose('Remove from group');
+  await page.locator('.group-row').click({ button: 'right' });
+  await choose('Ungroup');
+  await expect(page.locator('.group-row')).toHaveCount(0);
+  await openLayer();
+  await choose('Group layer');
+  await page.locator('.group-row').click({ button: 'right' });
+  await choose('Flatten group');
+  await expect(page.locator('.group-row')).toHaveCount(0);
+  await expect(rows()).toHaveCount(3);
+
+  await openLayer();
+  await menu.locator('.menu-sub', { hasText: 'Blending mode' }).hover();
+  await choose('multiply');
+  await openLayer();
+  await menu.locator('.menu-sub', { hasText: 'Color tag' }).hover();
+  await choose('#c01c28');
+  await expect(page.locator('#layer-list .layer-row[data-layer] .tag').first()).toHaveCSS('background-color', 'rgb(192, 28, 40)');
+  await openLayer();
+  await menu.locator('.menu-slider input').evaluate((input: HTMLInputElement) => {
+    input.value = '40';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  await expect(menu).toBeHidden();
+  await expect(page.locator('.layer-row[data-layer] .layer-meta').first()).toHaveText('40%');
+
+  await openLayer();
+  await choose('Rename');
+  await page.locator('.layer-rename').fill('Ink');
+  await page.locator('.layer-rename').press('Enter');
+  await expect(page.locator('.layer-row[data-layer] .layer-name').first()).toHaveText('Ink');
+
+  const topName = await page.locator('.layer-row[data-layer] .layer-name').first().innerText();
+  const nextName = await page.locator('.layer-row[data-layer] .layer-name').nth(1).innerText();
+  await rows().first().dragTo(rows().nth(1));
+  await expect(page.locator('.layer-row[data-layer] .layer-name').first()).toHaveText(nextName);
+  await expect(page.locator('.layer-row[data-layer] .layer-name').nth(1)).toHaveText(topName);
+
+  const checks = page.locator('#layer-list input[data-visible]');
+  const visibleCount = await checks.count();
+  for (let index = 0; index < visibleCount; index++) await checks.nth(index).uncheck();
+  expect((await pixel(page, 0.7, 0.7))[3]).toBeLessThan(10);
+  for (let index = 0; index < visibleCount; index++) await checks.nth(index).check();
+  expect((await pixel(page, 0.7, 0.7))[3]).toBeGreaterThan(200);
+
+  const beforeAdd = await rows().count();
+  await openLayer();
+  await choose('Add layer above');
+  await expect(rows()).toHaveCount(beforeAdd + 1);
+  await openLayer();
+  await choose('Add layer below');
+  await expect(rows()).toHaveCount(beforeAdd + 2);
+  await openLayer();
+  await choose('Merge layer below');
+  await expect(rows()).toHaveCount(beforeAdd + 1);
+  await openLayer();
+  await choose('Clear layer');
+  await openLayer();
+  await choose('Delete layer');
+  await expect(rows()).toHaveCount(beforeAdd);
+  await page.locator('#layer-list').click({ button: 'right', position: { x: 8, y: 8 } });
+  await choose('Flatten image');
+  await expect(rows()).toHaveCount(1);
+
+  await page.locator('#history-list .history-item').first().click({ button: 'right' });
+  await expect(menu).toContainText('Revert to here');
+  await page.keyboard.press('Escape');
+  await page.locator('.tab').first().click({ button: 'right' });
+  await expect(menu).toContainText('Close');
+  await page.keyboard.press('Escape');
+  const colorSwatch = page.locator('#palette button').first();
+  await colorSwatch.click({ button: 'right' });
+  await expect(menu).toContainText('Use as primary');
+  await page.keyboard.press('Escape');
+  await page.locator('#paper').click({ button: 'right' });
+  await expect(menu).toContainText('Paste');
+  await page.keyboard.press('Escape');
+
+  await page.locator('#layer-list input[data-visible]').uncheck();
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="save-as"]').click();
+  await page.locator('#export-name').fill('stack');
+  await page.locator('#export-format').selectOption('application/pinta');
+  await page.locator('#confirm-export').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('stack.pinta');
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  if (!stream) throw new Error('The .pinta download was empty.');
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  const archive = Buffer.concat(chunks);
+  const text = archive.toString('utf8');
+  const currentLayers = text.slice(text.indexOf('"layers":['), text.indexOf('"history"'));
+  expect(archive.subarray(0, 2).toString()).toBe('PK');
+  expect(text).toContain('manifest.json');
+  expect(text).toContain('"format":"pinta"');
+  expect(text).toContain('"width":48');
+  expect(text).toContain('"settings"');
+  expect(text).toContain('"history"');
+  expect(currentLayers).toContain('"visible":false');
+  expect(currentLayers).toMatch(/"file":"\d+\.png"/);
 });
 
 test.describe('touchscreen', () => {

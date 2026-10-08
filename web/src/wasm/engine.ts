@@ -28,10 +28,10 @@ function parseHex(hex: string): Rgba {
   const value = hex.replace('#', '');
   const full = value.length === 3 ? value.split('').map(ch => ch + ch).join('') : value;
   return {
-    r: Number.parseInt(full.slice(0, 2), 16),
-    g: Number.parseInt(full.slice(2, 4), 16),
-    b: Number.parseInt(full.slice(4, 6), 16),
-    a: 255,
+    r: Number.parseInt(full.slice(0, 2), 16) || 0,
+    g: Number.parseInt(full.slice(2, 4), 16) || 0,
+    b: Number.parseInt(full.slice(4, 6), 16) || 0,
+    a: full.length >= 8 ? Number.parseInt(full.slice(6, 8), 16) : 255,
   };
 }
 
@@ -138,6 +138,6 @@ export class PixelEngine {
 
 export function rgba(hex: string, alpha = 255): Rgba {
   const color = parseHex(hex);
-  color.a = alpha;
+  color.a = Math.round(color.a * alpha / 255);
   return color;
 }

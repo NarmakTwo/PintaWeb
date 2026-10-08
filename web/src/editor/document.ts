@@ -1,23 +1,72 @@
 import { PixelEngine, rgba, type Rgba } from '../wasm/engine.ts';
-import { canvasToPng, clearSession, encodeBmp, loadSession, saveSession, type SessionRecord } from './storage.ts';
+import { canvasToPng, clearSession, downloadBlob, encodeBmp, loadSession, saveSession, type SessionRecord } from './storage.ts';
+import { zipStore } from './zip.ts';
 import {
   boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask,
   type Bounds, type BrushId, type GradientKind, type Point, type SelectMode, type ShapeStyle, type ToolId, type Unit,
 } from './types.ts';
+
+export const BLEND_MODES = ['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'] as const;
+export type BlendMode = typeof BLEND_MODES[number];
+export const LAYER_TAGS = ['#c01c28', '#e5a50a', '#2ec27e', '#1c71d8', '#9141ac'] as const;
+
+const COMPOSITE: Record<BlendMode, GlobalCompositeOperation> = {
+  normal: 'source-over',
+  multiply: 'multiply',
+  screen: 'screen',
+  overlay: 'overlay',
+  darken: 'darken',
+  lighten: 'lighten',
+  'color-dodge': 'color-dodge',
+  'color-burn': 'color-burn',
+  'hard-light': 'hard-light',
+  'soft-light': 'soft-light',
+  difference: 'difference',
+  exclusion: 'exclusion',
+  hue: 'hue',
+  saturation: 'saturation',
+  color: 'color',
+  luminosity: 'luminosity',
+};
 
 export interface Layer {
   id: number;
   name: string;
   visible: boolean;
   opacity: number;
+  blend: BlendMode;
+  clip: boolean;
+  tag: string | null;
+  parent: number | null;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
+}
+
+export interface LayerGroup {
+  id: number;
+  name: string;
+  visible: boolean;
+  collapsed: boolean;
+  tag: string | null;
+  parent: number | null;
+}
+
+interface SnapshotGroup {
+  name: string;
+  visible: boolean;
+  collapsed: boolean;
+  tag: string | null;
+  parent: number | null;
 }
 
 interface SnapshotLayer {
   name: string;
   visible: boolean;
   opacity: number;
+  blend: BlendMode;
+  clip: boolean;
+  tag: string | null;
+  parent: number | null;
   data: ImageData;
 }
 
@@ -26,6 +75,7 @@ interface Snapshot {
   height: number;
   active: number;
   selection: Uint8Array | null;
+  groups: SnapshotGroup[];
   layers: SnapshotLayer[];
 }
 
@@ -34,6 +84,7 @@ export interface Doc {
   width: number;
   height: number;
   layers: Layer[];
+  groups: LayerGroup[];
   active: number;
   selection: Uint8Array | null;
   zoom: number;
@@ -60,9 +111,19 @@ function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   return ctx;
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let text = '';
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    text += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(text);
+}
+
 export class Editor {
   readonly engine = new PixelEngine();
   tool: ToolId = 'brush';
+  toolBeforePicker: ToolId = 'brush';
+  colorSlot: 'primary' | 'secondary' = 'primary';
   primary = '#000000';
   secondary = '#ffffff';
   size = 8;
@@ -167,7 +228,7 @@ export class Editor {
     canvas.height = data?.height ?? doc?.height ?? 1;
     const ctx = context2d(canvas);
     if (data) ctx.putImageData(data, 0, 0);
-    return { id: this.layerSerial++, name, visible, opacity, canvas, ctx };
+    return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: null, parent: null, canvas, ctx };
   }
 
   private capture(): Snapshot {
@@ -178,10 +239,21 @@ export class Editor {
       height: doc.height,
       active: doc.active,
       selection: doc.selection ? new Uint8Array(doc.selection) : null,
+      groups: doc.groups.map(group => ({
+        name: group.name,
+        visible: group.visible,
+        collapsed: group.collapsed,
+        tag: group.tag,
+        parent: group.parent == null ? null : doc.groups.findIndex(item => item.id === group.parent),
+      })),
       layers: doc.layers.map(layer => ({
         name: layer.name,
         visible: layer.visible,
         opacity: layer.opacity,
+        blend: layer.blend,
+        clip: layer.clip,
+        tag: layer.tag,
+        parent: layer.parent == null ? null : doc.groups.findIndex(group => group.id === layer.parent),
         data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
       })),
     };
@@ -195,7 +267,25 @@ export class Editor {
     doc.height = snapshot.height;
     doc.active = Math.max(0, Math.min(snapshot.active, snapshot.layers.length - 1));
     doc.selection = snapshot.selection ? new Uint8Array(snapshot.selection) : null;
-    doc.layers = snapshot.layers.map(layer => this.makeLayer(layer.name, layer.visible, layer.opacity, layer.data));
+    doc.groups = (snapshot.groups ?? []).map(group => ({
+      id: this.layerSerial++,
+      name: group.name,
+      visible: group.visible,
+      collapsed: group.collapsed,
+      tag: group.tag,
+      parent: null,
+    }));
+    snapshot.groups?.forEach((group, index) => {
+      doc.groups[index].parent = group.parent == null ? null : doc.groups[group.parent]?.id ?? null;
+    });
+    doc.layers = snapshot.layers.map(layer => {
+      const created = this.makeLayer(layer.name, layer.visible, layer.opacity, layer.data);
+      created.blend = layer.blend ?? 'normal';
+      created.clip = !!layer.clip;
+      created.tag = layer.tag ?? null;
+      created.parent = layer.parent == null ? null : doc.groups[layer.parent]?.id ?? null;
+      return created;
+    });
     this.syncSize();
     this.rebuildEdges();
     this.renderScene();
@@ -255,6 +345,7 @@ export class Editor {
       width,
       height,
       layers: [],
+      groups: [],
       active: 0,
       selection: null,
       zoom: 1,
@@ -432,18 +523,70 @@ export class Editor {
       this.onScene?.();
       return;
     }
-    for (const layer of doc.layers) {
-      if (!layer.visible) continue;
-      ctx.globalAlpha = layer.opacity / 100;
-      ctx.drawImage(layer.canvas, 0, 0);
-      if (this.float && layer === this.layer) {
-        if (this.float.frame) ctx.drawImage(this.float.frame, 0, 0);
-        else ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
-      }
-    }
+    this.paintStack(ctx, true);
     ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
     this.paintOverlay();
     this.onScene?.();
+  }
+
+  rememberTool(): void {
+    if (this.tool !== 'picker') this.toolBeforePicker = this.tool;
+  }
+
+  layerShown(layer: Layer): boolean {
+    const doc = this.doc;
+    if (!doc || !layer.visible) return false;
+    const seen = new Set<number>();
+    let parent = layer.parent;
+    while (parent != null) {
+      if (seen.has(parent)) return false;
+      seen.add(parent);
+      const group = doc.groups.find(item => item.id === parent);
+      if (!group?.visible) return false;
+      parent = group.parent;
+    }
+    return true;
+  }
+
+  private paintStack(ctx: CanvasRenderingContext2D, includeFloat: boolean): void {
+    const doc = this.doc;
+    if (!doc) return;
+    for (let index = 0; index < doc.layers.length; index++) {
+      const layer = doc.layers[index];
+      if (!this.layerShown(layer)) continue;
+      const lower = index > 0 && this.layerShown(doc.layers[index - 1]) ? doc.layers[index - 1].canvas : null;
+      ctx.save();
+      ctx.globalAlpha = layer.opacity / 100;
+      ctx.globalCompositeOperation = COMPOSITE[layer.blend] ?? 'source-over';
+      let source = includeFloat && this.float && layer === this.layer ? this.floatCanvas(layer) : layer.canvas;
+      if (layer.clip) source = this.masked(source, lower);
+      ctx.drawImage(source, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  private floatCanvas(layer: Layer): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = layer.canvas.width;
+    canvas.height = layer.canvas.height;
+    const ctx = context2d(canvas);
+    ctx.drawImage(layer.canvas, 0, 0);
+    if (this.float?.frame) ctx.drawImage(this.float.frame, 0, 0);
+    else if (this.float) ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
+    return canvas;
+  }
+
+  private masked(source: HTMLCanvasElement, below: HTMLCanvasElement | null): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = source.width;
+    canvas.height = source.height;
+    if (!below) return canvas;
+    const ctx = context2d(canvas);
+    ctx.drawImage(source, 0, 0);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(below, 0, 0);
+    return canvas;
   }
 
   paintOverlay(): void {
@@ -865,17 +1008,47 @@ export class Editor {
     const layer = this.makeLayer('Background', true, 100);
     layer.ctx.drawImage(flat, 0, 0);
     doc.layers = [layer];
+    doc.groups = [];
     doc.active = 0;
     this.checkpoint('Flatten');
   }
 
   addLayer(): void {
+    this.insertLayer('top');
+  }
+
+  insertLayer(where: 'top' | 'above' | 'below'): void {
     const doc = this.doc;
     if (!doc) return;
     const layer = this.makeLayer(`Layer ${doc.layers.length + 1}`, true, 100);
-    doc.layers.push(layer);
-    doc.active = doc.layers.length - 1;
-    this.checkpoint('Add New Layer');
+    if (where === 'above') {
+      layer.parent = this.layer?.parent ?? null;
+      doc.layers.splice(doc.active + 1, 0, layer);
+      doc.active += 1;
+    } else if (where === 'below') {
+      layer.parent = this.layer?.parent ?? null;
+      doc.layers.splice(doc.active, 0, layer);
+    } else {
+      doc.layers.push(layer);
+      doc.active = doc.layers.length - 1;
+    }
+    this.checkpoint(where === 'above' ? 'Add Layer Above' : where === 'below' ? 'Add Layer Below' : 'Add New Layer');
+  }
+
+  addLayerInGroup(id: number): void {
+    const doc = this.doc;
+    const group = doc?.groups.find(item => item.id === id);
+    if (!doc || !group) return;
+    const layer = this.makeLayer(`Layer ${doc.layers.length + 1}`, true, 100);
+    layer.parent = id;
+    let insert = doc.layers.length;
+    doc.layers.forEach((item, index) => {
+      if (item.parent === id) insert = index + 1;
+    });
+    doc.layers.splice(insert, 0, layer);
+    doc.active = insert;
+    group.collapsed = false;
+    this.checkpoint('Add Layer');
   }
 
   deleteLayer(): void {
@@ -894,6 +1067,10 @@ export class Editor {
     const layer = this.layer;
     if (!doc || !layer) return;
     const copy = this.makeLayer(`${layer.name} copy`, layer.visible, layer.opacity);
+    copy.blend = layer.blend;
+    copy.clip = layer.clip;
+    copy.tag = layer.tag;
+    copy.parent = layer.parent;
     copy.ctx.drawImage(layer.canvas, 0, 0);
     doc.layers.splice(doc.active + 1, 0, copy);
     doc.active++;
@@ -908,9 +1085,11 @@ export class Editor {
     }
     const upper = doc.layers[doc.active];
     const lower = doc.layers[doc.active - 1];
+    lower.ctx.save();
     lower.ctx.globalAlpha = upper.opacity / 100;
-    if (upper.visible) lower.ctx.drawImage(upper.canvas, 0, 0);
-    lower.ctx.globalAlpha = 1;
+    lower.ctx.globalCompositeOperation = COMPOSITE[upper.blend];
+    if (upper.visible) lower.ctx.drawImage(upper.clip ? this.masked(upper.canvas, lower.canvas) : upper.canvas, 0, 0);
+    lower.ctx.restore();
     doc.layers.splice(doc.active, 1);
     doc.active--;
     this.checkpoint('Merge Layer Down');
@@ -934,6 +1113,198 @@ export class Editor {
     layer.opacity = Math.max(0, Math.min(100, opacity));
     layer.visible = visible;
     this.checkpoint('Layer Properties');
+  }
+
+  renameLayer(index: number, name: string): void {
+    const layer = this.doc?.layers[index];
+    if (!layer) return;
+    layer.name = name.trim() || layer.name;
+    this.checkpoint('Rename Layer');
+  }
+
+  renameGroup(id: number, name: string): void {
+    const group = this.doc?.groups.find(item => item.id === id);
+    if (!group) return;
+    group.name = name.trim() || group.name;
+    this.checkpoint('Rename Group');
+  }
+
+  setLayerVisible(index: number, visible: boolean): void {
+    const layer = this.doc?.layers[index];
+    if (!layer || layer.visible === visible) return;
+    layer.visible = visible;
+    this.checkpoint(visible ? 'Show Layer' : 'Hide Layer');
+  }
+
+  setGroupVisible(id: number, visible: boolean): void {
+    const group = this.doc?.groups.find(item => item.id === id);
+    if (!group || group.visible === visible) return;
+    group.visible = visible;
+    this.checkpoint(visible ? 'Show Group' : 'Hide Group');
+  }
+
+  setLayerOpacity(index: number, opacity: number, commit: boolean): void {
+    const layer = this.doc?.layers[index];
+    if (!layer) return;
+    layer.opacity = Math.max(0, Math.min(100, opacity));
+    this.renderScene();
+    if (commit) this.checkpoint('Layer Opacity');
+  }
+
+  setLayerBlend(index: number, blend: BlendMode): void {
+    const layer = this.doc?.layers[index];
+    if (!layer) return;
+    layer.blend = blend;
+    this.checkpoint('Blending Mode');
+  }
+
+  setLayerClip(index: number, clip: boolean): void {
+    const layer = this.doc?.layers[index];
+    if (!layer) return;
+    layer.clip = clip;
+    this.checkpoint(clip ? 'Clipping Mask' : 'Release Clipping Mask');
+  }
+
+  setLayerTag(index: number, tag: string | null): void {
+    const layer = this.doc?.layers[index];
+    if (!layer) return;
+    layer.tag = tag;
+    this.checkpoint('Layer Color Tag');
+  }
+
+  setGroupTag(id: number, tag: string | null): void {
+    const group = this.doc?.groups.find(item => item.id === id);
+    if (!group) return;
+    group.tag = tag;
+    this.checkpoint('Group Color Tag');
+  }
+
+  toggleGroupCollapsed(id: number): void {
+    const group = this.doc?.groups.find(item => item.id === id);
+    if (!group) return;
+    group.collapsed = !group.collapsed;
+    this.notify();
+  }
+
+  reorderLayer(from: number, to: number, parent: number | null): void {
+    const doc = this.doc;
+    if (!doc || from < 0 || from >= doc.layers.length) return;
+    const moving = doc.layers[from];
+    if (from === to && moving.parent === parent) return;
+    const [layer] = doc.layers.splice(from, 1);
+    layer.parent = parent;
+    const dest = Math.max(0, Math.min(doc.layers.length, to > from ? to - 1 : to));
+    doc.layers.splice(dest, 0, layer);
+    doc.active = dest;
+    this.checkpoint('Reorder Layer');
+  }
+
+  groupLayer(index: number): void {
+    const doc = this.doc;
+    const layer = doc?.layers[index];
+    if (!doc || !layer) return;
+    const group: LayerGroup = {
+      id: this.layerSerial++,
+      name: 'Group',
+      visible: true,
+      collapsed: false,
+      tag: null,
+      parent: layer.parent,
+    };
+    doc.groups.push(group);
+    layer.parent = group.id;
+    this.checkpoint('Group Layer');
+  }
+
+  ungroup(id: number): void {
+    const doc = this.doc;
+    const group = doc?.groups.find(item => item.id === id);
+    if (!doc || !group) return;
+    for (const layer of doc.layers) if (layer.parent === id) layer.parent = group.parent;
+    for (const child of doc.groups) if (child.parent === id) child.parent = group.parent;
+    doc.groups = doc.groups.filter(item => item.id !== id);
+    this.checkpoint('Ungroup');
+  }
+
+  flattenGroup(id: number): void {
+    const doc = this.doc;
+    const group = doc?.groups.find(item => item.id === id);
+    if (!doc || !group) return;
+    const members = doc.layers.filter(layer => this.insideGroup(layer.parent, id));
+    if (!members.length) {
+      this.ungroup(id);
+      return;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = doc.width;
+    canvas.height = doc.height;
+    const ctx = context2d(canvas);
+    for (const layer of doc.layers) {
+      if (!this.insideGroup(layer.parent, id) || !layer.visible) continue;
+      ctx.save();
+      ctx.globalAlpha = layer.opacity / 100;
+      ctx.globalCompositeOperation = COMPOSITE[layer.blend];
+      ctx.drawImage(layer.canvas, 0, 0);
+      ctx.restore();
+    }
+    const flat = this.makeLayer(group.name, group.visible, 100);
+    flat.tag = group.tag;
+    flat.parent = group.parent;
+    flat.ctx.drawImage(canvas, 0, 0);
+    const first = doc.layers.findIndex(layer => this.insideGroup(layer.parent, id));
+    doc.layers = doc.layers.filter(layer => !this.insideGroup(layer.parent, id));
+    doc.groups = doc.groups.filter(item => item.id !== id && !this.insideGroup(item.parent, id));
+    doc.layers.splice(Math.max(0, first), 0, flat);
+    doc.active = Math.max(0, first);
+    this.checkpoint('Flatten Group');
+  }
+
+  private insideGroup(parent: number | null, id: number): boolean {
+    const doc = this.doc;
+    const seen = new Set<number>();
+    while (parent != null && doc) {
+      if (parent === id) return true;
+      if (seen.has(parent)) return false;
+      seen.add(parent);
+      parent = doc.groups.find(group => group.id === parent)?.parent ?? null;
+    }
+    return false;
+  }
+
+  invertLayer(index: number): void {
+    const doc = this.doc;
+    const layer = doc?.layers[index];
+    if (!doc || !layer) return;
+    const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    for (let i = 0; i < image.data.length; i += 4) {
+      if (image.data[i + 3] === 0) continue;
+      image.data[i] = 255 - image.data[i];
+      image.data[i + 1] = 255 - image.data[i + 1];
+      image.data[i + 2] = 255 - image.data[i + 2];
+    }
+    layer.ctx.putImageData(image, 0, 0);
+    this.checkpoint('Invert Layer');
+  }
+
+  clearLayer(index: number): void {
+    const doc = this.doc;
+    const layer = doc?.layers[index];
+    if (!doc || !layer) return;
+    layer.ctx.clearRect(0, 0, doc.width, doc.height);
+    this.checkpoint('Clear Layer');
+  }
+
+  selectLayerPixels(index: number): void {
+    const doc = this.doc;
+    const layer = doc?.layers[index];
+    if (!doc || !layer) return;
+    doc.active = index;
+    const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    const mask = new Uint8Array(doc.width * doc.height);
+    for (let i = 0; i < mask.length; i++) mask[i] = image.data[i * 4 + 3] > 0 ? 255 : 0;
+    this.setSelection(mask, 'replace');
+    if (doc.selection) this.tool = 'move-pixels';
+    this.checkpoint('Select Pixels');
   }
 
   rotateZoomLayer(degrees: number, scale: number): void {
@@ -1067,12 +1438,19 @@ export class Editor {
       ctx.fillStyle = matte;
       ctx.fillRect(0, 0, doc.width, doc.height);
     }
-    for (const layer of doc.layers) {
-      if (!layer.visible) continue;
+    for (let index = 0; index < doc.layers.length; index++) {
+      const layer = doc.layers[index];
+      if (!this.layerShown(layer)) continue;
+      const lower = index > 0 && this.layerShown(doc.layers[index - 1]) ? doc.layers[index - 1].canvas : null;
+      ctx.save();
       ctx.globalAlpha = layer.opacity / 100;
-      ctx.drawImage(layer.canvas, 0, 0);
+      ctx.globalCompositeOperation = COMPOSITE[layer.blend];
+      const source = layer.clip ? this.masked(layer.canvas, lower) : layer.canvas;
+      ctx.drawImage(source, 0, 0);
+      ctx.restore();
     }
     ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
     return canvas;
   }
 
@@ -1100,6 +1478,106 @@ export class Editor {
     this.notify();
   }
 
+  async exportPinta(filename: string): Promise<void> {
+    const doc = this.doc;
+    if (!doc) return;
+    this.cancelFloat();
+    const files: { name: string; data: Uint8Array }[] = [];
+    const layerFiles = [];
+    for (const layer of doc.layers) {
+      const file = `${layer.id}.png`;
+      files.push({ name: file, data: new Uint8Array(await (await canvasToPng(layer.canvas)).arrayBuffer()) });
+      layerFiles.push({
+        id: layer.id,
+        name: layer.name,
+        visible: layer.visible,
+        opacity: layer.opacity,
+        blend: layer.blend,
+        clip: layer.clip,
+        tag: layer.tag,
+        parent: layer.parent,
+        file,
+      });
+    }
+    const history = [];
+    for (let step = 0; step < doc.snapshots.length; step++) {
+      const snapshot = doc.snapshots[step];
+      const layers = [];
+      for (let index = 0; index < snapshot.layers.length; index++) {
+        const layer = snapshot.layers[index];
+        const file = `history/${step}/${index}.png`;
+        const canvas = document.createElement('canvas');
+        canvas.width = snapshot.width;
+        canvas.height = snapshot.height;
+        context2d(canvas).putImageData(layer.data, 0, 0);
+        files.push({ name: file, data: new Uint8Array(await (await canvasToPng(canvas)).arrayBuffer()) });
+        layers.push({
+          name: layer.name,
+          visible: layer.visible,
+          opacity: layer.opacity,
+          blend: layer.blend ?? 'normal',
+          clip: !!layer.clip,
+          tag: layer.tag ?? null,
+          parent: layer.parent ?? null,
+          file,
+        });
+      }
+      history.push({
+        label: doc.labels[step] ?? '',
+        width: snapshot.width,
+        height: snapshot.height,
+        active: snapshot.active,
+        selection: snapshot.selection ? bytesToBase64(snapshot.selection) : null,
+        groups: snapshot.groups ?? [],
+        layers,
+      });
+    }
+    const manifest = {
+      format: 'pinta',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      document: {
+        name: doc.name,
+        width: doc.width,
+        height: doc.height,
+        active: doc.active,
+        zoom: doc.zoom,
+        selection: doc.selection ? bytesToBase64(doc.selection) : null,
+      },
+      settings: {
+        primary: this.primary,
+        secondary: this.secondary,
+        palette: this.palette,
+        tool: this.tool,
+        size: this.size,
+        opacity: this.opacity,
+        tolerance: this.tolerance,
+        brush: this.brush,
+        shape: this.shape,
+        selectionMode: this.selectionMode,
+        antialias: this.antialias,
+        lineMode: this.lineMode,
+        gradient: this.gradient,
+        corner: this.corner,
+        eraser: this.eraser,
+        font: this.font,
+        unit: this.unit,
+        gridSize: this.gridSize,
+        show: this.show,
+      },
+      groups: doc.groups.map(group => ({ ...group })),
+      layers: layerFiles,
+      history: { cursor: doc.cursor, steps: history },
+    };
+    files.unshift({ name: 'manifest.json', data: new TextEncoder().encode(JSON.stringify(manifest)) });
+    downloadBlob(zipStore(files), filename);
+    doc.fileBase = filename.replace(/\.[^.]+$/, '') || doc.fileBase;
+    doc.fileMime = 'application/pinta';
+    doc.name = filename;
+    doc.savedCursor = doc.cursor;
+    this.notify();
+  }
+
   scheduleSave(): void {
     if (this.restoring) return;
     const token = ++this.saveToken;
@@ -1117,7 +1595,16 @@ export class Editor {
       for (const doc of this.docs) {
         const layers = [];
         for (const layer of doc.layers) {
-          layers.push({ name: layer.name, visible: layer.visible, opacity: layer.opacity, png: await canvasToPng(layer.canvas) });
+          layers.push({
+            name: layer.name,
+            visible: layer.visible,
+            opacity: layer.opacity,
+            blend: layer.blend,
+            clip: layer.clip,
+            tag: layer.tag,
+            parent: layer.parent,
+            png: await canvasToPng(layer.canvas),
+          });
         }
         documents.push({
           name: doc.name,
@@ -1126,6 +1613,7 @@ export class Editor {
           active: doc.active,
           zoom: doc.zoom,
           selection: doc.selection,
+          groups: doc.groups.map(group => ({ ...group })),
           layers,
         });
       }
@@ -1164,10 +1652,15 @@ export class Editor {
         this.index = this.docs.length - 1;
         doc.zoom = stored.zoom || 1;
         doc.selection = stored.selection;
+        doc.groups = (stored.groups ?? []).map(group => ({ ...group }));
         doc.layers = [];
         for (const layer of stored.layers) {
           const bitmap = await createImageBitmap(layer.png);
           const created = this.makeLayer(layer.name, layer.visible, layer.opacity);
+          created.blend = (layer.blend as BlendMode | undefined) ?? 'normal';
+          created.clip = !!layer.clip;
+          created.tag = layer.tag ?? null;
+          created.parent = layer.parent ?? null;
           created.canvas.width = stored.width;
           created.canvas.height = stored.height;
           created.ctx = context2d(created.canvas);
