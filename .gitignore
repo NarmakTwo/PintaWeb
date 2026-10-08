@@ -37,3 +37,8 @@ xdg/pinta.desktop
 xdg/pinta.appdata.xml
 .vs
 .vscode
+web/dist
+web/test-results
+web/playwright-report
+web/src/wasm/*.wasm
+web/node_modules

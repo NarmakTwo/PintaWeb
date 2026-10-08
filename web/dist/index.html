@@ -3,117 +3,280 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#181b1b" />
-    <meta name="description" content="A private, browser-based image editor. Your files stay on your device." />
+    <meta name="theme-color" content="#fafafa" />
+    <meta name="description" content="Pinta in the browser. Draw, adjust, and export images without uploading them." />
     <title>Pinta</title>
-    <script type="module" crossorigin src="/assets/index-D-KUttZP.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CaBc_vTP.css">
+    <script type="module" crossorigin src="/assets/index-C0xBXMOp.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DUXvhm6b.css">
   </head>
   <body>
     <div id="app">
-      <header class="topbar">
-        <a class="brand" href="#" aria-label="Pinta home">
-          <span class="brand-mark"><span></span><span></span><span></span><span></span></span>
-          <span>Pinta</span>
-        </a>
-        <div class="document-name" id="document-name">Untitled image</div>
-        <div class="top-actions">
-          <button class="icon-button" id="undo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled><i data-lucide="undo-2"></i></button>
-          <button class="icon-button" id="redo" title="Redo (Ctrl+Y)" aria-label="Redo" disabled><i data-lucide="redo-2"></i></button>
-          <span class="toolbar-divider"></span>
-          <button class="button button-secondary" id="open-file"><i data-lucide="folder-open"></i><span>Open</span></button>
-          <button class="button button-primary" id="save-file"><i data-lucide="download"></i><span>Export</span></button>
+      <header class="menubar-row">
+        <div id="menubar" class="menubar" role="menubar"></div>
+        <div class="window-title">
+          <span class="mark" aria-hidden="true"></span>
+          <span id="document-name">Pinta</span>
+        </div>
+        <div class="window-actions">
+          <button type="button" class="icon-button" id="undo" title="Undo (Ctrl+Z)" aria-label="Undo"><i data-lucide="undo-2"></i></button>
+          <button type="button" class="icon-button" id="redo" title="Redo (Ctrl+Y)" aria-label="Redo"><i data-lucide="redo-2"></i></button>
         </div>
       </header>
 
-      <main class="editor">
-        <aside class="tool-rail" aria-label="Drawing tools">
-          <div class="tool-group">
-            <button class="tool-button selected" data-tool="brush" title="Brush (B)" aria-label="Brush"><i data-lucide="brush"></i></button>
-            <button class="tool-button" data-tool="eraser" title="Eraser (E)" aria-label="Eraser"><i data-lucide="eraser"></i></button>
-            <span class="rail-divider"></span>
-            <button class="tool-button" data-tool="line" title="Line (L)" aria-label="Line"><i data-lucide="minus"></i></button>
-            <button class="tool-button" data-tool="rectangle" title="Rectangle (R)" aria-label="Rectangle"><i data-lucide="square"></i></button>
-            <button class="tool-button" data-tool="ellipse" title="Ellipse (O)" aria-label="Ellipse"><i data-lucide="circle"></i></button>
-          </div>
-          <div class="color-control">
-            <span class="rail-label">Color</span>
-            <label class="color-swatch" title="Choose a color">
-              <input id="color-picker" type="color" value="#e46f52" aria-label="Choose drawing color" />
-              <span id="color-preview"></span>
-            </label>
-            <div class="swatch-list" aria-label="Recent colors">
-              <button class="mini-swatch" data-color="#e46f52" style="--swatch:#e46f52" aria-label="Coral"></button>
-              <button class="mini-swatch" data-color="#ecc36a" style="--swatch:#ecc36a" aria-label="Gold"></button>
-              <button class="mini-swatch" data-color="#8ab49a" style="--swatch:#8ab49a" aria-label="Sage"></button>
-              <button class="mini-swatch" data-color="#f3f0e8" style="--swatch:#f3f0e8" aria-label="White"></button>
+      <div id="tool-options" class="tool-options">
+        <label class="option">Size
+          <input id="size-slider" type="range" min="1" max="200" value="8" />
+          <output id="size-value">8</output>
+        </label>
+        <div id="tool-extra"></div>
+        <p id="tool-context" class="tool-context"></p>
+      </div>
+
+      <div class="workspace">
+        <aside id="toolbox" class="toolbox" aria-label="Toolbox">
+          <div id="tool-list" class="tool-list" role="toolbar"></div>
+          <div class="colors">
+            <div class="swatches">
+              <label class="color-field primary">
+                <span id="primary-swatch" class="swatch-face"></span>
+                <input id="primary-input" type="color" value="#000000" aria-label="Primary color" />
+              </label>
+              <label class="color-field secondary">
+                <span id="secondary-swatch" class="swatch-face"></span>
+                <input id="secondary-input" type="color" value="#ffffff" aria-label="Secondary color" />
+              </label>
+              <button type="button" class="icon-button swap" id="swap-colors" title="Swap colors (X)" aria-label="Swap colors"><i data-lucide="move-diagonal"></i></button>
             </div>
-          </div>
-          <div class="brush-control">
-            <label class="rail-label" for="brush-size">Size <output id="brush-size-value">8</output></label>
-            <input id="brush-size" type="range" min="1" max="80" value="8" aria-label="Brush size" />
+            <div id="palette" class="palette" aria-label="Palette"></div>
           </div>
         </aside>
 
-        <section class="workspace" aria-label="Image workspace">
-          <div class="workspace-toolbar">
-            <div class="tool-context" id="tool-context">Brush <span>•</span> 8 px</div>
-            <div class="view-controls">
-              <button class="icon-button compact" id="zoom-out" title="Zoom out" aria-label="Zoom out"><i data-lucide="minus"></i></button>
-              <button class="zoom-label" id="zoom-fit" title="Fit image to workspace">Fit</button>
-              <button class="icon-button compact" id="zoom-in" title="Zoom in" aria-label="Zoom in"><i data-lucide="plus"></i></button>
+        <div class="canvas-column">
+          <div class="ruler-corner"></div>
+          <canvas id="ruler-x" aria-hidden="true"></canvas>
+          <canvas id="ruler-y" aria-hidden="true"></canvas>
+          <div id="stage">
+            <div id="paper">
+              <canvas id="image-canvas"></canvas>
+              <canvas id="preview-canvas"></canvas>
+              <canvas id="overlay-canvas"></canvas>
+            </div>
+            <div id="empty-state" hidden>
+              <p>No image is open.</p>
+              <button type="button" id="empty-new">New image</button>
             </div>
           </div>
-          <div class="stage" id="stage">
-            <div class="empty-state" id="empty-state">
-              <div class="empty-art" aria-hidden="true"><i data-lucide="image-plus"></i></div>
-              <h1>Start with an image</h1>
-              <p>Open an image from your device, or create a blank canvas.</p>
-              <div class="empty-actions">
-                <button class="button button-primary" id="empty-open"><i data-lucide="folder-open"></i><span>Open image</span></button>
-                <button class="button button-secondary" id="new-image"><i data-lucide="file-plus-2"></i><span>New canvas</span></button>
+        </div>
+
+        <aside id="docks" class="docks">
+          <section class="dock" aria-labelledby="layers-heading">
+            <header class="dock-head">
+              <h2 id="layers-heading">Layers</h2>
+              <div class="dock-actions">
+                <button type="button" class="icon-button" data-command="layer-add" title="Add layer" aria-label="Add layer"><i data-lucide="plus"></i></button>
+                <button type="button" class="icon-button" data-command="layer-delete" title="Delete layer" aria-label="Delete layer"><i data-lucide="x"></i></button>
               </div>
-              <span class="privacy-note"><i data-lucide="shield-check"></i> Files stay on your device</span>
-            </div>
-            <div class="paper-wrap" id="paper-wrap" hidden>
-              <div class="paper" id="paper">
-                <canvas id="image-canvas"></canvas>
-                <canvas id="preview-canvas"></canvas>
-              </div>
-            </div>
-            <input id="file-input" type="file" accept="image/*,.bmp" hidden />
-          </div>
-          <footer class="statusbar">
-            <span id="image-dimensions">No image</span>
-            <span class="status-spacer"></span>
-            <span class="status-dot"></span><span>Local only</span>
-          </footer>
-        </section>
-      </main>
+            </header>
+            <ol id="layer-list"></ol>
+          </section>
+          <section class="dock" aria-labelledby="history-heading">
+            <header class="dock-head"><h2 id="history-heading">History</h2></header>
+            <ol id="history-list"></ol>
+          </section>
+        </aside>
+      </div>
+
+      <div id="tabs" class="tabs" role="tablist"></div>
+
+      <footer class="statusbar">
+        <span id="engine-status" data-state="loading">Starting pixel engine</span>
+        <span id="selection-status">No selection</span>
+        <span id="cursor-pos">0, 0</span>
+        <span id="image-dimensions"></span>
+        <button type="button" id="zoom-label" title="Fit the image">100%</button>
+        <span id="save-state" data-serial="0">Not saved yet</span>
+      </footer>
     </div>
 
-    <dialog id="new-dialog" class="new-dialog">
-      <form id="new-form" method="dialog">
-        <div class="dialog-heading"><div><span class="eyebrow">NEW DOCUMENT</span><h2>Blank canvas</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-lucide="x"></i></button></div>
-        <div class="dimension-fields">
-          <label>Width <span class="number-field"><input name="width" type="number" min="1" max="10000" value="1200" required /><span>px</span></span></label>
-          <label>Height <span class="number-field"><input name="height" type="number" min="1" max="10000" value="800" required /><span>px</span></span></label>
+    <textarea id="text-editor" hidden aria-label="Text"></textarea>
+    <div id="toast" hidden role="status"></div>
+    <input id="file-input" type="file" accept="image/*" hidden />
+    <input id="layer-input" type="file" accept="image/*" hidden />
+    <input id="palette-input" type="file" accept=".txt,text/plain" hidden />
+
+    <dialog id="new-dialog">
+      <form method="dialog">
+        <h2>New image</h2>
+        <label>Width <input id="new-width" type="number" min="1" max="8000" value="800" required /></label>
+        <label>Height <input id="new-height" type="number" min="1" max="8000" value="600" required /></label>
+        <label>Background
+          <select id="new-background">
+            <option value="white">White</option>
+            <option value="transparent">Transparent</option>
+            <option value="secondary">Secondary color</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="create-canvas" value="ok">Create</button>
         </div>
-        <label class="background-choice">Background <select name="background"><option value="transparent">Transparent</option><option value="white">White</option></select></label>
-        <div class="dialog-actions"><button class="button button-secondary" value="cancel">Cancel</button><button class="button button-primary" id="create-canvas" value="create">Create canvas</button></div>
       </form>
     </dialog>
 
-    <dialog id="export-dialog" class="new-dialog">
-      <form id="export-form" method="dialog">
-        <div class="dialog-heading"><div><span class="eyebrow">SAVE A COPY</span><h2>Export image</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-lucide="x"></i></button></div>
-        <label class="background-choice">File format <select name="format"><option value="image/png">PNG · transparent</option><option value="image/jpeg">JPEG · smaller file</option><option value="image/webp">WebP · smaller file</option></select></label>
-        <label class="background-choice">File name <span class="filename-field"><input name="filename" value="pinta-image" maxlength="120" required /><span id="export-extension">.png</span></span></label>
-        <p class="format-note" id="format-note">PNG preserves transparency and image detail.</p>
-        <div class="dialog-actions"><button class="button button-secondary" value="cancel">Cancel</button><button class="button button-primary" id="confirm-export" value="export"><i data-lucide="download"></i><span>Download</span></button></div>
+    <dialog id="export-dialog">
+      <form method="dialog">
+        <h2>Save image</h2>
+        <label>File name <input id="export-name" type="text" value="Untitled" required /></label>
+        <label>Format
+          <select id="export-format">
+            <option value="image/png">PNG</option>
+            <option value="image/jpeg">JPEG</option>
+            <option value="image/webp">WebP</option>
+            <option value="image/bmp">BMP</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="confirm-export" value="ok">Save</button>
+        </div>
       </form>
     </dialog>
 
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <dialog id="adjust-dialog">
+      <form method="dialog">
+        <h2 id="adjust-title">Adjust</h2>
+        <div id="adjust-fields"></div>
+        <div class="dialog-actions">
+          <button type="submit" id="adjust-cancel" value="cancel">Cancel</button>
+          <button type="submit" id="adjust-ok" value="ok">OK</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="resize-dialog">
+      <form method="dialog">
+        <h2>Resize image</h2>
+        <label>Width <input id="resize-width" type="number" min="1" max="8000" required /></label>
+        <label>Height <input id="resize-height" type="number" min="1" max="8000" required /></label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="resize-ok" value="ok">Resize</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="canvas-dialog">
+      <form method="dialog">
+        <h2>Canvas size</h2>
+        <label>Width <input id="canvas-width" type="number" min="1" max="8000" required /></label>
+        <label>Height <input id="canvas-height" type="number" min="1" max="8000" required /></label>
+        <label>Anchor
+          <select id="canvas-anchor">
+            <option value="nw">Top left</option>
+            <option value="n">Top</option>
+            <option value="ne">Top right</option>
+            <option value="w">Left</option>
+            <option value="c" selected>Center</option>
+            <option value="e">Right</option>
+            <option value="sw">Bottom left</option>
+            <option value="s">Bottom</option>
+            <option value="se">Bottom right</option>
+          </select>
+        </label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="canvas-ok" value="ok">Resize canvas</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="layer-dialog">
+      <form method="dialog">
+        <h2>Layer properties</h2>
+        <label>Name <input id="layer-name" type="text" required /></label>
+        <label>Opacity <input id="layer-opacity" type="number" min="0" max="100" required /></label>
+        <label class="check"><input id="layer-visible" type="checkbox" /> Visible</label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="layer-ok" value="ok">OK</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="rotate-dialog">
+      <form method="dialog">
+        <h2>Rotate / zoom layer</h2>
+        <label>Degrees <input id="rotate-degrees" type="number" value="0" /></label>
+        <label>Scale <input id="rotate-scale" type="number" min="0.05" max="8" step="0.05" value="1" /></label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="rotate-ok" value="ok">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="offset-dialog">
+      <form method="dialog">
+        <h2>Offset selection</h2>
+        <label>X <input id="offset-x" type="number" value="0" /></label>
+        <label>Y <input id="offset-y" type="number" value="0" /></label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="offset-ok" value="ok">Offset</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="grid-dialog">
+      <form method="dialog">
+        <h2>Pixel grid</h2>
+        <label>Spacing <input id="grid-size" type="number" min="2" max="256" value="16" /></label>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="submit" id="grid-ok" value="ok">Show grid</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="close-dialog">
+      <form method="dialog">
+        <h2>Save changes?</h2>
+        <p id="close-message">This image has unsaved changes.</p>
+        <div class="dialog-actions">
+          <button type="submit" id="close-cancel" value="cancel">Cancel</button>
+          <button type="submit" id="close-discard" value="discard">Discard</button>
+          <button type="submit" id="close-save" value="save">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="paste-dialog">
+      <form method="dialog">
+        <h2>Image is larger than the canvas</h2>
+        <p>Expand the canvas, or paste only the part that fits.</p>
+        <div class="dialog-actions">
+          <button type="submit" id="paste-cancel" value="cancel">Cancel</button>
+          <button type="submit" id="paste-clip" value="clip">Clip</button>
+          <button type="submit" id="paste-expand" value="expand">Expand</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="shortcuts-dialog">
+      <form method="dialog">
+        <h2>Keyboard shortcuts</h2>
+        <dl id="shortcuts-list"></dl>
+        <div class="dialog-actions"><button type="submit" value="ok">Close</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="about-dialog">
+      <form method="dialog">
+        <h2>About Pinta</h2>
+        <p>Paint, select, adjust, and export images in the browser. Pixel effects run in WebAssembly. Open images stay in this browser until you save a file.</p>
+        <div class="dialog-actions"><button type="submit" value="ok">Close</button></div>
+      </form>
+    </dialog>
+
   </body>
 </html>
