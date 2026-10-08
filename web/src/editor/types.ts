@@ -36,7 +36,7 @@ export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string;
   { id: 'move-pixels', label: 'Move Selected Pixels', shortcut: 'M', icon: 'move', hint: 'Drag to move pixels inside the selection. With no selection, the whole layer moves.' },
   { id: 'move-selection', label: 'Move Selection', shortcut: 'M', icon: 'move-diagonal', hint: 'Drag to move the selection outline without changing pixels.' },
   { id: 'zoom', label: 'Zoom', shortcut: 'Z', icon: 'zoom-in', hint: 'Click to zoom in. Alt-click or right-click to zoom out. Drag to zoom into a rectangle.' },
-  { id: 'pan', label: 'Pan', shortcut: 'H', icon: 'hand', hint: 'Drag to move around the canvas. Hold Space to pan with any tool.' },
+  { id: 'pan', label: 'Pan', shortcut: 'H', icon: 'hand', hint: 'Drag to move around the canvas. Hold Space to pan with any tool. Two fingers pan, and a pinch zooms.' },
   { id: 'rect-select', label: 'Rectangle Select', shortcut: 'S', icon: 'square-dashed', hint: 'Drag a rectangular selection. Hold Shift for a square.' },
   { id: 'ellipse-select', label: 'Ellipse Select', shortcut: 'S', icon: 'circle-dashed', hint: 'Drag an elliptical selection. Hold Shift for a circle.' },
   { id: 'lasso', label: 'Lasso Select', shortcut: 'S', icon: 'lasso', hint: 'Draw around the area you want to select.' },

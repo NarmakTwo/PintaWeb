@@ -155,7 +155,9 @@ function viewMenu(): string {
     item('Zoom In', 'zoom-in'), item('Zoom Out', 'zoom-out'), item('Normal Size', 'zoom-100', 'Ctrl+0'), item('Best Fit', 'zoom-fit'), item('Zoom to Selection', 'zoom-selection'), '<div class="sep"></div>',
     item('Rulers', 'toggle-rulers'), item('Status Bar', 'toggle-status'), item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'),
     item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Pixel Grid', 'toggle-grid'), item('Grid Size…', 'grid-size'), '<div class="sep"></div>',
-    item('Pixels', 'unit-px'), item('Inches', 'unit-in'), item('Centimeters', 'unit-cm'), '<div class="sep"></div>', item('Fullscreen', 'fullscreen'),
+    item('Pixels', 'unit-px'), item('Inches', 'unit-in'), item('Centimeters', 'unit-cm'), '<div class="sep"></div>',
+    '<button type="button" data-command="theme-dark" aria-checked="false">Dark Mode<span class="shortcut" id="theme-mark">Off</span></button>',
+    '<div class="sep"></div>', item('Fullscreen', 'fullscreen'),
   ].join('');
 }
 
@@ -200,18 +202,60 @@ function effectGroups(): string {
 
 function wire(editor: Editor, tools: ToolController): void {
   const paper = $('paper');
+  const contacts = new Map<number, { x: number; y: number }>();
+  let pinch: { distance: number; cx: number; cy: number; zoom: number } | null = null;
+
+  const measure = () => {
+    const points = [...contacts.values()];
+    if (points.length < 2) return null;
+    const [a, b] = points;
+    return {
+      distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+      cx: (a.x + b.x) / 2,
+      cy: (a.y + b.y) / 2,
+    };
+  };
+
   paper.addEventListener('pointerdown', event => {
-    if (event.button === 2) event.preventDefault();
+    if (event.cancelable) event.preventDefault();
+    contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    paper.setPointerCapture(event.pointerId);
+    if (contacts.size > 1) {
+      tools.abandon();
+      const span = measure();
+      if (span && editor.doc) pinch = { ...span, zoom: editor.doc.zoom };
+      return;
+    }
     tools.down(event);
   });
   paper.addEventListener('pointermove', event => {
+    if (contacts.has(event.pointerId)) contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pinch && contacts.size > 1) {
+      const span = measure();
+      if (span && editor.doc) {
+        editor.zoomAt(pinch.zoom * (span.distance / pinch.distance), pinch.cx, pinch.cy);
+        editor.stage.scrollLeft -= span.cx - pinch.cx;
+        editor.stage.scrollTop -= span.cy - pinch.cy;
+      }
+      return;
+    }
     tools.move(event);
     const point = editor.imagePoint(event);
     if (!point || !editor.doc) return;
     $('cursor-pos').textContent = `${formatUnit(point.x, editor.unit)}, ${formatUnit(point.y, editor.unit)}`;
   });
-  paper.addEventListener('pointerup', event => tools.up(event));
-  paper.addEventListener('pointercancel', event => tools.up(event));
+  const release = (event: PointerEvent) => {
+    const pinching = pinch !== null;
+    contacts.delete(event.pointerId);
+    if (pinching) {
+      if (contacts.size < 2) pinch = null;
+      return;
+    }
+    if (event.type === 'pointercancel') tools.abandon();
+    else tools.up(event);
+  };
+  paper.addEventListener('pointerup', release);
+  paper.addEventListener('pointercancel', release);
   paper.addEventListener('contextmenu', event => event.preventDefault());
   paper.addEventListener('wheel', event => {
     if (!event.ctrlKey || !editor.doc) return;
@@ -295,6 +339,11 @@ function wire(editor: Editor, tools: ToolController): void {
     if (event.key === ' ') editor.space = false;
   });
   window.addEventListener('resize', () => paintRulers(editor));
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (localStorage.getItem('pinta-theme')) return;
+    applyTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    editor.notify();
+  });
   $('palette').addEventListener('click', event => {
     const button = (event.target as HTMLElement).closest('button');
     if (!button?.dataset.color) return;
@@ -406,6 +455,7 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   } else if (command === 'unit-px') setUnit(editor, 'px');
   else if (command === 'unit-in') setUnit(editor, 'in');
   else if (command === 'unit-cm') setUnit(editor, 'cm');
+  else if (command === 'theme-dark') toggleTheme(editor);
   else if (command === 'fullscreen') {
     if (document.fullscreenElement) await document.exitFullscreen();
     else await document.documentElement.requestFullscreen();
@@ -453,6 +503,18 @@ function setUnit(editor: Editor, unit: Unit): void {
   editor.unit = unit;
   editor.notify();
   paintRulers(editor);
+}
+
+function applyTheme(theme: 'dark' | 'light'): void {
+  document.documentElement.dataset.theme = theme;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#242424' : '#fafafa');
+}
+
+function toggleTheme(editor: Editor): void {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('pinta-theme', next);
+  applyTheme(next);
+  editor.notify();
 }
 
 function swapColors(editor: Editor): void {
@@ -657,6 +719,11 @@ let optionTool: ToolId | null = null;
 function sync(editor: Editor): void {
   const doc = editor.doc;
   const app = $('app');
+  const dark = document.documentElement.dataset.theme === 'dark';
+  const themeButton = document.querySelector<HTMLButtonElement>('[data-command="theme-dark"]');
+  if (themeButton) themeButton.setAttribute('aria-checked', String(dark));
+  const themeMark = document.getElementById('theme-mark');
+  if (themeMark) themeMark.textContent = dark ? 'On' : 'Off';
   app.dataset.rulers = editor.show.rulers ? '1' : '0';
   app.dataset.status = editor.show.status ? '1' : '0';
   app.dataset.tools = editor.show.tools ? '1' : '0';
@@ -786,8 +853,9 @@ function paintAxis(canvas: HTMLCanvasElement, horizontal: boolean, length: numbe
   if (!ctx) return;
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = '#5e5c64';
-  ctx.strokeStyle = '#9a9996';
+  const theme = getComputedStyle(document.documentElement);
+  ctx.fillStyle = theme.getPropertyValue('--muted').trim();
+  ctx.strokeStyle = theme.getPropertyValue('--tick').trim();
   ctx.font = '10px Cantarell, Segoe UI, sans-serif';
   ctx.lineWidth = 1;
   if (!length || !editor.doc) return;

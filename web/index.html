@@ -6,6 +6,14 @@
     <meta name="theme-color" content="#fafafa" />
     <meta name="description" content="Pinta in the browser. Draw, adjust, and export images without uploading them." />
     <title>Pinta</title>
+    <script>
+      try {
+        var savedTheme = localStorage.getItem('pinta-theme');
+        var darkTheme = savedTheme ? savedTheme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.dataset.theme = darkTheme ? 'dark' : 'light';
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', darkTheme ? '#242424' : '#fafafa');
+      } catch (error) {}
+    </script>
   </head>
   <body>
     <div id="app">

@@ -59,6 +59,19 @@ async function pixel(page: Page, xRatio: number, yRatio: number): Promise<number
   }, { xRatio, yRatio });
 }
 
+test('switches to dark mode and keeps the choice', async ({ page }) => {
+  await ready(page);
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="theme-dark"]').click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await expect(page.locator('#theme-mark')).toHaveText('On');
+  const background = await page.locator('body').evaluate(element => getComputedStyle(element).backgroundColor);
+  expect(background).toBe('rgb(36, 36, 36)');
+  await page.reload();
+  await expect(page.locator('#engine-status')).toHaveAttribute('data-state', 'ready');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
+
 test('starts the pixel engine and lists every tool', async ({ page }) => {
   await ready(page);
   const tools = page.locator('#tool-list [data-tool]');
@@ -224,4 +237,28 @@ test('can use every tool without a script error', async ({ page }) => {
     } else await drag(page, 0.2, 0.2, 0.7, 0.6);
     await expect(page.locator('#image-canvas')).toBeVisible();
   }
+});
+
+test.describe('touchscreen', () => {
+  test.use({ hasTouch: true });
+
+  test('draws with a finger instead of scrolling the canvas', async ({ page }) => {
+    await ready(page);
+    await newCanvas(page);
+    await page.locator('[data-tool="pencil"]').click();
+    await page.locator('#size-slider').fill('16');
+    const box = await page.locator('#paper').boundingBox();
+    if (!box) throw new Error('The canvas is not visible.');
+    const x = box.x + box.width * 0.5;
+    const y = box.y + box.height * 0.5;
+    const client = await page.context().newCDPSession(page);
+    const point = (type: 'touchStart' | 'touchMove' | 'touchEnd', active: boolean) => client.send('Input.dispatchTouchEvent', {
+      type,
+      touchPoints: active ? [{ x, y: type === 'touchMove' ? y + 12 : y, id: 1 }] : [],
+    });
+    await point('touchStart', true);
+    await point('touchMove', true);
+    await point('touchEnd', false);
+    await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
+  });
 });

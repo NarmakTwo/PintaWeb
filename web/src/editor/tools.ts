@@ -313,6 +313,25 @@ export class ToolController {
     this.last = point;
   }
 
+  abandon(): void {
+    const editor = this.editor;
+    const wasDrawing = this.drawing;
+    this.drawing = false;
+    this.panning = false;
+    if (editor.float) editor.cancelFloat();
+    else if (wasDrawing && this.before && editor.layer) editor.layer.ctx.putImageData(this.before, 0, 0);
+    if (this.baseMask && editor.doc) {
+      editor.doc.selection = new Uint8Array(this.baseMask);
+      editor.rebuildEdges();
+    }
+    this.before = null;
+    this.baseMask = null;
+    this.points = [];
+    this.start = null;
+    clearPreview(editor);
+    if (wasDrawing) editor.renderScene();
+  }
+
   up(event: PointerEvent): void {
     const editor = this.editor;
     if (this.panning) {
