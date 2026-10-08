@@ -2,13 +2,21 @@ import { PixelEngine, rgba, type Rgba } from '../wasm/engine.ts';
 import { canvasToPng, clearSession, downloadBlob, encodeBmp, loadSession, saveSession, type SessionRecord } from './storage.ts';
 import { zipStore } from './zip.ts';
 import {
-  boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask,
+  boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask, TOOLS,
   type Bounds, type BrushId, type GradientKind, type Point, type SelectMode, type ShapeStyle, type ToolId, type Unit,
 } from './types.ts';
 
 export const BLEND_MODES = ['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'] as const;
 export type BlendMode = typeof BLEND_MODES[number];
-export const LAYER_TAGS = ['#c01c28', '#e5a50a', '#2ec27e', '#1c71d8', '#9141ac'] as const;
+export const LAYER_TAGS = [
+  { name: 'White', color: '#ffffff' },
+  { name: 'Red', color: '#c01c28' },
+  { name: 'Yellow', color: '#e5a50a' },
+  { name: 'Green', color: '#2ec27e' },
+  { name: 'Blue', color: '#1c71d8' },
+  { name: 'Purple', color: '#9141ac' },
+] as const;
+export const DEFAULT_TAG = LAYER_TAGS[0].color;
 
 const COMPOSITE: Record<BlendMode, GlobalCompositeOperation> = {
   normal: 'source-over',
@@ -145,7 +153,7 @@ export class Editor {
   docs: Doc[] = [];
   index = -1;
   space = false;
-  cloneMarker: Point | null = null;
+  draftEdges: Uint16Array | null = null;
   float: FloatState | null = null;
   ants = 0;
   edges: Int32Array | null = null;
@@ -228,7 +236,7 @@ export class Editor {
     canvas.height = data?.height ?? doc?.height ?? 1;
     const ctx = context2d(canvas);
     if (data) ctx.putImageData(data, 0, 0);
-    return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: null, parent: null, canvas, ctx };
+    return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: DEFAULT_TAG, parent: null, canvas, ctx };
   }
 
   private capture(): Snapshot {
@@ -609,26 +617,27 @@ export class Editor {
       }
       ctx.stroke();
     }
-    if (this.edges) {
-      const limit = Math.min(this.edges.length, 200000);
+    const paintEdges = (edges: ArrayLike<number>) => {
+      const limit = Math.min(edges.length, 200000);
       for (let i = 0; i < limit; i += 2) {
-        const x = this.edges[i];
-        const y = this.edges[i + 1];
+        const x = edges[i];
+        const y = edges[i + 1];
         ctx.fillStyle = ((x + y + this.ants) & 4) === 0 ? '#111' : '#fff';
         ctx.fillRect(x, y, 1, 1);
       }
-    }
-    if (this.cloneMarker) {
-      ctx.strokeStyle = '#1c71d8';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(this.cloneMarker.x - 4.5, this.cloneMarker.y - 4.5, 9, 9);
-      ctx.beginPath();
-      ctx.moveTo(this.cloneMarker.x - 7, this.cloneMarker.y);
-      ctx.lineTo(this.cloneMarker.x + 7, this.cloneMarker.y);
-      ctx.moveTo(this.cloneMarker.x, this.cloneMarker.y - 7);
-      ctx.lineTo(this.cloneMarker.x, this.cloneMarker.y + 7);
-      ctx.stroke();
-    }
+    };
+    if (this.edges) paintEdges(this.edges);
+    if (this.draftEdges) paintEdges(this.draftEdges);
+  }
+
+  renameDocument(name: string): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const clean = name.replace(/[\u0000-\u001f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!clean) return;
+    doc.name = clean;
+    doc.fileBase = clean.replace(/\.[^.]+$/, '') || clean;
+    this.notify();
   }
 
   rebuildEdges(): void {
@@ -1208,7 +1217,7 @@ export class Editor {
       name: 'Group',
       visible: true,
       collapsed: false,
-      tag: null,
+      tag: DEFAULT_TAG,
       parent: layer.parent,
     };
     doc.groups.push(group);
@@ -1644,7 +1653,7 @@ export class Editor {
       this.primary = session.primary || this.primary;
       this.secondary = session.secondary || this.secondary;
       this.palette = session.palette?.length ? session.palette : this.palette;
-      this.tool = session.tool || this.tool;
+      this.tool = TOOLS.some(tool => tool.id === session.tool) ? session.tool : 'brush';
       this.docs = [];
       for (const stored of session.documents) {
         const doc = this.blank(stored.width, stored.height, stored.name);

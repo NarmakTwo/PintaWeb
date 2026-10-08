@@ -1,6 +1,6 @@
 import { createIcons, icons } from 'lucide';
 import { ADJUSTMENTS, ALL_EFFECTS, EFFECTS, performEffect, valuesFrom, type AdjustValues, type Field } from './commands.ts';
-import { BLEND_MODES, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
+import { BLEND_MODES, DEFAULT_TAG, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
 import { canvasToPng, downloadBlob, parsePalette, serializePalette } from './storage.ts';
 import { ToolController } from './tools.ts';
 import { boundsOf, DEFAULT_PALETTE, TOOLS, toolFromShortcut, type ToolId, type Unit } from './types.ts';
@@ -59,11 +59,16 @@ export async function start(): Promise<void> {
   }
   sync(editor);
   window.setInterval(() => {
-    if (!editor.doc?.selection) return;
+    if (!editor.doc?.selection && !editor.draftEdges) return;
     editor.ants = (editor.ants + 1) % 8;
     editor.paintOverlay();
   }, 120);
 }
+
+const CUSTOM_ICONS: Record<string, string> = {
+  pen: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M 15.54,3.5 20.5,8.47 19.07,9.88 14.12,4.93 15.54,3.5 M 3.5,19.78 10,13.31 C 9.9,13 9.97,12.61 10.23,12.35 c 0.39,-0.39 1.03,-0.39 1.42,0 0.39,0.4 0.39,1.03 0,1.42 C 11.39,14.03 11,14.1 10.69,14 L 4.22,20.5 14.83,16.95 18.36,10.59 13.42,5.64 7.05,9.17 Z"/></svg>',
+  'lasso-select': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.704 14.467a10 8 0 1 1 3.115 2.375" stroke-dasharray="2 4"/><path d="M7 22a5 5 0 0 1-2-3.994" stroke-dasharray="2 4"/><circle cx="5" cy="16" r="2"/></svg>',
+};
 
 function buildChrome(editor: Editor, tools: ToolController): void {
   const menus: { id: string; label: string; items: string }[] = [
@@ -93,7 +98,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
     button.title = `${tool.label} (${tool.shortcut})`;
     button.setAttribute('aria-label', tool.label);
     button.setAttribute('aria-pressed', String(tool.id === editor.tool));
-    button.innerHTML = `<i data-lucide="${tool.icon}"></i>`;
+    button.innerHTML = CUSTOM_ICONS[tool.icon] ?? `<i data-lucide="${tool.icon}"></i>`;
     button.addEventListener('click', () => {
       tools.commitText();
       if (tool.id === 'picker') editor.rememberTool();
@@ -201,6 +206,41 @@ function effectGroups(): string {
 }
 
 function wire(editor: Editor, tools: ToolController): void {
+  $('document-name').addEventListener('dblclick', () => {
+    const doc = editor.doc;
+    const host = $('document-name');
+    if (!doc || host.querySelector('input')) return;
+    const input = document.createElement('input');
+    input.className = 'document-rename';
+    input.value = doc.name;
+    input.maxLength = 120;
+    input.setAttribute('aria-label', 'Image title');
+    host.textContent = '';
+    host.append(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const close = (commit: boolean) => {
+      if (done) return;
+      done = true;
+      const next = input.value;
+      input.remove();
+      if (commit) editor.renameDocument(next);
+      editor.notify();
+    };
+    input.addEventListener('keydown', event => {
+      event.stopPropagation();
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        close(true);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        close(false);
+      }
+    });
+    input.addEventListener('blur', () => close(true));
+  });
+
   const paper = $('paper');
   const contacts = new Map<number, { x: number; y: number }>();
   let pinch: { distance: number; cx: number; cy: number; zoom: number } | null = null;
@@ -258,19 +298,6 @@ function wire(editor: Editor, tools: ToolController): void {
   paper.addEventListener('pointercancel', release);
   paper.addEventListener('contextmenu', event => {
     event.preventDefault();
-    if (!editor.doc) return;
-    openContext(event.clientX, event.clientY, [
-      { label: 'Paste', action: () => void run(editor, tools, 'paste') },
-      { label: 'Select all', action: () => editor.selectAll() },
-      { label: 'Deselect', action: () => editor.deselect() },
-      { separator: true },
-      { label: 'Zoom in', action: () => editor.zoomAt(editor.doc!.zoom * 1.25, event.clientX, event.clientY) },
-      { label: 'Zoom out', action: () => editor.zoomAt(editor.doc!.zoom / 1.25, event.clientX, event.clientY) },
-      { label: 'Fit image', action: () => editor.fit() },
-      { separator: true },
-      { label: 'Flip horizontal', action: () => editor.flip(true, 'image') },
-      { label: 'Flip vertical', action: () => editor.flip(false, 'image') },
-    ]);
   });
   paper.addEventListener('wheel', event => {
     if (!event.ctrlKey || !editor.doc) return;
@@ -278,6 +305,11 @@ function wire(editor: Editor, tools: ToolController): void {
     editor.zoomAt(editor.doc.zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
   }, { passive: false });
 
+  $('context-menu').addEventListener('pointerover', event => {
+    const host = (event.target as HTMLElement).closest<HTMLElement>('.menu-sub');
+    if (!host || host.contains(event.relatedTarget as Node)) return;
+    placeSubmenu(host);
+  });
   $('context-menu').addEventListener('click', event => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-action]');
     if (!button) return;
@@ -840,6 +872,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   else if (!ctrl && event.shiftKey && key === 'f') { event.preventDefault(); editor.flip(false, 'layer'); }
   else if (event.key === 'F4') { event.preventDefault(); void run(editor, tools, 'layer-properties'); }
   else if (event.key === 'Escape') {
+    if (document.activeElement?.classList.contains('document-rename')) return;
     if (!$('context-menu').hidden) closeContext();
     else if (editor.float) editor.cancelFloat();
     else editor.deselect();
@@ -883,11 +916,60 @@ function openContext(x: number, y: number, entries: ContextEntry[]): void {
   menuActions = [];
   menu.innerHTML = contextHtml(entries);
   menu.hidden = false;
-  menu.style.left = `${Math.max(8, x)}px`;
-  menu.style.top = `${Math.max(8, y)}px`;
+  placeOnScreen(menu, x, y);
+}
+
+function viewSize(): { width: number; height: number } {
+  const view = window.visualViewport;
+  return {
+    width: view?.width ?? document.documentElement.clientWidth,
+    height: view?.height ?? document.documentElement.clientHeight,
+  };
+}
+
+function placeOnScreen(menu: HTMLElement, x: number, y: number): void {
+  const margin = 8;
+  const size = viewSize();
+  menu.style.left = `${margin}px`;
+  menu.style.top = `${margin}px`;
+  const left = Math.min(Math.max(margin, x), Math.max(margin, size.width - menu.offsetWidth - margin));
+  const top = Math.min(Math.max(margin, y), Math.max(margin, size.height - menu.offsetHeight - margin));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
   const box = menu.getBoundingClientRect();
-  if (box.right > window.innerWidth - 8) menu.style.left = `${Math.max(8, window.innerWidth - box.width - 8)}px`;
-  if (box.bottom > window.innerHeight - 8) menu.style.top = `${Math.max(8, window.innerHeight - box.height - 8)}px`;
+  const fitted = viewSize();
+  if (box.right > fitted.width - margin) menu.style.left = `${Math.max(margin, fitted.width - box.width - margin)}px`;
+  if (box.bottom > fitted.height - margin) menu.style.top = `${Math.max(margin, fitted.height - box.height - margin)}px`;
+}
+
+function placeSubmenu(host: HTMLElement): void {
+  const sub = host.querySelector<HTMLElement>(':scope > .submenu');
+  if (!sub) return;
+  const margin = 8;
+  const shown = sub.style.display;
+  sub.style.display = 'block';
+  sub.style.left = '0px';
+  sub.style.right = 'auto';
+  sub.style.top = '0px';
+  const parent = host.getBoundingClientRect();
+  const width = sub.offsetWidth;
+  const height = sub.offsetHeight;
+  const view = viewSize();
+  const roomRight = view.width - margin - parent.right;
+  const roomLeft = parent.left - margin;
+  const openLeft = width > roomRight && roomLeft >= roomRight;
+  if (openLeft) {
+    sub.style.left = 'auto';
+    sub.style.right = `${Math.max(0, host.offsetWidth - 4)}px`;
+  } else {
+    sub.style.left = `${Math.max(0, host.offsetWidth - 4)}px`;
+    sub.style.right = 'auto';
+  }
+  let top = 0;
+  if (parent.top + height > view.height - margin) top = view.height - margin - height - parent.top;
+  if (parent.top + top < margin) top = margin - parent.top;
+  sub.style.top = `${Math.round(top)}px`;
+  sub.style.display = shown;
 }
 
 function contextHtml(entries: ContextEntry[]): string {
@@ -975,11 +1057,11 @@ function layerMarkup(editor: Editor): string {
 }
 
 function groupRow(group: { id: number; name: string; visible: boolean; collapsed: boolean; tag: string | null }, depth: number): string {
-  return `<li class="layer-row group-row" data-group="${group.id}" style="padding-left:${depth * 12}px"><button type="button" class="chevron${group.collapsed ? ' collapsed' : ''}" data-collapse="${group.id}" aria-label="${group.collapsed ? 'Expand group' : 'Collapse group'}"></button><button type="button" class="layer" data-group="${group.id}"><i class="tag" style="background:${group.tag ?? 'transparent'}"></i><span class="layer-name">${escapeHtml(group.name)}</span></button><input type="checkbox" data-group-visible="${group.id}" ${group.visible ? 'checked' : ''} aria-label="Group visible" /></li>`;
+  return `<li class="layer-row group-row" data-group="${group.id}" style="padding-left:${depth * 12}px"><button type="button" class="chevron${group.collapsed ? ' collapsed' : ''}" data-collapse="${group.id}" aria-label="${group.collapsed ? 'Expand group' : 'Collapse group'}"></button><button type="button" class="layer" data-group="${group.id}"><i class="tag" style="background:${group.tag || DEFAULT_TAG}"></i><span class="layer-name">${escapeHtml(group.name)}</span></button><input type="checkbox" data-group-visible="${group.id}" ${group.visible ? 'checked' : ''} aria-label="Group visible" /></li>`;
 }
 
 function layerRow(layer: { name: string; visible: boolean; opacity: number; tag: string | null }, index: number, depth: number, active: boolean): string {
-  return `<li class="layer-row" data-layer="${index}" style="padding-left:${depth * 12}px"><button type="button" class="layer" data-layer="${index}" data-active="${active}"><i class="tag" style="background:${layer.tag ?? 'transparent'}"></i><span class="layer-name">${escapeHtml(layer.name)}</span><span class="layer-meta">${layer.opacity}%</span></button><input type="checkbox" data-visible data-layer="${index}" ${layer.visible ? 'checked' : ''} aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}" /></li>`;
+  return `<li class="layer-row" data-layer="${index}" style="padding-left:${depth * 12}px"><button type="button" class="layer" data-layer="${index}" data-active="${active}"><i class="tag" style="background:${layer.tag || DEFAULT_TAG}"></i><span class="layer-name">${escapeHtml(layer.name)}</span><span class="layer-meta">${layer.opacity}%</span></button><input type="checkbox" data-visible data-layer="${index}" ${layer.visible ? 'checked' : ''} aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}" /></li>`;
 }
 
 function useLayer(editor: Editor, index: number): void {
@@ -987,12 +1069,14 @@ function useLayer(editor: Editor, index: number): void {
 }
 
 function tagMenu(apply: (tag: string | null) => void, current: string | null): ContextEntry {
+  const selected = (current || DEFAULT_TAG).toLowerCase();
   return {
     label: 'Color tag',
-    children: [
-      { label: 'None', checked: current == null, action: () => apply(null) },
-      ...LAYER_TAGS.map(tag => ({ label: tag, checked: current === tag, action: () => apply(tag) })),
-    ],
+    children: LAYER_TAGS.map(tag => ({
+      label: tag.name,
+      checked: selected === tag.color,
+      action: () => apply(tag.color),
+    })),
   };
 }
 
@@ -1123,7 +1207,7 @@ function sync(editor: Editor): void {
   app.dataset.toolbar = editor.show.toolbar ? '1' : '0';
   app.dataset.docks = editor.show.docks ? '1' : '0';
   app.dataset.tabs = editor.show.tabs ? '1' : '0';
-  $('document-name').textContent = doc ? `${doc.name}${editor.dirty ? ' •' : ''}` : 'Pinta';
+  if (!$('document-name').querySelector('input')) $('document-name').textContent = doc ? `${doc.name}${editor.dirty ? ' •' : ''}` : 'Pinta';
   document.title = doc ? `${doc.name} — Pinta` : 'Pinta';
   $<HTMLButtonElement>('undo').disabled = !doc || doc.cursor <= 0;
   $<HTMLButtonElement>('redo').disabled = !doc || doc.cursor >= doc.snapshots.length - 1;
@@ -1161,17 +1245,17 @@ function sync(editor: Editor): void {
 
 function extraOptions(editor: Editor): string {
   const tool = editor.tool;
-  const drawing = ['brush', 'pencil', 'eraser', 'recolor', 'clone', 'line', 'rectangle', 'rounded', 'ellipse', 'freeform', 'text'].includes(tool);
+  const drawing = ['brush', 'pen', 'pencil', 'eraser', 'recolor', 'line', 'rectangle', 'rounded', 'ellipse', 'freeform', 'lasso-draw', 'text', 'lighten', 'darken', 'dither'].includes(tool);
   const parts: string[] = [];
   if (drawing || tool === 'bucket' || tool === 'gradient') {
     parts.push(`<label class="option">Opacity <input id="opacity-slider" type="range" min="1" max="100" value="${editor.opacity}" /></label>`);
   }
-  if (tool === 'brush' || tool === 'clone' || tool === 'eraser') {
+  if (tool === 'brush' || tool === 'eraser') {
     parts.push(`<label class="option">Brush <select id="brush-select">${['plain', 'circle', 'squares', 'splatter', 'slash', 'grid'].map(id => `<option value="${id}" ${id === editor.brush ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
   }
   if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
   if (tool === 'bucket' || tool === 'wand' || tool === 'recolor') parts.push(`<label class="option">Tolerance <input id="tolerance-slider" type="range" min="0" max="100" value="${editor.tolerance}" /></label>`);
-  if (tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse' || tool === 'freeform') {
+  if (tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse' || tool === 'freeform' || tool === 'lasso-draw') {
     parts.push(`<label class="option">Style <select id="shape-select"><option value="outline">Outline</option><option value="fill" ${editor.shape === 'fill' ? 'selected' : ''}>Fill</option><option value="both" ${editor.shape === 'both' ? 'selected' : ''}>Fill and outline</option></select></label>`);
   }
   if (tool === 'rounded') parts.push(`<label class="option">Corner <input id="corner-slider" type="range" min="0" max="200" value="${editor.corner}" /></label>`);

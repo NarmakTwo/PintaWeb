@@ -171,6 +171,16 @@ kbd, .shortcut {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: text;
+}
+.document-rename {
+  width: 14em;
+  max-width: 40vw;
+  padding: 1px 4px;
+  font: inherit;
+  color: inherit;
+  background: var(--field);
+  border: 1px solid var(--line);
 }
 
 .tool-options {
@@ -235,7 +245,7 @@ kbd, .shortcut {
 .layer-row { display: flex; align-items: center; gap: 4px; cursor: grab; user-select: none; }
 .layer-row .layer { flex: 1; min-width: 0; }
 .layer-row input[type="checkbox"] { flex: 0 0 auto; margin: 0; }
-.layer-row .tag { width: 8px; height: 8px; flex: 0 0 auto; background: transparent; }
+.layer-row .tag { width: 8px; height: 8px; flex: 0 0 auto; background: #ffffff; box-shadow: inset 0 0 0 1px var(--line); }
 .layer-meta { margin-left: auto; color: var(--muted); font-size: 11px; }
 .chevron {
   width: 14px;
@@ -267,8 +277,7 @@ kbd, .shortcut {
   position: fixed;
   z-index: 80;
   min-width: 210px;
-  max-height: calc(100vh - 16px);
-  overflow: auto;
+  overflow: visible;
   padding: 4px;
   background: var(--chrome);
   color: var(--ink);
@@ -296,8 +305,6 @@ kbd, .shortcut {
   left: calc(100% - 4px);
   top: 0;
   min-width: 168px;
-  max-height: 280px;
-  overflow: auto;
   padding: 4px;
   background: var(--chrome);
   color: var(--ink);
@@ -339,6 +346,7 @@ kbd, .shortcut {
   display: grid;
   place-items: center;
   border: 1px solid transparent;
+  color: var(--ink);
 }
 
 .tool-button[aria-pressed="true"] {

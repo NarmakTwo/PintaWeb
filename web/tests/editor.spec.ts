@@ -75,10 +75,11 @@ test('switches to dark mode and keeps the choice', async ({ page }) => {
 test('starts the pixel engine and lists every tool', async ({ page }) => {
   await ready(page);
   const tools = page.locator('#tool-list [data-tool]');
-  await expect(tools).toHaveCount(22);
+  await expect(tools).toHaveCount(26);
   const ids = await tools.evaluateAll(nodes => nodes.map(node => node.getAttribute('data-tool')));
-  expect(new Set(ids).size).toBe(22);
-  for (let index = 0; index < 22; index++) {
+  expect(new Set(ids).size).toBe(26);
+  expect(ids).not.toContain('clone');
+  for (let index = 0; index < 26; index++) {
     await tools.nth(index).click();
     await expect(tools.nth(index)).toHaveAttribute('aria-pressed', 'true');
   }
@@ -228,12 +229,6 @@ test('can use every tool without a script error', async ({ page }) => {
       await page.mouse.click(point.x, point.y);
       await page.locator('#text-editor').fill('Pinta');
       await page.locator('#text-editor').press('Enter');
-    } else if (id === 'clone') {
-      const source = await paperPoint(page, 0.25, 0.25);
-      await page.keyboard.down('Alt');
-      await page.mouse.click(source.x, source.y);
-      await page.keyboard.up('Alt');
-      await drag(page, 0.4, 0.4, 0.55, 0.5);
     } else await drag(page, 0.2, 0.2, 0.7, 0.6);
     await expect(page.locator('#image-canvas')).toBeVisible();
   }
@@ -350,6 +345,37 @@ test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
     await expect(menu).toBeHidden();
   };
 
+  const onScreen = async (locator: ReturnType<Page['locator']>) => {
+    const box = await locator.boundingBox();
+    const view = page.viewportSize();
+    expect(box).toBeTruthy();
+    expect(view).toBeTruthy();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual((view?.width ?? 0) + 1);
+    expect(box!.y + box!.height).toBeLessThanOrEqual((view?.height ?? 0) + 1);
+    const scroll = await locator.evaluate(element => element.scrollHeight - element.clientHeight);
+    expect(scroll).toBeLessThanOrEqual(1);
+  };
+
+  await openLayer();
+  await onScreen(menu);
+  await menu.locator('.menu-sub', { hasText: 'Blending mode' }).hover();
+  const blend = menu.locator('.menu-sub', { hasText: 'Blending mode' });
+  const blendMenu = blend.locator('.submenu');
+  await expect(blendMenu).toBeVisible();
+  await onScreen(blendMenu);
+  const blendBox = await blend.boundingBox();
+  const blendMenuBox = await blendMenu.boundingBox();
+  expect(blendMenuBox!.x).toBeLessThan(blendBox!.x);
+  await menu.locator('.menu-sub', { hasText: 'Color tag' }).hover();
+  const tags = menu.locator('.menu-sub', { hasText: 'Color tag' }).locator('.submenu');
+  await expect(tags.getByRole('button', { name: 'White', exact: true })).toBeVisible();
+  await expect(tags.getByRole('button', { name: 'Red', exact: true })).toBeVisible();
+  await expect(tags.getByRole('button', { name: 'None', exact: true })).toHaveCount(0);
+  await expect(page.locator('#layer-list .tag').first()).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await page.keyboard.press('Escape');
+
   await openLayer();
   const theme = await page.locator('html').getAttribute('data-theme');
   await expect(menu).toHaveCSS('background-color', theme === 'dark' ? 'rgb(48, 48, 48)' : 'rgb(255, 255, 255)');
@@ -456,7 +482,7 @@ test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
   await expect(page.locator('.group-row .layer-name')).toHaveText('Folder');
   await page.locator('.group-row').click({ button: 'right' });
   await menu.locator('.menu-sub', { hasText: 'Color tag' }).hover();
-  await choose('#2ec27e');
+  await choose('Green');
   await expect(page.locator('.group-row .tag')).toHaveCSS('background-color', 'rgb(46, 194, 126)');
   await page.locator('[data-group-visible]').uncheck();
   expect((await pixel(page, 0.7, 0.7))[0]).toBeGreaterThan(200);
@@ -487,7 +513,7 @@ test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
   await choose('multiply');
   await openLayer();
   await menu.locator('.menu-sub', { hasText: 'Color tag' }).hover();
-  await choose('#c01c28');
+  await choose('Red');
   await expect(page.locator('#layer-list .layer-row[data-layer] .tag').first()).toHaveCSS('background-color', 'rgb(192, 28, 40)');
   await openLayer();
   await menu.locator('.menu-slider input').evaluate((input: HTMLInputElement) => {
@@ -546,8 +572,7 @@ test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
   await expect(menu).toContainText('Use as primary');
   await page.keyboard.press('Escape');
   await page.locator('#paper').click({ button: 'right' });
-  await expect(menu).toContainText('Paste');
-  await page.keyboard.press('Escape');
+  await expect(menu).toBeHidden();
 
   await page.locator('#layer-list input[data-visible]').uncheck();
   const downloadPromise = page.waitForEvent('download');
@@ -573,6 +598,179 @@ test('layers, eyedropper, transparency, and pinta export', async ({ page }) => {
   expect(text).toContain('"history"');
   expect(currentLayers).toContain('"visible":false');
   expect(currentLayers).toMatch(/"file":"\d+\.png"/);
+});
+
+test('pen, tone tools, lasso, outlines, selection transforms, and title rename', async ({ page }) => {
+  await ready(page);
+  await expect(page.locator('[data-tool="clone"]')).toHaveCount(0);
+  for (const id of ['pen', 'lasso', 'lasso-draw', 'lighten', 'darken', 'dither']) {
+    await expect(page.locator(`[data-tool="${id}"] svg`)).toHaveCount(1);
+  }
+  const pen = page.locator('[data-tool="pen"] svg');
+  await expect(pen).toHaveCSS('width', '18px');
+  await expect(pen).toHaveCSS('height', '18px');
+  const penFill = await page.locator('[data-tool="pen"] path').evaluate(element => getComputedStyle(element).fill);
+  expect(penFill).toBe('rgb(36, 31, 49)');
+  const lassoDash = await page.locator('[data-tool="lasso"] path').first().evaluate(element => element.getAttribute('stroke-dasharray'));
+  expect(lassoDash).toBeTruthy();
+  await expect(page.locator('[data-tool="lasso-draw"] svg')).toHaveAttribute('class', /lucide-lasso/);
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="theme-dark"]').click();
+  const darkFill = await page.locator('[data-tool="pen"] path').evaluate(element => getComputedStyle(element).fill);
+  expect(darkFill).toBe('rgb(255, 255, 255)');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="theme-dark"]').click();
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#document-name').dblclick();
+  const rename = page.locator('.document-rename');
+  await rename.fill('Harbor');
+  await rename.press('Enter');
+  await expect(page.locator('#document-name')).toContainText('Harbor');
+  await page.locator('#document-name').dblclick();
+  await page.locator('.document-rename').fill('   ');
+  await page.locator('.document-rename').press('Enter');
+  await expect(page.locator('#document-name')).toContainText('Harbor');
+  await page.locator('#document-name').dblclick();
+  await page.locator('.document-rename').fill('Nope');
+  await page.locator('.document-rename').press('Escape');
+  await expect(page.locator('#document-name')).toContainText('Harbor');
+
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('#secondary-input').fill('#0000ff');
+  await page.locator('[data-tool="rectangle"]').click();
+  await page.locator('#shape-select').selectOption('both');
+  await page.locator('#size-slider').fill('8');
+  await drag(page, 0.2, 0.2, 0.8, 0.8);
+  const colors = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let red = 0;
+    let blue = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] > 180 && data[i + 2] < 80) red += 1;
+      if (data[i + 2] > 180 && data[i] < 80) blue += 1;
+    }
+    return { red, blue };
+  });
+  expect(colors.red).toBeGreaterThan(20);
+  expect(colors.blue).toBeGreaterThan(8);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="pen"]').click();
+  await page.locator('#size-slider').fill('22');
+  const slowStart = await paperPoint(page, 0.15, 0.35);
+  const slowEnd = await paperPoint(page, 0.85, 0.35);
+  await page.mouse.move(slowStart.x, slowStart.y);
+  await page.mouse.down();
+  await page.mouse.move(slowEnd.x, slowEnd.y, { steps: 40 });
+  await page.mouse.up();
+  const slow = await pixel(page, 0.5, 0.47);
+  await page.locator('#undo').click();
+  const fastStart = await paperPoint(page, 0.15, 0.35);
+  const fastEnd = await paperPoint(page, 0.85, 0.35);
+  await page.mouse.move(fastStart.x, fastStart.y);
+  await page.mouse.down();
+  await page.mouse.move(fastEnd.x, fastEnd.y, { steps: 1 });
+  await page.mouse.up();
+  const fast = await pixel(page, 0.5, 0.47);
+  expect(slow[0]).toBeLessThan(40);
+  expect(fast[0]).toBeGreaterThan(200);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('6');
+  await drag(page, 0.1, 0.5, 0.9, 0.5);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  await page.locator('[data-tool="lighten"]').click();
+  await page.locator('#size-slider').fill('16');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  const lifted = await pixel(page, 0.5, 0.5);
+  expect(lifted[1]).toBeGreaterThan(40);
+  expect(lifted[0]).toBeGreaterThan(200);
+  await page.locator('[data-tool="darken"]').click();
+  await page.mouse.click((await paperPoint(page, 0.2, 0.2)).x, (await paperPoint(page, 0.2, 0.2)).y);
+  expect((await pixel(page, 0.2, 0.2))[0]).toBeLessThan(200);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="dither"]').click();
+  await page.locator('#size-slider').fill('18');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  const stipple = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let ink = 0;
+    let paper = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] < 40 && data[i + 3] > 200) ink += 1;
+      else paper += 1;
+    }
+    return { ink, paper };
+  });
+  expect(stipple.ink).toBeGreaterThan(8);
+  expect(stipple.paper).toBeGreaterThan(stipple.ink);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="lasso"]').click();
+  const lassoStart = await paperPoint(page, 0.2, 0.2);
+  await page.mouse.move(lassoStart.x, lassoStart.y);
+  await page.mouse.down();
+  await page.mouse.move((await paperPoint(page, 0.75, 0.3)).x, (await paperPoint(page, 0.75, 0.3)).y, { steps: 4 });
+  await page.mouse.move((await paperPoint(page, 0.6, 0.8)).x, (await paperPoint(page, 0.6, 0.8)).y, { steps: 4 });
+  const ants = await page.evaluate(() => {
+    const canvas = document.querySelector('#overlay-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let marks = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i] > 0) marks += 1;
+    return marks;
+  });
+  expect(ants).toBeGreaterThan(8);
+  await page.mouse.up();
+  await expect(page.locator('#selection-status')).toContainText('×');
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="lasso-draw"]').click();
+  await page.locator('#shape-select').selectOption('outline');
+  await drag(page, 0.2, 0.2, 0.7, 0.6);
+  expect((await pixel(page, 0.2, 0.2))[0]).toBeLessThan(80);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  await page.locator('[data-tool="rect-select"]').click();
+  await drag(page, 0.25, 0.35, 0.75, 0.65);
+  await page.locator('[data-tool="move-selection"]').click();
+  const before = await page.locator('#selection-status').innerText();
+  const readBox = (text: string) => {
+    const match = text.match(/(\d+),\s*(\d+),\s*(\d+)\s*×\s*(\d+)/);
+    if (!match) throw new Error(text);
+    return { w: Number(match[3]), h: Number(match[4]) };
+  };
+  await drag(page, 0.4, 0.5, 0.55, 0.5);
+  expect((await pixel(page, 0.1, 0.1))[0]).toBeGreaterThan(200);
+  const moved = readBox(await page.locator('#selection-status').innerText());
+  const original = readBox(before);
+  expect(moved.w).toBe(original.w);
+  await page.keyboard.down('Control');
+  await drag(page, 0.75, 0.65, 0.95, 0.9);
+  await page.keyboard.up('Control');
+  const scaled = readBox(await page.locator('#selection-status').innerText());
+  expect(Math.max(scaled.w, scaled.h)).toBeGreaterThan(Math.max(original.w, original.h));
+  await page.keyboard.down('Alt');
+  await drag(page, 0.7, 0.35, 0.9, 0.15);
+  await page.keyboard.up('Alt');
+  const rotated = readBox(await page.locator('#selection-status').innerText());
+  expect(rotated.w !== scaled.w || rotated.h !== scaled.h).toBe(true);
+  expect((await pixel(page, 0.1, 0.1))[0]).toBeGreaterThan(200);
 });
 
 test.describe('touchscreen', () => {

@@ -27,16 +27,79 @@ function transformAround(ctx: CanvasRenderingContext2D, gesture: 'scale' | 'unif
   ctx.translate(-cx, -cy);
 }
 
+function transformMask(mask: Uint8Array, width: number, height: number, kind: 'scale' | 'uniform' | 'rotate' | 'rotate-step', start: Point, point: Point, bounds: Bounds): Uint8Array | null {
+  if (!width || !height || width * height > 8_000_000) return null;
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = width;
+  maskCanvas.height = height;
+  const maskCtx = maskCanvas.getContext('2d');
+  const out = document.createElement('canvas');
+  out.width = width;
+  out.height = height;
+  const outCtx = out.getContext('2d');
+  if (!maskCtx || !outCtx) return null;
+  const image = maskCtx.createImageData(width, height);
+  const length = Math.min(mask.length, width * height);
+  for (let i = 0; i < length; i++) {
+    if (mask[i] === 0) continue;
+    image.data[i * 4 + 3] = 255;
+  }
+  maskCtx.putImageData(image, 0, 0);
+  outCtx.imageSmoothingEnabled = true;
+  transformAround(outCtx, kind, start, point, bounds);
+  outCtx.drawImage(maskCanvas, 0, 0);
+  const sampled = outCtx.getImageData(0, 0, width, height);
+  const next = new Uint8Array(width * height);
+  for (let i = 0; i < next.length; i++) next[i] = sampled.data[i * 4 + 3] > 128 ? 255 : 0;
+  return next.some(value => value > 0) ? next : null;
+}
+
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+function edgesAlong(points: Point[], width: number, height: number): Uint16Array | null {
+  if (points.length < 2 || !width || !height) return null;
+  const loop = points.length > 2 ? [...points, points[0]] : points;
+  const edges: number[] = [];
+  const seen = new Set<number>();
+  for (let i = 1; i < loop.length; i++) {
+    const a = loop[i - 1];
+    const b = loop[i];
+    if (!Number.isFinite(a.x) || !Number.isFinite(b.x)) continue;
+    const distance = Math.hypot(b.x - a.x, b.y - a.y);
+    const steps = Math.min(2000, Math.max(1, Math.ceil(distance)));
+    for (let step = 0; step <= steps; step++) {
+      const t = step / steps;
+      const x = Math.round(a.x + (b.x - a.x) * t);
+      const y = Math.round(a.y + (b.y - a.y) * t);
+      if (x < 0 || y < 0 || x >= width || y >= height) continue;
+      const key = y * width + x;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push(x, y);
+      if (edges.length >= 120000) break;
+    }
+    if (edges.length >= 120000) break;
+  }
+  return edges.length ? Uint16Array.from(edges) : null;
+}
+
 function clearPreview(editor: Editor): void {
   editor.preview.getContext('2d')?.clearRect(0, 0, editor.preview.width, editor.preview.height);
 }
 
-function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape']): void {
+function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape'], fill: string, stroke: string): void {
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = stroke;
   if (style === 'fill') ctx.fill();
   else if (style === 'both') {
     ctx.fill();
     ctx.stroke();
   } else ctx.stroke();
+}
+
+function brushSize(editor: Editor): number {
+  const size = Number.isFinite(editor.size) ? editor.size : 8;
+  return Math.max(1, Math.min(400, size));
 }
 
 function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, a: Point, b: Point, shift: boolean, color: string): void {
@@ -48,7 +111,7 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
     h = Math.sign(h || 1) * side;
   }
   ctx.save();
-  ctx.lineWidth = Math.max(1, editor.size);
+  ctx.lineWidth = brushSize(editor);
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
   ctx.lineCap = 'round';
@@ -64,7 +127,7 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
     ctx.stroke();
   } else if (tool === 'ellipse') {
     ctx.ellipse(a.x + w / 2, a.y + h / 2, Math.max(Math.abs(w) / 2, 0.5), Math.max(Math.abs(h) / 2, 0.5), 0, 0, Math.PI * 2);
-    paintStyle(ctx, editor.shape);
+    paintStyle(ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
   } else {
     const left = Math.min(a.x, a.x + w);
     const top = Math.min(a.y, a.y + h);
@@ -72,7 +135,7 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
     const height = Math.abs(h);
     if (tool === 'rounded') ctx.roundRect(left, top, width, height, Math.min(editor.corner, width / 2, height / 2));
     else ctx.rect(left, top, width, height);
-    paintStyle(ctx, editor.shape);
+    paintStyle(ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
   }
   ctx.restore();
 }
@@ -91,7 +154,8 @@ function drawCurve(ctx: CanvasRenderingContext2D, editor: Editor, a: Point, cont
 }
 
 function stampBrush(ctx: CanvasRenderingContext2D, editor: Editor, x: number, y: number, color: string, erase: boolean): void {
-  const radius = Math.max(0.5, editor.size / 2);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  const radius = Math.max(0.5, brushSize(editor) / 2);
   ctx.save();
   ctx.globalAlpha = erase && editor.eraser === 'soft' ? editor.opacity / 200 : editor.opacity / 100;
   ctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
@@ -133,8 +197,10 @@ function stampBrush(ctx: CanvasRenderingContext2D, editor: Editor, x: number, y:
 }
 
 function walk(from: Point, to: Point, spacing: number, visit: (point: Point) => void): void {
+  if (!Number.isFinite(from.x) || !Number.isFinite(from.y) || !Number.isFinite(to.x) || !Number.isFinite(to.y)) return;
   const distance = Math.hypot(to.x - from.x, to.y - from.y);
-  const steps = Math.max(1, Math.ceil(distance / spacing));
+  const safeSpacing = Math.max(0.5, Number.isFinite(spacing) ? spacing : 1);
+  const steps = Math.min(500, Math.max(1, Math.ceil(distance / safeSpacing)));
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     visit({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t });
@@ -191,8 +257,11 @@ export class ToolController {
   private pending: { a: Point; b: Point } | null = null;
   private baseMask: Uint8Array | null = null;
   private target: { r: number; g: number; b: number; a: number } | null = null;
-  private source: HTMLCanvasElement | null = null;
   private gesture: 'move' | 'scale' | 'rotate' = 'move';
+  private smooth: Point | null = null;
+  private lastRaw: Point | null = null;
+  private penWidth = 0;
+  private strokeClock = 0;
 
   constructor(private readonly editor: Editor) {}
 
@@ -247,13 +316,7 @@ export class ToolController {
       this.placeText(point);
       return;
     }
-    if (editor.tool === 'clone' && event.altKey) {
-      editor.cloneMarker = { x: Math.round(point.x), y: Math.round(point.y) };
-      editor.paintOverlay();
-      editor.toast('Clone source set.');
-      return;
-    }
-    if ((editor.tool === 'move-pixels' || editor.tool === 'move-selection') && !doc.selection && editor.tool === 'move-selection') {
+    if (editor.tool === 'move-selection' && !doc.selection) {
       editor.toast('Draw a selection first.');
       return;
     }
@@ -261,27 +324,27 @@ export class ToolController {
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
     editor.paper.setPointerCapture(event.pointerId);
     if (editor.tool === 'move-pixels') this.startMove(point, event);
-    else if (editor.tool === 'move-selection' && doc.selection) this.baseMask = new Uint8Array(doc.selection);
-    else if (editor.tool === 'recolor') {
+    else if (editor.tool === 'move-selection' && doc.selection) {
+      this.baseMask = new Uint8Array(doc.selection);
+      this.armGesture(event);
+    } else if (editor.tool === 'recolor') {
       const pixel = editor.layer.ctx.getImageData(Math.min(doc.width - 1, Math.floor(point.x)), Math.min(doc.height - 1, Math.floor(point.y)), 1, 1).data;
       this.target = { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
       this.recolor(point);
-    } else if (editor.tool === 'clone') {
-      if (!editor.cloneMarker) {
-        editor.toast('Alt-click to set the clone source.');
-        this.drawing = false;
-        return;
-      }
-      this.source = document.createElement('canvas');
-      this.source.width = doc.width;
-      this.source.height = doc.height;
-      this.source.getContext('2d')?.drawImage(editor.layer.canvas, 0, 0);
-      this.clone(point);
     } else if (editor.tool === 'pencil') this.pencil(point, point);
-    else if (editor.tool === 'brush' || editor.tool === 'eraser') this.brush(point, point);
-    else if (editor.tool === 'lasso' || editor.tool === 'freeform') {
+    else if (editor.tool === 'brush' || editor.tool === 'eraser') {
+      this.resetStroke(point);
+      this.brush(point, point);
+    } else if (editor.tool === 'pen') {
+      this.resetStroke(point);
+      this.penWidth = brushSize(editor);
+      this.strokeClock = event.timeStamp;
+      this.pen(point, point, event.timeStamp);
+    } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither') this.tone(point, point);
+    else if (editor.tool === 'lasso' || editor.tool === 'lasso-draw' || editor.tool === 'freeform') {
       this.points = [point];
-      this.previewPath(false);
+      if (editor.tool === 'lasso') this.showLasso();
+      else this.previewPath(editor.tool === 'freeform' || editor.shape !== 'outline');
     }
   }
 
@@ -302,18 +365,18 @@ export class ToolController {
     if (!this.drawing || !this.start || !this.last || !point) return;
     if (Math.hypot(point.x - this.start.x, point.y - this.start.y) > 2) this.moved = true;
     const tool = editor.tool;
-    if (tool === 'brush' || tool === 'eraser') this.brush(this.last, point);
+    const sample = tool === 'brush' || tool === 'eraser' || tool === 'pen' ? this.smoothToward(point) : point;
+    if (tool === 'brush' || tool === 'eraser') this.brush(this.last, sample);
+    else if (tool === 'pen') this.pen(this.last, sample, event.timeStamp, false, this.lastRaw, point);
     else if (tool === 'pencil') this.pencil(this.last, point);
+    else if (tool === 'lighten' || tool === 'darken' || tool === 'dither') this.tone(this.last, point);
     else if (tool === 'recolor') this.recolor(point);
-    else if (tool === 'clone') this.clone(point);
     else if (tool === 'move-pixels' && editor.float) this.paintFloat(point, event.shiftKey);
-    else if (tool === 'move-selection' && this.baseMask && editor.doc) {
-      editor.doc.selection = shiftMask(this.baseMask, editor.doc.width, editor.doc.height, Math.round(point.x - this.start.x), Math.round(point.y - this.start.y));
-      editor.rebuildEdges();
-      editor.paintOverlay();
-    } else if (tool === 'lasso' || tool === 'freeform') {
-      this.points.push(point);
-      this.previewPath(tool === 'freeform');
+    else if (tool === 'move-selection' && this.baseMask && editor.doc) this.paintSelection(point, event.shiftKey);
+    else if (tool === 'lasso' || tool === 'lasso-draw' || tool === 'freeform') {
+      this.pushPoint(point);
+      if (tool === 'lasso') this.showLasso();
+      else this.previewPath(tool === 'freeform' || editor.shape !== 'outline');
     } else if (tool === 'rect-select' || tool === 'ellipse-select' || tool === 'zoom') {
       this.previewMarquee(point, event.shiftKey, tool === 'ellipse-select' ? 'ellipse' : 'rectangle');
     } else if (tool === 'line' || tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse') {
@@ -334,7 +397,8 @@ export class ToolController {
         ctx.restore();
       }
     }
-    this.last = point;
+    this.last = sample;
+    this.lastRaw = point;
   }
 
   abandon(): void {
@@ -352,8 +416,15 @@ export class ToolController {
     this.baseMask = null;
     this.points = [];
     this.start = null;
+    this.smooth = null;
+    this.lastRaw = null;
+    this.penWidth = 0;
+    editor.draftEdges = null;
     clearPreview(editor);
-    if (wasDrawing) editor.renderScene();
+    if (wasDrawing) {
+      editor.paintOverlay();
+      editor.renderScene();
+    }
   }
 
   up(event: PointerEvent): void {
@@ -367,16 +438,20 @@ export class ToolController {
     const point = editor.imagePoint(event) ?? this.last ?? this.start;
     const tool = editor.tool;
     clearPreview(editor);
-    if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'recolor' || tool === 'clone') {
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pen') this.catchUp(point, tool, event.timeStamp);
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'pen' || tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'recolor') {
       if (this.before) editor.applyClip(this.before);
-      editor.checkpoint(tool === 'eraser' ? 'Eraser' : tool === 'pencil' ? 'Pencil' : tool === 'recolor' ? 'Recolor' : tool === 'clone' ? 'Clone Stamp' : 'Paintbrush');
+      const label = tool === 'eraser' ? 'Eraser' : tool === 'pencil' ? 'Pencil' : tool === 'pen' ? 'Fountain Pen' : tool === 'lighten' ? 'Lighten' : tool === 'darken' ? 'Darken' : tool === 'dither' ? 'Dither' : tool === 'recolor' ? 'Recolor' : 'Paintbrush';
+      editor.checkpoint(label);
     } else if (tool === 'move-pixels') this.finishMove();
     else if (tool === 'move-selection') {
       editor.rebuildEdges();
-      editor.checkpoint('Move Selection');
+      if (this.moved) editor.checkpoint('Move Selection');
+      else editor.paintOverlay();
     } else if (tool === 'zoom') this.finishZoom(point, event);
     else if (tool === 'rect-select' || tool === 'ellipse-select') this.finishSelect(point, event);
     else if (tool === 'lasso') this.finishLasso(modeFromPointer(editor.selectionMode, event));
+    else if (tool === 'lasso-draw') this.finishLassoDraw();
     else if (tool === 'freeform') this.finishFreeform();
     else if (tool === 'line' && editor.lineMode === 'curve') this.pending = { a: this.start, b: point };
     else if (tool === 'line' || tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse') {
@@ -395,6 +470,10 @@ export class ToolController {
     this.before = null;
     this.baseMask = null;
     this.points = [];
+    this.smooth = null;
+    this.lastRaw = null;
+    this.penWidth = 0;
+    editor.draftEdges = null;
   }
 
   private flood(point: Point, button: number): void {
@@ -455,21 +534,151 @@ export class ToolController {
     editor.renderScene();
   }
 
-  private clone(point: Point): void {
+  private resetStroke(point: Point): void {
+    this.smooth = null;
+    this.lastRaw = point;
+    this.smoothToward(point);
+  }
+
+  private smoothToward(raw: Point): Point {
+    const x = Number.isFinite(raw.x) ? raw.x : this.smooth?.x ?? 0;
+    const y = Number.isFinite(raw.y) ? raw.y : this.smooth?.y ?? 0;
+    if (!this.smooth || !Number.isFinite(this.smooth.x) || !Number.isFinite(this.smooth.y)) {
+      this.smooth = { x, y };
+      return { x, y };
+    }
+    const alpha = 0.42;
+    this.smooth = {
+      x: this.smooth.x + (x - this.smooth.x) * alpha,
+      y: this.smooth.y + (y - this.smooth.y) * alpha,
+    };
+    return { x: this.smooth.x, y: this.smooth.y };
+  }
+
+  private catchUp(point: Point, tool: ToolId, time: number): void {
+    let cursor = this.last ?? point;
+    for (let i = 0; i < 6; i++) {
+      const next = this.smoothToward(point);
+      if (tool === 'pen') this.pen(cursor, next, time, true);
+      else this.brush(cursor, next);
+      cursor = next;
+      if (Math.hypot(next.x - point.x, next.y - point.y) < 0.35) break;
+    }
+    this.last = cursor;
+  }
+
+  private pen(from: Point, to: Point, time: number, holdWidth = false, rawFrom?: Point | null, rawTo?: Point | null): void {
     const editor = this.editor;
     const layer = editor.layer;
-    const marker = editor.cloneMarker;
-    if (!layer || !this.source || !this.start || !marker) return;
-    const radius = Math.max(1, editor.size / 2);
-    const dx = point.x - this.start.x;
-    const dy = point.y - this.start.y;
-    layer.ctx.save();
-    layer.ctx.beginPath();
-    layer.ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
-    layer.ctx.clip();
-    layer.ctx.drawImage(this.source, marker.x + dx - radius, marker.y + dy - radius, radius * 2, radius * 2, point.x - radius, point.y - radius, radius * 2, radius * 2);
-    layer.ctx.restore();
+    if (!layer) return;
+    const size = brushSize(editor);
+    if (!holdWidth) {
+      const stamp = Number.isFinite(time) ? time : this.strokeClock;
+      const elapsed = stamp - this.strokeClock;
+      const dt = Math.max(8, Math.min(80, elapsed > 0 ? elapsed : 16));
+      this.strokeClock = stamp;
+      const origin = rawFrom ?? from;
+      const destination = rawTo ?? to;
+      const distance = Math.hypot(destination.x - origin.x, destination.y - origin.y);
+      const speed = distance / dt;
+      const min = Math.max(0.75, size * 0.12);
+      const target = size + (min - size) * Math.max(0, Math.min(1, speed / 0.45));
+      this.penWidth = this.penWidth > 0 ? this.penWidth + (target - this.penWidth) * 0.72 : target;
+    }
+    const radius = Math.max(0.5, Math.min(size, this.penWidth) / 2);
+    const color = editor.color(this.button);
+    walk(from, to, Math.max(0.75, radius / 2), mark => {
+      layer.ctx.save();
+      layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
+      layer.ctx.fillStyle = color;
+      layer.ctx.beginPath();
+      layer.ctx.arc(mark.x, mark.y, radius, 0, Math.PI * 2);
+      layer.ctx.fill();
+      layer.ctx.restore();
+    });
     editor.renderScene();
+  }
+
+  private tone(from: Point, to: Point): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    const layer = editor.layer;
+    if (!doc || !layer) return;
+    const mode = editor.tool;
+    const radius = Math.max(1, brushSize(editor) / 2);
+    const strength = Math.max(0.08, Math.min(1, editor.opacity / 100)) * (mode === 'dither' ? 1 : 0.45);
+    const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    const color = editor.ink(this.button);
+    const paint = (x: number, y: number) => {
+      const left = Math.max(0, Math.floor(x - radius));
+      const top = Math.max(0, Math.floor(y - radius));
+      const right = Math.min(doc.width - 1, Math.ceil(x + radius));
+      const bottom = Math.min(doc.height - 1, Math.ceil(y + radius));
+      for (let py = top; py <= bottom; py++) {
+        for (let px = left; px <= right; px++) {
+          if ((px - x) ** 2 + (py - y) ** 2 > radius * radius) continue;
+          const index = (py * doc.width + px) * 4;
+          if (mode === 'dither') {
+            const cell = ((py & 3) << 2) + (px & 3);
+            if (BAYER[cell] > 7) continue;
+            image.data[index] = color.r;
+            image.data[index + 1] = color.g;
+            image.data[index + 2] = color.b;
+            image.data[index + 3] = Math.max(image.data[index + 3], Math.round(color.a * strength));
+            continue;
+          }
+          if (image.data[index + 3] === 0) continue;
+          for (let channel = 0; channel < 3; channel++) {
+            const value = image.data[index + channel];
+            image.data[index + channel] = mode === 'lighten'
+              ? Math.min(255, Math.round(value + (255 - value) * strength))
+              : Math.max(0, Math.round(value * (1 - strength)));
+          }
+        }
+      }
+    };
+    walk(from, to, Math.max(1, radius / 2), mark => paint(mark.x, mark.y));
+    layer.ctx.putImageData(image, 0, 0);
+    editor.renderScene();
+  }
+
+  private pushPoint(point: Point): void {
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+    const last = this.points[this.points.length - 1];
+    if (last && Math.hypot(point.x - last.x, point.y - last.y) < 0.6) return;
+    if (this.points.length >= 8000) this.points[this.points.length - 1] = point;
+    else this.points.push(point);
+  }
+
+  private showLasso(): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    clearPreview(editor);
+    editor.draftEdges = doc ? edgesAlong(this.points, doc.width, doc.height) : null;
+    editor.paintOverlay();
+  }
+
+  private armGesture(event: PointerEvent): void {
+    if (event.altKey) this.gesture = 'rotate';
+    else if (event.ctrlKey || event.metaKey) this.gesture = 'scale';
+    else this.gesture = 'move';
+  }
+
+  private paintSelection(point: Point, shift: boolean): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    const mask = this.baseMask;
+    const start = this.start;
+    if (!doc || !mask || !start) return;
+    if (this.gesture === 'move') {
+      doc.selection = shiftMask(mask, doc.width, doc.height, Math.round(point.x - start.x), Math.round(point.y - start.y));
+    } else {
+      const kind = this.gesture === 'scale' ? (shift ? 'uniform' : 'scale') : (shift ? 'rotate-step' : 'rotate');
+      const bounds = boundsOf(mask, doc.width, doc.height);
+      doc.selection = bounds ? transformMask(mask, doc.width, doc.height, kind, start, point, bounds) : doc.selection;
+    }
+    editor.rebuildEdges();
+    editor.paintOverlay();
   }
 
   private startMove(point: Point, event: PointerEvent): void {
@@ -493,19 +702,18 @@ export class ToolController {
       ctx.putImageData(spriteData, 0, 0);
       layer.ctx.putImageData(base, 0, 0);
     } else layer.ctx.clearRect(0, 0, doc.width, doc.height);
-    const ctrl = event.ctrlKey || event.metaKey;
-    if (event.altKey) this.gesture = 'rotate';
-    else if (ctrl) this.gesture = 'scale';
-    else this.gesture = 'move';
+    this.armGesture(event);
     editor.float = { sprite, x: 0, y: 0, before: this.before, mask: doc.selection ? new Uint8Array(doc.selection) : null, frame: null };
     this.start = point;
     editor.renderScene();
   }
 
   syncConstraint(event: KeyboardEvent): void {
-    if (event.key !== 'Shift' || event.repeat || !this.drawing || !this.last || !this.editor.float) return;
+    if (event.key !== 'Shift' || event.repeat || !this.drawing || !this.last) return;
     if (this.gesture !== 'scale' && this.gesture !== 'rotate') return;
-    this.paintFloat(this.last, event.type === 'keydown');
+    const shift = event.type === 'keydown';
+    if (this.editor.float) this.paintFloat(this.last, shift);
+    else if (this.editor.tool === 'move-selection' && this.baseMask) this.paintSelection(this.last, shift);
   }
 
   private paintFloat(point: Point, shift: boolean): void {
@@ -536,30 +744,8 @@ export class ToolController {
     float.x = 0;
     float.y = 0;
     if (float.mask) {
-      const maskCanvas = document.createElement('canvas');
-      maskCanvas.width = doc.width;
-      maskCanvas.height = doc.height;
-      const maskCtx = maskCanvas.getContext('2d');
-      const out = document.createElement('canvas');
-      out.width = doc.width;
-      out.height = doc.height;
-      const outCtx = out.getContext('2d');
-      if (maskCtx && outCtx) {
-        const image = maskCtx.createImageData(doc.width, doc.height);
-        for (let i = 0; i < float.mask.length; i++) {
-          if (float.mask[i] === 0) continue;
-          image.data[i * 4 + 3] = 255;
-        }
-        maskCtx.putImageData(image, 0, 0);
-        outCtx.imageSmoothingEnabled = true;
-        transformAround(outCtx, kind, start, point, bounds);
-        outCtx.drawImage(maskCanvas, 0, 0);
-        const sampled = outCtx.getImageData(0, 0, doc.width, doc.height);
-        const next = new Uint8Array(doc.width * doc.height);
-        for (let i = 0; i < next.length; i++) next[i] = sampled.data[i * 4 + 3] > 128 ? 255 : 0;
-        doc.selection = next.some(value => value > 0) ? next : null;
-        editor.rebuildEdges();
-      }
+      doc.selection = transformMask(float.mask, doc.width, doc.height, kind, start, point, bounds);
+      editor.rebuildEdges();
     }
     editor.renderScene();
   }
@@ -629,7 +815,11 @@ export class ToolController {
   private finishLasso(mode: SelectMode): void {
     const editor = this.editor;
     const doc = editor.doc;
-    if (!doc || this.points.length < 3) return;
+    editor.draftEdges = null;
+    if (!doc || this.points.length < 3) {
+      editor.paintOverlay();
+      return;
+    }
     const mask = maskFromShape(doc.width, doc.height, ctx => {
       ctx.fillStyle = '#000';
       ctx.beginPath();
@@ -643,20 +833,41 @@ export class ToolController {
     editor.checkpoint('Lasso Select');
   }
 
+  private finishLassoDraw(): void {
+    const editor = this.editor;
+    const layer = editor.layer;
+    if (!layer || this.points.length < 2 || !this.before) return;
+    layer.ctx.save();
+    const color = editor.color(this.button);
+    layer.ctx.lineWidth = brushSize(editor);
+    layer.ctx.lineJoin = 'round';
+    layer.ctx.lineCap = 'round';
+    layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
+    layer.ctx.beginPath();
+    layer.ctx.moveTo(this.points[0].x, this.points[0].y);
+    for (const point of this.points.slice(1)) layer.ctx.lineTo(point.x, point.y);
+    layer.ctx.closePath();
+    paintStyle(layer.ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
+    layer.ctx.restore();
+    editor.applyClip(this.before);
+    editor.checkpoint('Lasso');
+  }
+
   private finishFreeform(): void {
     const editor = this.editor;
     const layer = editor.layer;
     if (!layer || this.points.length < 2 || !this.before) return;
     layer.ctx.save();
-    layer.ctx.lineWidth = Math.max(1, editor.size);
-    layer.ctx.strokeStyle = editor.color(this.button);
-    layer.ctx.fillStyle = editor.color(this.button);
-    layer.ctx.globalAlpha = editor.opacity / 100;
+    const color = editor.color(this.button);
+    layer.ctx.lineWidth = brushSize(editor);
+    layer.ctx.lineJoin = 'round';
+    layer.ctx.lineCap = 'round';
+    layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
     layer.ctx.beginPath();
     layer.ctx.moveTo(this.points[0].x, this.points[0].y);
     for (const point of this.points.slice(1)) layer.ctx.lineTo(point.x, point.y);
     layer.ctx.closePath();
-    paintStyle(layer.ctx, editor.shape);
+    paintStyle(layer.ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
     layer.ctx.restore();
     editor.applyClip(this.before);
     editor.checkpoint('Freeform Shape');
@@ -695,15 +906,16 @@ export class ToolController {
     const ctx = editor.preview.getContext('2d');
     if (!ctx || !this.points.length) return;
     ctx.save();
-    ctx.strokeStyle = editor.primary;
-    ctx.fillStyle = editor.primary;
     ctx.globalAlpha = 0.9;
-    ctx.lineWidth = Math.max(1, editor.size);
+    ctx.lineWidth = brushSize(editor);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.moveTo(this.points[0].x, this.points[0].y);
     for (const point of this.points.slice(1)) ctx.lineTo(point.x, point.y);
     if (close) ctx.closePath();
-    ctx.stroke();
+    const color = editor.color(this.button);
+    paintStyle(ctx, close ? editor.shape : 'outline', color, editor.shape === 'both' ? editor.secondary : color);
     ctx.restore();
   }
 
