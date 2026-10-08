@@ -239,6 +239,31 @@ test('can use every tool without a script error', async ({ page }) => {
   }
 });
 
+test('scales a selection and deselects with Ctrl+D', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('[data-tool="rect-select"]').click();
+  await drag(page, 0.2, 0.2, 0.8, 0.8);
+  await expect(page.locator('[data-tool="move-pixels"]')).toHaveAttribute('aria-pressed', 'true');
+  await page.keyboard.press('Control+d');
+  await expect(page.locator('#selection-status')).toHaveText('No selection');
+
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  const point = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(point.x, point.y);
+  await page.keyboard.press('Control+a');
+  await expect(page.locator('[data-tool="move-pixels"]')).toHaveAttribute('aria-pressed', 'true');
+  await page.keyboard.down('Control');
+  await drag(page, 0.02, 0.02, 0.35, 0.35);
+  await page.keyboard.up('Control');
+  const corner = await pixel(page, 0, 0);
+  const center = await pixel(page, 0.5, 0.5);
+  expect(corner[3]).toBeLessThan(10);
+  expect(center[0]).toBeGreaterThan(200);
+  expect(center[1]).toBeLessThan(40);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

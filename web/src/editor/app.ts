@@ -106,7 +106,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
   const rows = [
     ['New', 'Ctrl+N'], ['Open', 'Ctrl+O'], ['Save', 'Ctrl+S'], ['Save As', 'Ctrl+Shift+S'], ['Close', 'Ctrl+W'],
     ['Undo', 'Ctrl+Z'], ['Redo', 'Ctrl+Y'], ['Cut', 'Ctrl+X'], ['Copy', 'Ctrl+C'], ['Copy merged', 'Ctrl+Shift+C'],
-    ['Paste', 'Ctrl+V'], ['Select all', 'Ctrl+A'], ['Deselect', 'Escape'], ['Add layer', 'Ctrl+Shift+N'],
+    ['Paste', 'Ctrl+V'], ['Select all', 'Ctrl+A'], ['Deselect', 'Ctrl+D'], ['Add layer', 'Ctrl+Shift+N'],
     ['Delete layer', 'Ctrl+Shift+Delete'], ['Duplicate layer', 'Ctrl+Shift+D'], ['Merge down', 'Ctrl+M'],
     ['Brush size', '[ ]'], ['Swap colors', 'X'], ['Pan', 'Space'],
     ...TOOLS.map(tool => [tool.label, tool.shortcut]),
@@ -146,7 +146,7 @@ function editMenu(): string {
     item('Cut', 'cut', 'Ctrl+X'), item('Copy', 'copy', 'Ctrl+C'), item('Copy Merged', 'copy-merged', 'Ctrl+Shift+C'),
     item('Paste', 'paste', 'Ctrl+V'), item('Paste Into New Layer', 'paste-layer', 'Ctrl+Shift+V'), item('Paste Into New Image', 'paste-image'), '<div class="sep"></div>',
     item('Erase Selection', 'erase-selection'), item('Fill Selection', 'fill-selection'), item('Invert Selection', 'invert-selection'), item('Offset Selection…', 'offset-selection'), '<div class="sep"></div>',
-    item('Select All', 'select-all', 'Ctrl+A'), item('Deselect', 'deselect', 'Escape'),
+    item('Select All', 'select-all', 'Ctrl+A'), item('Deselect', 'deselect', 'Ctrl+D'),
   ].join('');
 }
 
@@ -334,10 +334,11 @@ function wire(editor: Editor, tools: ToolController): void {
       void pasteBitmap(editor, editor.clipboard, 'layer');
     }
   });
-  window.addEventListener('keydown', event => onKey(event, editor, tools));
+  window.addEventListener('keydown', event => onKey(event, editor, tools), true);
   window.addEventListener('keyup', event => {
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'd') event.preventDefault();
     if (event.key === ' ') editor.space = false;
-  });
+  }, true);
   window.addEventListener('resize', () => paintRulers(editor));
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
     if (localStorage.getItem('pinta-theme')) return;
@@ -596,14 +597,7 @@ async function pasteBitmap(editor: Editor, source: HTMLCanvasElement | ImageBitm
     editor.toast('The clipboard is empty.');
     return;
   }
-  const doc = editor.doc;
-  let overflow: 'expand' | 'clip' = 'clip';
-  if (destination !== 'new-image' && doc && (source.width > doc.width || source.height > doc.height)) {
-    const answer = await ask('paste-dialog');
-    if (answer !== 'expand' && answer !== 'clip') return;
-    overflow = answer;
-  }
-  editor.pasteCanvas(source, destination, overflow);
+  editor.pasteCanvas(source, destination);
   if (source instanceof ImageBitmap) source.close();
 }
 
@@ -644,7 +638,7 @@ async function screenshot(editor: Editor): Promise<void> {
     canvas.height = video.videoHeight || 600;
     canvas.getContext('2d')?.drawImage(video, 0, 0);
     stream.getTracks().forEach(track => track.stop());
-    editor.pasteCanvas(canvas, 'new-image', 'clip');
+    editor.pasteCanvas(canvas, 'new-image');
   } catch {
     editor.toast('Screenshot was cancelled.');
   }
@@ -671,13 +665,19 @@ function askAdjust(title: string, fields: Field[], preview: ((values: AdjustValu
 }
 
 function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): void {
+  const key = event.key.toLowerCase();
+  const ctrl = event.ctrlKey || event.metaKey;
+  if (ctrl && !event.shiftKey && key === 'd') {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!editing()) editor.deselect();
+    return;
+  }
   if (event.key === ' ' && !editing()) {
     editor.space = true;
     event.preventDefault();
   }
   if (editing() && event.key !== 'Escape') return;
-  const key = event.key.toLowerCase();
-  const ctrl = event.ctrlKey || event.metaKey;
   if (ctrl && key === 'n') { event.preventDefault(); void run(editor, tools, 'new'); }
   else if (ctrl && key === 'o') { event.preventDefault(); void run(editor, tools, 'open'); }
   else if (ctrl && event.shiftKey && key === 's') { event.preventDefault(); void run(editor, tools, 'save-as'); }

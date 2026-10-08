@@ -1,6 +1,31 @@
 import type { Editor } from './document.ts';
 import { rgba } from '../wasm/engine.ts';
-import { boundsOf, modeFromPointer, shiftMask, type Point, type SelectMode, type ToolId } from './types.ts';
+import { boundsOf, modeFromPointer, shiftMask, type Bounds, type Point, type SelectMode, type ToolId } from './types.ts';
+
+function transformAround(ctx: CanvasRenderingContext2D, gesture: 'scale' | 'uniform' | 'rotate' | 'rotate-step', start: Point, point: Point, bounds: Bounds): void {
+  const cx = bounds.x + bounds.w / 2;
+  const cy = bounds.y + bounds.h / 2;
+  ctx.translate(cx, cy);
+  if (gesture === 'rotate' || gesture === 'rotate-step') {
+    let angle = Math.atan2(point.y - cy, point.x - cx) - Math.atan2(start.y - cy, start.x - cx);
+    if (gesture === 'rotate-step') {
+      const step = Math.PI / 12;
+      angle = Math.round(angle / step) * step;
+    }
+    ctx.rotate(angle);
+  } else if (gesture === 'uniform') {
+    const origin = Math.hypot(start.x - cx, start.y - cy);
+    const scale = origin < 1 ? 1 : Math.hypot(point.x - cx, point.y - cy) / origin;
+    ctx.scale(scale, scale);
+  } else {
+    const ox = start.x - cx;
+    const oy = start.y - cy;
+    const sx = Math.abs(ox) < 1 ? 1 + (point.x - start.x) / Math.max(1, bounds.w) : (point.x - cx) / ox;
+    const sy = Math.abs(oy) < 1 ? 1 + (point.y - start.y) / Math.max(1, bounds.h) : (point.y - cy) / oy;
+    ctx.scale(sx, sy);
+  }
+  ctx.translate(-cx, -cy);
+}
 
 function clearPreview(editor: Editor): void {
   editor.preview.getContext('2d')?.clearRect(0, 0, editor.preview.width, editor.preview.height);
@@ -167,6 +192,7 @@ export class ToolController {
   private baseMask: Uint8Array | null = null;
   private target: { r: number; g: number; b: number; a: number } | null = null;
   private source: HTMLCanvasElement | null = null;
+  private gesture: 'move' | 'scale' | 'uniform' | 'rotate' | 'rotate-step' = 'move';
 
   constructor(private readonly editor: Editor) {}
 
@@ -233,7 +259,7 @@ export class ToolController {
     this.drawing = true;
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
     editor.paper.setPointerCapture(event.pointerId);
-    if (editor.tool === 'move-pixels') this.startMove(point);
+    if (editor.tool === 'move-pixels') this.startMove(point, event);
     else if (editor.tool === 'move-selection' && doc.selection) this.baseMask = new Uint8Array(doc.selection);
     else if (editor.tool === 'recolor') {
       const pixel = editor.layer.ctx.getImageData(Math.min(doc.width - 1, Math.floor(point.x)), Math.min(doc.height - 1, Math.floor(point.y)), 1, 1).data;
@@ -279,11 +305,8 @@ export class ToolController {
     else if (tool === 'pencil') this.pencil(this.last, point);
     else if (tool === 'recolor') this.recolor(point);
     else if (tool === 'clone') this.clone(point);
-    else if (tool === 'move-pixels' && editor.float) {
-      editor.float.x = Math.round(point.x - this.start.x);
-      editor.float.y = Math.round(point.y - this.start.y);
-      editor.renderScene();
-    } else if (tool === 'move-selection' && this.baseMask && editor.doc) {
+    else if (tool === 'move-pixels' && editor.float) this.paintFloat(point);
+    else if (tool === 'move-selection' && this.baseMask && editor.doc) {
       editor.doc.selection = shiftMask(this.baseMask, editor.doc.width, editor.doc.height, Math.round(point.x - this.start.x), Math.round(point.y - this.start.y));
       editor.rebuildEdges();
       editor.paintOverlay();
@@ -394,6 +417,7 @@ export class ToolController {
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     const mask = editor.engine.wand(image, Math.min(doc.width - 1, point.x | 0), Math.min(doc.height - 1, point.y | 0), Math.round(editor.tolerance * 2.55));
     editor.setSelection(mask, mode);
+    if (editor.doc?.selection) editor.tool = 'move-pixels';
     editor.checkpoint('Magic Wand');
   }
 
@@ -447,7 +471,7 @@ export class ToolController {
     editor.renderScene();
   }
 
-  private startMove(point: Point): void {
+  private startMove(point: Point, event: PointerEvent): void {
     const editor = this.editor;
     const doc = editor.doc;
     const layer = editor.layer;
@@ -468,8 +492,69 @@ export class ToolController {
       ctx.putImageData(spriteData, 0, 0);
       layer.ctx.putImageData(base, 0, 0);
     } else layer.ctx.clearRect(0, 0, doc.width, doc.height);
-    editor.float = { sprite, x: 0, y: 0, before: this.before, mask: doc.selection ? new Uint8Array(doc.selection) : null };
+    const ctrl = event.ctrlKey || event.metaKey;
+    if (event.altKey && event.shiftKey) this.gesture = 'rotate-step';
+    else if (event.altKey) this.gesture = 'rotate';
+    else if (ctrl && event.shiftKey) this.gesture = 'uniform';
+    else if (ctrl) this.gesture = 'scale';
+    else this.gesture = 'move';
+    editor.float = { sprite, x: 0, y: 0, before: this.before, mask: doc.selection ? new Uint8Array(doc.selection) : null, frame: null };
     this.start = point;
+    editor.renderScene();
+  }
+
+  private paintFloat(point: Point): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    const float = editor.float;
+    const start = this.start;
+    if (!doc || !float || !start) return;
+    if (this.gesture === 'move') {
+      float.frame = null;
+      float.x = Math.round(point.x - start.x);
+      float.y = Math.round(point.y - start.y);
+      editor.renderScene();
+      return;
+    }
+    const bounds = float.mask ? boundsOf(float.mask, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
+    if (!bounds) return;
+    const frame = document.createElement('canvas');
+    frame.width = doc.width;
+    frame.height = doc.height;
+    const ctx = frame.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    transformAround(ctx, this.gesture, start, point, bounds);
+    ctx.drawImage(float.sprite, 0, 0);
+    float.frame = frame;
+    float.x = 0;
+    float.y = 0;
+    if (float.mask) {
+      const maskCanvas = document.createElement('canvas');
+      maskCanvas.width = doc.width;
+      maskCanvas.height = doc.height;
+      const maskCtx = maskCanvas.getContext('2d');
+      const out = document.createElement('canvas');
+      out.width = doc.width;
+      out.height = doc.height;
+      const outCtx = out.getContext('2d');
+      if (maskCtx && outCtx) {
+        const image = maskCtx.createImageData(doc.width, doc.height);
+        for (let i = 0; i < float.mask.length; i++) {
+          if (float.mask[i] === 0) continue;
+          image.data[i * 4 + 3] = 255;
+        }
+        maskCtx.putImageData(image, 0, 0);
+        outCtx.imageSmoothingEnabled = true;
+        transformAround(outCtx, this.gesture, start, point, bounds);
+        outCtx.drawImage(maskCanvas, 0, 0);
+        const sampled = outCtx.getImageData(0, 0, doc.width, doc.height);
+        const next = new Uint8Array(doc.width * doc.height);
+        for (let i = 0; i < next.length; i++) next[i] = sampled.data[i * 4 + 3] > 128 ? 255 : 0;
+        doc.selection = next.some(value => value > 0) ? next : null;
+        editor.rebuildEdges();
+      }
+    }
     editor.renderScene();
   }
 
@@ -479,10 +564,14 @@ export class ToolController {
     const layer = editor.layer;
     const float = editor.float;
     if (!doc || !layer || !float) return;
-    layer.ctx.drawImage(float.sprite, float.x, float.y);
-    if (float.mask) {
-      doc.selection = shiftMask(float.mask, doc.width, doc.height, float.x, float.y);
-      editor.rebuildEdges();
+    layer.ctx.imageSmoothingEnabled = true;
+    if (float.frame) layer.ctx.drawImage(float.frame, 0, 0);
+    else {
+      layer.ctx.drawImage(float.sprite, float.x, float.y);
+      if (float.mask) {
+        doc.selection = shiftMask(float.mask, doc.width, doc.height, float.x, float.y);
+        editor.rebuildEdges();
+      }
     }
     editor.float = null;
     editor.checkpoint('Move Selected Pixels');
@@ -525,8 +614,10 @@ export class ToolController {
         ctx.fill();
       } else ctx.fillRect(Math.min(this.start!.x, this.start!.x + w), Math.min(this.start!.y, this.start!.y + h), Math.abs(w), Math.abs(h));
     });
+    const label = editor.tool === 'ellipse-select' ? 'Ellipse Select' : 'Rectangle Select';
     editor.setSelection(mask, modeFromPointer(editor.selectionMode, event));
-    editor.checkpoint(editor.tool === 'ellipse-select' ? 'Ellipse Select' : 'Rectangle Select');
+    if (editor.doc?.selection) editor.tool = 'move-pixels';
+    editor.checkpoint(label);
   }
 
   private finishLasso(mode: SelectMode): void {
@@ -542,6 +633,7 @@ export class ToolController {
       ctx.fill();
     });
     editor.setSelection(mask, mode);
+    if (editor.doc?.selection) editor.tool = 'move-pixels';
     editor.checkpoint('Lasso Select');
   }
 

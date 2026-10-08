@@ -51,6 +51,7 @@ export interface FloatState {
   y: number;
   before: ImageData;
   mask: Uint8Array | null;
+  frame: HTMLCanvasElement | null;
 }
 
 function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -435,7 +436,10 @@ export class Editor {
       if (!layer.visible) continue;
       ctx.globalAlpha = layer.opacity / 100;
       ctx.drawImage(layer.canvas, 0, 0);
-      if (this.float && layer === this.layer) ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
+      if (this.float && layer === this.layer) {
+        if (this.float.frame) ctx.drawImage(this.float.frame, 0, 0);
+        else ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
+      }
     }
     ctx.globalAlpha = 1;
     this.paintOverlay();
@@ -527,6 +531,7 @@ export class Editor {
     const mask = new Uint8Array(doc.width * doc.height);
     mask.fill(255);
     this.setSelection(mask, 'replace');
+    this.tool = 'move-pixels';
     this.checkpoint('Select All');
   }
 
@@ -1008,7 +1013,7 @@ export class Editor {
     return canvas;
   }
 
-  pasteCanvas(source: CanvasImageSource & { width: number; height: number }, destination: 'layer' | 'new-layer' | 'new-image', overflow: 'expand' | 'clip'): void {
+  pasteCanvas(source: CanvasImageSource & { width: number; height: number }, destination: 'layer' | 'new-layer' | 'new-image'): void {
     if (destination === 'new-image') {
       const doc = this.blank(source.width, source.height, 'Pasted');
       this.docs.push(doc);
@@ -1017,29 +1022,36 @@ export class Editor {
       layer.ctx.drawImage(source, 0, 0);
       doc.layers = [layer];
       this.docs.pop();
+      this.tool = 'move-pixels';
       this.finishNew(doc, 'Paste Into New Image');
       return;
     }
     const doc = this.doc;
     if (!doc) return;
-    if (overflow === 'expand' && (source.width > doc.width || source.height > doc.height)) {
-      this.resizeCanvas(Math.max(doc.width, source.width), Math.max(doc.height, source.height), 'nw');
+    const current = doc;
+    let drawWidth = source.width;
+    let drawHeight = source.height;
+    const fitted = source.width > current.width || source.height > current.height;
+    if (fitted) {
+      const scale = Math.min(current.width / source.width, current.height / source.height);
+      drawWidth = Math.max(1, Math.round(source.width * scale));
+      drawHeight = Math.max(1, Math.round(source.height * scale));
     }
-    const current = this.doc;
-    if (!current) return;
-    const origin = current.selection ? boundsOf(current.selection, current.width, current.height) : null;
-    const x = origin?.x ?? 0;
-    const y = origin?.y ?? 0;
+    const origin = !fitted && current.selection ? boundsOf(current.selection, current.width, current.height) : null;
+    const x = fitted ? Math.round((current.width - drawWidth) / 2) : origin?.x ?? 0;
+    const y = fitted ? Math.round((current.height - drawHeight) / 2) : origin?.y ?? 0;
     if (destination === 'new-layer') this.addLayer();
     const layer = this.layer;
     if (!layer) return;
-    layer.ctx.drawImage(source, x, y);
+    layer.ctx.imageSmoothingEnabled = true;
+    layer.ctx.drawImage(source, x, y, drawWidth, drawHeight);
     const mask = new Uint8Array(current.width * current.height);
-    const right = Math.min(current.width, x + source.width);
-    const bottom = Math.min(current.height, y + source.height);
+    const right = Math.min(current.width, x + drawWidth);
+    const bottom = Math.min(current.height, y + drawHeight);
     for (let py = y; py < bottom; py++) for (let px = x; px < right; px++) mask[py * current.width + px] = 255;
     current.selection = mask;
     this.rebuildEdges();
+    this.tool = 'move-pixels';
     if (destination === 'layer') this.checkpoint('Paste');
     else this.checkpoint('Paste Into New Layer');
   }
