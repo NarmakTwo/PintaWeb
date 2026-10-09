@@ -146,6 +146,13 @@ export class Editor {
   corner = 16;
   eraser: 'hard' | 'soft' = 'hard';
   font = 'sans-serif';
+  toneAmount = 50;
+  toneRate = 0;
+  randomLow = -32;
+  randomHigh = 32;
+  randomRate = 0;
+  randomAlpha = false;
+  recolorGlobal = false;
   palette = [...DEFAULT_PALETTE];
   unit: Unit = 'px';
   show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false };

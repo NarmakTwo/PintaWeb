@@ -83,16 +83,20 @@ function edgesAlong(points: Point[], width: number, height: number): Uint16Array
   return edges.length ? Uint16Array.from(edges) : null;
 }
 
+function capturePointer(element: HTMLElement, pointerId: number): void {
+  try { element.setPointerCapture(pointerId); } catch { /* The pointer is already captured, or the event is synthetic. */ }
+}
+
 function clearPreview(editor: Editor): void {
   editor.preview.getContext('2d')?.clearRect(0, 0, editor.preview.width, editor.preview.height);
 }
 
-function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape'], fill: string, stroke: string): void {
+function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape'], fill: string, stroke: string, rule: CanvasFillRule = 'nonzero'): void {
   ctx.fillStyle = fill;
   ctx.strokeStyle = stroke;
-  if (style === 'fill') ctx.fill();
+  if (style === 'fill') ctx.fill(rule);
   else if (style === 'both') {
-    ctx.fill();
+    ctx.fill(rule);
     ctx.stroke();
   } else ctx.stroke();
 }
@@ -262,6 +266,9 @@ export class ToolController {
   private lastRaw: Point | null = null;
   private penWidth = 0;
   private strokeClock = 0;
+  private held = 0;
+  private touched = new Map<number, number>();
+  private rateTimer = 0;
 
   constructor(private readonly editor: Editor) {}
 
@@ -285,14 +292,20 @@ export class ToolController {
     }
     const point = editor.imagePoint(event);
     if (!point) return;
+    if (this.drawing && editor.tool === 'dither') {
+      this.held = this.held | (event.buttons || (event.button === 2 ? 2 : 1));
+      if (this.last) this.tone(this.last, this.last);
+      return;
+    }
     this.button = event.button;
+    this.held = event.buttons || (event.button === 2 ? 2 : 1);
     this.moved = false;
     this.start = point;
     this.last = point;
     if (editor.space || event.button === 1 || editor.tool === 'pan') {
       this.panning = true;
       this.scroll = { x: editor.stage.scrollLeft, y: editor.stage.scrollTop, cx: event.clientX, cy: event.clientY };
-      editor.paper.setPointerCapture(event.pointerId);
+      capturePointer(editor.paper, event.pointerId);
       return;
     }
     if (editor.tool === 'picker') {
@@ -322,7 +335,8 @@ export class ToolController {
     }
     this.drawing = true;
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
-    editor.paper.setPointerCapture(event.pointerId);
+    capturePointer(editor.paper, event.pointerId);
+    if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'random') this.beginRate();
     if (editor.tool === 'move-pixels') this.startMove(point, event);
     else if (editor.tool === 'move-selection' && doc.selection) {
       this.baseMask = new Uint8Array(doc.selection);
@@ -340,11 +354,11 @@ export class ToolController {
       this.penWidth = brushSize(editor);
       this.strokeClock = event.timeStamp;
       this.pen(point, point, event.timeStamp);
-    } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither') this.tone(point, point);
-    else if (editor.tool === 'lasso' || editor.tool === 'lasso-draw' || editor.tool === 'freeform') {
+    } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither' || editor.tool === 'random') this.tone(point, point);
+    else if (editor.tool === 'lasso' || editor.tool === 'lasso-draw') {
       this.points = [point];
       if (editor.tool === 'lasso') this.showLasso();
-      else this.previewPath(editor.tool === 'freeform' || editor.shape !== 'outline');
+      else this.previewPath(editor.shape !== 'outline');
     }
   }
 
@@ -363,20 +377,21 @@ export class ToolController {
       return;
     }
     if (!this.drawing || !this.start || !this.last || !point) return;
+    if (editor.tool === 'dither' && event.buttons) this.held = event.buttons;
     if (Math.hypot(point.x - this.start.x, point.y - this.start.y) > 2) this.moved = true;
     const tool = editor.tool;
     const sample = tool === 'brush' || tool === 'eraser' || tool === 'pen' ? this.smoothToward(point) : point;
     if (tool === 'brush' || tool === 'eraser') this.brush(this.last, sample);
     else if (tool === 'pen') this.pen(this.last, sample, event.timeStamp, false, this.lastRaw, point);
     else if (tool === 'pencil') this.pencil(this.last, point);
-    else if (tool === 'lighten' || tool === 'darken' || tool === 'dither') this.tone(this.last, point);
-    else if (tool === 'recolor') this.recolor(point);
+    else if (tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'random') this.tone(this.last, point);
+    else if (tool === 'recolor' && !editor.recolorGlobal) this.recolor(point);
     else if (tool === 'move-pixels' && editor.float) this.paintFloat(point, event.shiftKey);
     else if (tool === 'move-selection' && this.baseMask && editor.doc) this.paintSelection(point, event.shiftKey);
-    else if (tool === 'lasso' || tool === 'lasso-draw' || tool === 'freeform') {
+    else if (tool === 'lasso' || tool === 'lasso-draw') {
       this.pushPoint(point);
       if (tool === 'lasso') this.showLasso();
-      else this.previewPath(tool === 'freeform' || editor.shape !== 'outline');
+      else this.previewPath(editor.shape !== 'outline');
     } else if (tool === 'rect-select' || tool === 'ellipse-select' || tool === 'zoom') {
       this.previewMarquee(point, event.shiftKey, tool === 'ellipse-select' ? 'ellipse' : 'rectangle');
     } else if (tool === 'line' || tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse') {
@@ -419,6 +434,7 @@ export class ToolController {
     this.smooth = null;
     this.lastRaw = null;
     this.penWidth = 0;
+    this.stopRate();
     editor.draftEdges = null;
     clearPreview(editor);
     if (wasDrawing) {
@@ -434,14 +450,19 @@ export class ToolController {
       return;
     }
     if (!this.drawing || !this.start) return;
+    if (editor.tool === 'dither' && (event.buttons & 3) !== 0) {
+      this.held = event.buttons;
+      return;
+    }
+    this.stopRate();
     this.drawing = false;
     const point = editor.imagePoint(event) ?? this.last ?? this.start;
     const tool = editor.tool;
     clearPreview(editor);
     if (tool === 'brush' || tool === 'eraser' || tool === 'pen') this.catchUp(point, tool, event.timeStamp);
-    if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'pen' || tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'recolor') {
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'pen' || tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'recolor' || tool === 'random') {
       if (this.before) editor.applyClip(this.before);
-      const label = tool === 'eraser' ? 'Eraser' : tool === 'pencil' ? 'Pencil' : tool === 'pen' ? 'Fountain Pen' : tool === 'lighten' ? 'Lighten' : tool === 'darken' ? 'Darken' : tool === 'dither' ? 'Dither' : tool === 'recolor' ? 'Recolor' : 'Paintbrush';
+      const label = tool === 'eraser' ? 'Eraser' : tool === 'pencil' ? 'Pencil' : tool === 'pen' ? 'Fountain Pen' : tool === 'lighten' ? 'Lighten' : tool === 'darken' ? 'Darken' : tool === 'dither' ? 'Dither' : tool === 'random' ? 'Random Brush' : tool === 'recolor' ? 'Recolor' : 'Paintbrush';
       editor.checkpoint(label);
     } else if (tool === 'move-pixels') this.finishMove();
     else if (tool === 'move-selection') {
@@ -452,7 +473,6 @@ export class ToolController {
     else if (tool === 'rect-select' || tool === 'ellipse-select') this.finishSelect(point, event);
     else if (tool === 'lasso') this.finishLasso(modeFromPointer(editor.selectionMode, event));
     else if (tool === 'lasso-draw') this.finishLassoDraw();
-    else if (tool === 'freeform') this.finishFreeform();
     else if (tool === 'line' && editor.lineMode === 'curve') this.pending = { a: this.start, b: point };
     else if (tool === 'line' || tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse') {
       const layer = editor.layer;
@@ -473,6 +493,7 @@ export class ToolController {
     this.smooth = null;
     this.lastRaw = null;
     this.penWidth = 0;
+    this.stopRate();
     editor.draftEdges = null;
   }
 
@@ -529,9 +550,57 @@ export class ToolController {
     const target = this.target;
     if (!doc || !layer || !target) return;
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
-    editor.engine.recolor(image, point.x | 0, point.y | 0, Math.max(1, editor.size / 2), target, editor.ink(this.button), Math.round(editor.tolerance * 2.55));
+    const fill = editor.ink(this.button);
+    const tolerance = Math.round(editor.tolerance * 2.55);
+    if (editor.recolorGlobal) {
+      for (let index = 0; index < image.data.length; index += 4) {
+        const distance = Math.max(
+          Math.abs(image.data[index] - target.r),
+          Math.abs(image.data[index + 1] - target.g),
+          Math.abs(image.data[index + 2] - target.b),
+          Math.abs(image.data[index + 3] - target.a),
+        );
+        if (distance > tolerance) continue;
+        image.data[index] = fill.r;
+        image.data[index + 1] = fill.g;
+        image.data[index + 2] = fill.b;
+      }
+    } else editor.engine.recolor(image, point.x | 0, point.y | 0, Math.max(1, editor.size / 2), target, fill, tolerance);
     layer.ctx.putImageData(image, 0, 0);
     editor.renderScene();
+  }
+
+  private beginRate(): void {
+    this.touched.clear();
+    this.stopRate();
+    this.rateTimer = window.setInterval(() => this.tickRate(), 50);
+  }
+
+  private stopRate(): void {
+    if (this.rateTimer) window.clearInterval(this.rateTimer);
+    this.rateTimer = 0;
+    this.touched.clear();
+  }
+
+  private tickRate(): void {
+    if (!this.drawing || !this.last) return;
+    const tool = this.editor.tool;
+    const rate = tool === 'random' ? this.editor.randomRate : this.editor.toneRate;
+    if (rate <= 0 || (tool !== 'lighten' && tool !== 'darken' && tool !== 'random')) return;
+    this.tone(this.last, this.last);
+  }
+
+  private allowPixel(pixel: number, rate: number): boolean {
+    const now = performance.now();
+    const previous = this.touched.get(pixel);
+    if (rate <= 0) {
+      if (previous !== undefined) return false;
+      this.touched.set(pixel, now);
+      return true;
+    }
+    if (previous !== undefined && now - previous < 1000 / rate) return false;
+    this.touched.set(pixel, now);
+    return true;
   }
 
   private resetStroke(point: Point): void {
@@ -604,35 +673,81 @@ export class ToolController {
     const doc = editor.doc;
     const layer = editor.layer;
     if (!doc || !layer) return;
+    if (editor.tool === 'random') {
+      this.randomBrush(from, to);
+      return;
+    }
     const mode = editor.tool;
     const radius = Math.max(1, brushSize(editor) / 2);
-    const strength = Math.max(0.08, Math.min(1, editor.opacity / 100)) * (mode === 'dither' ? 1 : 0.45);
+    const amount = Math.max(1, Math.min(100, Number.isFinite(editor.toneAmount) ? editor.toneAmount : 50)) / 100;
+    const rate = Math.max(0, Math.min(10, Number.isFinite(editor.toneRate) ? editor.toneRate : 0));
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
-    const color = editor.ink(this.button);
+    const primary = editor.ink(0);
+    const secondary = editor.ink(2);
+    const left = (this.held & 1) !== 0;
+    const right = (this.held & 2) !== 0;
     const paint = (x: number, y: number) => {
-      const left = Math.max(0, Math.floor(x - radius));
+      const leftEdge = Math.max(0, Math.floor(x - radius));
       const top = Math.max(0, Math.floor(y - radius));
-      const right = Math.min(doc.width - 1, Math.ceil(x + radius));
+      const rightEdge = Math.min(doc.width - 1, Math.ceil(x + radius));
       const bottom = Math.min(doc.height - 1, Math.ceil(y + radius));
       for (let py = top; py <= bottom; py++) {
-        for (let px = left; px <= right; px++) {
+        for (let px = leftEdge; px <= rightEdge; px++) {
           if ((px - x) ** 2 + (py - y) ** 2 > radius * radius) continue;
-          const index = (py * doc.width + px) * 4;
+          const pixel = py * doc.width + px;
+          const index = pixel * 4;
           if (mode === 'dither') {
             const cell = ((py & 3) << 2) + (px & 3);
-            if (BAYER[cell] > 7) continue;
+            const primaryCell = BAYER[cell] <= 7;
+            const color = primaryCell ? (left ? primary : null) : (right ? secondary : null);
+            if (!color) continue;
             image.data[index] = color.r;
             image.data[index + 1] = color.g;
             image.data[index + 2] = color.b;
-            image.data[index + 3] = Math.max(image.data[index + 3], Math.round(color.a * strength));
+            image.data[index + 3] = Math.max(image.data[index + 3], color.a);
             continue;
           }
-          if (image.data[index + 3] === 0) continue;
+          if (image.data[index + 3] === 0 || !this.allowPixel(pixel, rate)) continue;
           for (let channel = 0; channel < 3; channel++) {
             const value = image.data[index + channel];
             image.data[index + channel] = mode === 'lighten'
-              ? Math.min(255, Math.round(value + (255 - value) * strength))
-              : Math.max(0, Math.round(value * (1 - strength)));
+              ? Math.min(255, Math.round(value + (255 - value) * amount))
+              : Math.max(0, Math.round(value * (1 - amount)));
+          }
+        }
+      }
+    };
+    walk(from, to, Math.max(1, radius / 2), mark => paint(mark.x, mark.y));
+    layer.ctx.putImageData(image, 0, 0);
+    editor.renderScene();
+  }
+
+  private randomBrush(from: Point, to: Point): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    const layer = editor.layer;
+    if (!doc || !layer) return;
+    const radius = Math.max(1, brushSize(editor) / 2);
+    const rate = Math.max(0, Math.min(10, Number.isFinite(editor.randomRate) ? editor.randomRate : 0));
+    const low = Math.max(-255, Math.min(255, Math.round(Math.min(editor.randomLow, editor.randomHigh))));
+    const high = Math.max(-255, Math.min(255, Math.round(Math.max(editor.randomLow, editor.randomHigh))));
+    const span = high - low + 1;
+    const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    const paint = (x: number, y: number) => {
+      const leftEdge = Math.max(0, Math.floor(x - radius));
+      const top = Math.max(0, Math.floor(y - radius));
+      const rightEdge = Math.min(doc.width - 1, Math.ceil(x + radius));
+      const bottom = Math.min(doc.height - 1, Math.ceil(y + radius));
+      for (let py = top; py <= bottom; py++) {
+        for (let px = leftEdge; px <= rightEdge; px++) {
+          if ((px - x) ** 2 + (py - y) ** 2 > radius * radius) continue;
+          const pixel = py * doc.width + px;
+          if (!this.allowPixel(pixel, rate)) continue;
+          const index = pixel * 4;
+          const channels = editor.randomAlpha ? 4 : 3;
+          for (let channel = 0; channel < channels; channel++) {
+            const delta = low + Math.floor(Math.random() * span);
+            image.data[index + channel] = Math.max(0, Math.min(255, image.data[index + channel] + delta));
           }
         }
       }
@@ -826,7 +941,7 @@ export class ToolController {
       ctx.moveTo(this.points[0].x, this.points[0].y);
       for (const point of this.points.slice(1)) ctx.lineTo(point.x, point.y);
       ctx.closePath();
-      ctx.fill();
+      ctx.fill('evenodd');
     });
     editor.setSelection(mask, mode);
     if (editor.doc?.selection) editor.tool = 'move-pixels';
@@ -847,30 +962,10 @@ export class ToolController {
     layer.ctx.moveTo(this.points[0].x, this.points[0].y);
     for (const point of this.points.slice(1)) layer.ctx.lineTo(point.x, point.y);
     layer.ctx.closePath();
-    paintStyle(layer.ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
+    paintStyle(layer.ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color, 'evenodd');
     layer.ctx.restore();
     editor.applyClip(this.before);
     editor.checkpoint('Lasso');
-  }
-
-  private finishFreeform(): void {
-    const editor = this.editor;
-    const layer = editor.layer;
-    if (!layer || this.points.length < 2 || !this.before) return;
-    layer.ctx.save();
-    const color = editor.color(this.button);
-    layer.ctx.lineWidth = brushSize(editor);
-    layer.ctx.lineJoin = 'round';
-    layer.ctx.lineCap = 'round';
-    layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
-    layer.ctx.beginPath();
-    layer.ctx.moveTo(this.points[0].x, this.points[0].y);
-    for (const point of this.points.slice(1)) layer.ctx.lineTo(point.x, point.y);
-    layer.ctx.closePath();
-    paintStyle(layer.ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
-    layer.ctx.restore();
-    editor.applyClip(this.before);
-    editor.checkpoint('Freeform Shape');
   }
 
   private finishGradient(point: Point): void {
@@ -915,7 +1010,7 @@ export class ToolController {
     for (const point of this.points.slice(1)) ctx.lineTo(point.x, point.y);
     if (close) ctx.closePath();
     const color = editor.color(this.button);
-    paintStyle(ctx, close ? editor.shape : 'outline', color, editor.shape === 'both' ? editor.secondary : color);
+    paintStyle(ctx, close ? editor.shape : 'outline', color, editor.shape === 'both' ? editor.secondary : color, 'evenodd');
     ctx.restore();
   }
 

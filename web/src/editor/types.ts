@@ -2,8 +2,8 @@ export type ToolId =
   | 'move-pixels' | 'move-selection' | 'zoom' | 'pan'
   | 'rect-select' | 'ellipse-select' | 'lasso' | 'lasso-draw' | 'wand'
   | 'brush' | 'pen' | 'pencil' | 'eraser' | 'bucket' | 'gradient' | 'picker' | 'text'
-  | 'line' | 'rectangle' | 'rounded' | 'ellipse' | 'freeform'
-  | 'lighten' | 'darken' | 'dither' | 'recolor';
+  | 'line' | 'rectangle' | 'rounded' | 'ellipse'
+  | 'lighten' | 'darken' | 'dither' | 'recolor' | 'random';
 
 export type BrushId = 'plain' | 'circle' | 'squares' | 'splatter' | 'slash' | 'grid';
 export type ShapeStyle = 'outline' | 'fill' | 'both';
@@ -39,11 +39,12 @@ export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string;
   { id: 'pan', label: 'Pan', shortcut: 'H', icon: 'hand', hint: 'Drag to move around the canvas. Hold Space to pan with any tool. Two fingers pan, and a pinch zooms.' },
   { id: 'rect-select', label: 'Rectangle Select', shortcut: 'S', icon: 'square-dashed', hint: 'Drag a rectangular selection. Hold Shift for a square.' },
   { id: 'ellipse-select', label: 'Ellipse Select', shortcut: 'S', icon: 'circle-dashed', hint: 'Drag an elliptical selection. Hold Shift for a circle.' },
-  { id: 'lasso', label: 'Lasso Select', shortcut: 'S', icon: 'lasso-select', hint: 'Draw around the area you want to select. The outline marches while you draw.' },
-  { id: 'lasso-draw', label: 'Lasso', shortcut: 'S', icon: 'lasso', hint: 'Draw a closed stroke. Fill and outline uses the secondary color for the outline.' },
+  { id: 'lasso', label: 'Lasso Select', shortcut: 'S', icon: 'lasso-select', hint: 'Draw around the area you want to select. A loop that crosses itself leaves the overlap unselected. The outline marches while you draw.' },
+  { id: 'lasso-draw', label: 'Lasso', shortcut: 'S', icon: 'lasso', hint: 'Draw a closed shape. A loop that crosses itself leaves the overlap unfilled. Fill and outline uses the secondary color for the outline.' },
   { id: 'wand', label: 'Magic Wand', shortcut: 'S', icon: 'wand', hint: 'Click a color to select the connected area. Raise tolerance to include similar colors.' },
   { id: 'brush', label: 'Paintbrush', shortcut: 'B', icon: 'brush', hint: 'Draw with the primary color. Right-click uses the secondary color. Fast strokes are smoothed.' },
   { id: 'pen', label: 'Fountain Pen', shortcut: 'B', icon: 'pen', hint: 'A slow stroke stays thick. A fast stroke thins down. Right-click uses the secondary color.' },
+  { id: 'random', label: 'Random Brush', shortcut: 'B', icon: 'random-brush', hint: 'Shift each pixel’s color by a random amount from the range. Rate 0 changes a pixel once. Rate 10 can change it 10 times a second.' },
   { id: 'pencil', label: 'Pencil', shortcut: 'P', icon: 'pencil', hint: 'Draw hard-edged pixels. Right-click uses the secondary color.' },
   { id: 'eraser', label: 'Eraser', shortcut: 'E', icon: 'eraser', hint: 'Erase to transparent. Right-click paints the secondary color.' },
   { id: 'bucket', label: 'Paint Bucket', shortcut: 'F', icon: 'paint-bucket', hint: 'Fill a connected area of similar color.' },
@@ -54,11 +55,10 @@ export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string;
   { id: 'rectangle', label: 'Rectangle', shortcut: 'O', icon: 'square', hint: 'Drag a rectangle. Hold Shift for a square.' },
   { id: 'rounded', label: 'Rounded Rectangle', shortcut: 'O', icon: 'rectangle-horizontal', hint: 'Drag a rounded rectangle. Hold Shift for a square.' },
   { id: 'ellipse', label: 'Ellipse', shortcut: 'O', icon: 'circle', hint: 'Drag an ellipse. Hold Shift for a circle.' },
-  { id: 'freeform', label: 'Freeform Shape', shortcut: 'O', icon: 'pen-line', hint: 'Draw a freeform shape. It closes when you release. Fill and outline uses the secondary color for the outline.' },
-  { id: 'lighten', label: 'Lighten', shortcut: 'L', icon: 'sun', hint: 'Paint to lighten existing colors. Transparent pixels stay transparent.' },
-  { id: 'darken', label: 'Darken', shortcut: 'D', icon: 'moon', hint: 'Paint to darken existing colors. Transparent pixels stay transparent.' },
-  { id: 'dither', label: 'Dither', shortcut: 'D', icon: 'grid-3x3', hint: 'Paint a stippled pattern in the primary color. Right-click uses the secondary color.' },
-  { id: 'recolor', label: 'Recolor', shortcut: 'R', icon: 'paintbrush', hint: 'Paint over a color to replace it with the primary color.' },
+  { id: 'lighten', label: 'Lighten', shortcut: 'L', icon: 'sun', hint: 'Paint to lighten existing colors. Amount 100% turns a color white. Rate 0 changes each pixel once.' },
+  { id: 'darken', label: 'Darken', shortcut: 'D', icon: 'moon', hint: 'Paint to darken existing colors. Amount 100% turns a color black. Rate 0 changes each pixel once.' },
+  { id: 'dither', label: 'Dither', shortcut: 'D', icon: 'grid-3x3', hint: 'Paint a stippled pattern. Right-click paints the opposite cells in the secondary color. Hold both buttons for both colors.' },
+  { id: 'recolor', label: 'Recolor', shortcut: 'R', icon: 'paintbrush', hint: 'Paint over a color to replace it. Turn on Global to replace that color everywhere on the layer.' },
 ];
 
 const SHORTCUT_GROUPS: Record<string, ToolId[]> = {
@@ -66,14 +66,14 @@ const SHORTCUT_GROUPS: Record<string, ToolId[]> = {
   z: ['zoom'],
   h: ['pan'],
   s: ['rect-select', 'ellipse-select', 'lasso', 'lasso-draw', 'wand'],
-  b: ['brush', 'pen'],
+  b: ['brush', 'pen', 'random'],
   p: ['pencil'],
   e: ['eraser'],
   f: ['bucket'],
   g: ['gradient'],
   k: ['picker'],
   t: ['text'],
-  o: ['line', 'rectangle', 'rounded', 'ellipse', 'freeform'],
+  o: ['line', 'rectangle', 'rounded', 'ellipse'],
   l: ['lighten'],
   d: ['darken', 'dither'],
   r: ['recolor'],

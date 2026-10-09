@@ -1,4 +1,9 @@
-import { createIcons, icons } from 'lucide';
+import {
+  Blend, Brush, Circle, CircleDashed, Eraser, Grid3x3, Hand, Lasso, Moon, Move, MoveDiagonal,
+  PaintBucket, Paintbrush, Pencil, Pipette, Plus, RectangleHorizontal, Redo2, Spline, Square,
+  SquareDashed, Sun, Type, Undo2, Wand, X, ZoomIn,
+  createIcons,
+} from 'lucide';
 import { ADJUSTMENTS, ALL_EFFECTS, EFFECTS, performEffect, valuesFrom, type AdjustValues, type Field } from './commands.ts';
 import { BLEND_MODES, DEFAULT_TAG, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
 import { canvasToPng, downloadBlob, parsePalette, serializePalette } from './storage.ts';
@@ -75,6 +80,7 @@ export async function start(): Promise<void> {
 const CUSTOM_ICONS: Record<string, string> = {
   pen: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M 15.54,3.5 20.5,8.47 19.07,9.88 14.12,4.93 15.54,3.5 M 3.5,19.78 10,13.31 C 9.9,13 9.97,12.61 10.23,12.35 c 0.39,-0.39 1.03,-0.39 1.42,0 0.39,0.4 0.39,1.03 0,1.42 C 11.39,14.03 11,14.1 10.69,14 L 4.22,20.5 14.83,16.95 18.36,10.59 13.42,5.64 7.05,9.17 Z"/></svg>',
   'lasso-select': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.704 14.467a10 8 0 1 1 3.115 2.375" stroke-dasharray="2 4"/><path d="M7 22a5 5 0 0 1-2-3.994" stroke-dasharray="2 4"/><circle cx="5" cy="16" r="2"/></svg>',
+  'random-brush': '<svg viewBox="0 -2 32 32" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="M 15.627783,17.324677 12.812427,27.831726 2.3053781,25.016371 5.120734,14.509321 Z m -1.665301,0.961462 -7.8802862,-2.111517 -2.1115167,7.880287 7.8802859,2.111516 z m -3.049404,4.813626 c 0.54402,0.145769 0.866865,0.704955 0.721096,1.248975 -0.14577,0.54402 -0.704955,0.866866 -1.248974,0.721096 C 9.8411793,24.924067 9.5183336,24.364881 9.6641032,23.820861 9.8098728,23.276841 10.369059,22.953995 10.913078,23.099765 Z M 9.2305206,20.185488 c 0.5440213,0.14577 0.8668664,0.704955 0.7210963,1.248976 C 9.8058474,21.978485 9.2466627,22.30133 8.7026414,22.15556 8.1586213,22.00979 7.8357756,21.450605 7.9815451,20.906584 8.1273158,20.362564 8.6865005,20.039717 9.2305206,20.185488 Z m -1.682558,-2.914276 c 0.5440213,0.14577 0.866867,0.704955 0.7210963,1.248975 -0.1457696,0.54402 -0.7049553,0.866866 -1.2489755,0.721096 C 6.4760632,19.095514 6.1532175,18.536328 6.2989871,17.992308 6.4447566,17.448288 7.0039424,17.125442 7.5479626,17.271212 Z M 29.03703,-0.02953 c -0.75825,0 -1.5165,0.28556 -2.095,0.85656 l -15.34851,15.15453 2.20718,0.57813 0.45328,-0.44766 0.78024,0.7707 0.85226,0.22321 -1.02781,3.92445 16.27336,-16.06641 c 1.157,-1.143 1.157,-2.99495 0,-4.13695 -0.5785,-0.571 -1.33675,-0.85656 -2.095,-0.85656 z m 3.1e-4,1.94976 c 0.25263,0 0.50516,0.09529 0.69766,0.28579 0.386,0.381 0.386,0.99798 0,1.37898 L 17.04703,16.11203 15.65,14.73297 28.33898,2.20602 c 0.193,-0.1905 0.44574,-0.28579 0.69836,-0.28579 z M 2.45414,23.91102 C 1.3515,24.72979 0,24.67102 0,24.67102 c 3.62802,4.02445 7.70344,3.69433 10.3432,2.6332 L 6.09242,26.19086 c -5e-5,0 -10e-5,0 -1.5e-4,0 C 5.30334,26.17377 4.53165,26.0041 3.85539,25.605 l -1.6e-4,-8e-5 -1.72632,-0.45211 z"/></svg>',
 };
 
 function buildChrome(editor: Editor, tools: ToolController): void {
@@ -124,7 +130,13 @@ function buildChrome(editor: Editor, tools: ToolController): void {
     ...TOOLS.map(tool => [tool.label, tool.shortcut]),
   ];
   shortcuts.innerHTML = rows.map(([name, keys]) => `<dt>${name}</dt><dd>${keys}</dd>`).join('');
-  createIcons({ icons });
+  createIcons({
+    icons: {
+      Blend, Brush, Circle, CircleDashed, Eraser, Grid3x3, Hand, Lasso, Moon, Move, MoveDiagonal,
+      PaintBucket, Paintbrush, Pencil, Pipette, Plus, RectangleHorizontal, Redo2, Spline, Square,
+      SquareDashed, Sun, Type, Undo2, Wand, X, ZoomIn,
+    },
+  });
   document.querySelectorAll<HTMLButtonElement>('[data-category-toggle]').forEach(button => {
     button.addEventListener('click', event => {
       event.stopPropagation();
@@ -266,7 +278,7 @@ function wire(editor: Editor, tools: ToolController): void {
   paper.addEventListener('pointerdown', event => {
     if (event.cancelable) event.preventDefault();
     contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    paper.setPointerCapture(event.pointerId);
+    try { paper.setPointerCapture(event.pointerId); } catch { /* already captured */ }
     if (contacts.size > 1) {
       tools.abandon();
       const span = measure();
@@ -1260,7 +1272,7 @@ function sync(editor: Editor): void {
 
 function extraOptions(editor: Editor): string {
   const tool = editor.tool;
-  const drawing = ['brush', 'pen', 'pencil', 'eraser', 'recolor', 'line', 'rectangle', 'rounded', 'ellipse', 'freeform', 'lasso-draw', 'text', 'lighten', 'darken', 'dither'].includes(tool);
+  const drawing = ['brush', 'pen', 'pencil', 'eraser', 'random', 'recolor', 'line', 'rectangle', 'rounded', 'ellipse', 'lasso-draw', 'text', 'lighten', 'darken', 'dither'].includes(tool);
   const parts: string[] = [];
   if (drawing || tool === 'bucket' || tool === 'gradient') {
     parts.push(`<label class="option">Opacity <input id="opacity-slider" type="range" min="1" max="100" value="${editor.opacity}" /></label>`);
@@ -1270,7 +1282,8 @@ function extraOptions(editor: Editor): string {
   }
   if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
   if (tool === 'bucket' || tool === 'wand' || tool === 'recolor') parts.push(`<label class="option">Tolerance <input id="tolerance-slider" type="range" min="0" max="100" value="${editor.tolerance}" /></label>`);
-  if (tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse' || tool === 'freeform' || tool === 'lasso-draw') {
+  if (tool === 'recolor') parts.push(`<label class="check"><input id="recolor-global" type="checkbox" ${editor.recolorGlobal ? 'checked' : ''}/> Global</label>`);
+  if (tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse' || tool === 'lasso-draw') {
     parts.push(`<label class="option">Style <select id="shape-select"><option value="outline">Outline</option><option value="fill" ${editor.shape === 'fill' ? 'selected' : ''}>Fill</option><option value="both" ${editor.shape === 'both' ? 'selected' : ''}>Fill and outline</option></select></label>`);
   }
   if (tool === 'rounded') parts.push(`<label class="option">Corner <input id="corner-slider" type="range" min="0" max="200" value="${editor.corner}" /></label>`);
@@ -1280,6 +1293,17 @@ function extraOptions(editor: Editor): string {
   }
   if (tool === 'gradient') parts.push(`<label class="option">Kind <select id="gradient-select">${['linear', 'radial', 'diamond', 'conical'].map(id => `<option value="${id}" ${id === editor.gradient ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
   if (tool === 'text') parts.push(`<label class="option">Font <input id="font-input" type="text" value="${editor.font}" /></label>`);
+  if (tool === 'lighten' || tool === 'darken') {
+    parts.push(`<label class="option">Amount <input id="tone-amount" type="range" min="1" max="100" value="${editor.toneAmount}" /></label>`);
+    parts.push(`<label class="option">Rate <input id="tone-rate" type="range" min="0" max="10" step="1" value="${editor.toneRate}" /></label>`);
+  }
+  if (tool === 'random') {
+    const low = Math.min(editor.randomLow, editor.randomHigh);
+    const high = Math.max(editor.randomLow, editor.randomHigh);
+    parts.push(`<label class="option">Random <span class="dual-range"><input id="random-low" type="range" min="-255" max="255" value="${low}" aria-label="Random minimum" /><input id="random-high" type="range" min="-255" max="255" value="${high}" aria-label="Random maximum" /></span><span id="random-readout">${low} to ${high}</span></label>`);
+    parts.push(`<label class="option">Rate <input id="random-rate" type="range" min="0" max="10" step="1" value="${editor.randomRate}" /></label>`);
+    parts.push(`<label class="check"><input id="random-alpha" type="checkbox" ${editor.randomAlpha ? 'checked' : ''}/> Randomize alpha</label>`);
+  }
   if (tool === 'rect-select' || tool === 'ellipse-select' || tool === 'lasso' || tool === 'wand') {
     parts.push(`<label class="option">Mode <select id="select-mode">${['replace', 'union', 'exclude', 'xor', 'intersect'].map(id => `<option value="${id}" ${id === editor.selectionMode ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
   }
@@ -1301,6 +1325,30 @@ function bindExtra(editor: Editor): void {
   listen('gradient-select', value => { editor.gradient = value as Editor['gradient']; });
   listen('font-input', value => { editor.font = value || 'sans-serif'; });
   listen('select-mode', value => { editor.selectionMode = value as Editor['selectionMode']; });
+  listen('tone-amount', value => { editor.toneAmount = Number(value); });
+  listen('tone-rate', value => { editor.toneRate = Number(value); });
+  listen('random-rate', value => { editor.randomRate = Number(value); });
+  const readRandom = () => {
+    const low = document.getElementById('random-low') as HTMLInputElement | null;
+    const high = document.getElementById('random-high') as HTMLInputElement | null;
+    const readout = document.getElementById('random-readout');
+    if (!low || !high) return;
+    editor.randomLow = Number(low.value);
+    editor.randomHigh = Number(high.value);
+    if (readout) {
+      const start = Math.min(editor.randomLow, editor.randomHigh);
+      const end = Math.max(editor.randomLow, editor.randomHigh);
+      readout.textContent = `${start} to ${end}`;
+    }
+  };
+  document.getElementById('random-low')?.addEventListener('input', readRandom);
+  document.getElementById('random-high')?.addEventListener('input', readRandom);
+  document.getElementById('recolor-global')?.addEventListener('change', event => {
+    editor.recolorGlobal = (event.target as HTMLInputElement).checked;
+  });
+  document.getElementById('random-alpha')?.addEventListener('change', event => {
+    editor.randomAlpha = (event.target as HTMLInputElement).checked;
+  });
   document.getElementById('alias-check')?.addEventListener('change', event => {
     editor.antialias = (event.target as HTMLInputElement).checked;
   });

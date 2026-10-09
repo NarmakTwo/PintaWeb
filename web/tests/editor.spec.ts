@@ -786,6 +786,235 @@ test('tool options give focus back so undo still works', async ({ page }) => {
   expect((await pixel(page, 0.4, 0.4))[0]).toBeGreaterThan(200);
 });
 
+test('lasso even-odd, inverse dither, global recolor, tone amount, and random brush', async ({ page }) => {
+  await ready(page);
+  await expect(page.locator('[data-tool="freeform"]')).toHaveCount(0);
+  const icon = page.locator('[data-tool="random"] svg');
+  await expect(icon).toHaveCount(1);
+  await expect(icon).toHaveAttribute('fill', 'currentColor');
+  const iconBox = await icon.boundingBox();
+  expect(iconBox?.width ?? 0).toBeGreaterThan(16);
+  expect(iconBox?.width ?? 0).toBeLessThan(20);
+
+  const star = Array.from({ length: 5 }, (_, index) => {
+    const angle = -Math.PI / 2 + index * (4 * Math.PI / 5);
+    return { x: 0.5 + 0.34 * Math.cos(angle), y: 0.5 + 0.34 * Math.sin(angle) };
+  });
+  const traceStar = async () => {
+    const first = await paperPoint(page, star[0].x, star[0].y);
+    await page.mouse.move(first.x, first.y);
+    await page.mouse.down();
+    for (const point of [...star.slice(1), star[0]]) {
+      const next = await paperPoint(page, point.x, point.y);
+      await page.mouse.move(next.x, next.y, { steps: 3 });
+    }
+    await page.mouse.up();
+  };
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="lasso-draw"]').click();
+  await page.locator('#shape-select').selectOption('fill');
+  await page.locator('#primary-input').fill('#ff0000');
+  await traceStar();
+  const drawnArm = await pixel(page, 0.5, 0.28);
+  const drawnHole = await pixel(page, 0.5, 0.5);
+  expect(drawnArm[0]).toBeGreaterThan(200);
+  expect(drawnArm[1]).toBeLessThan(40);
+  expect(drawnHole[0]).toBeGreaterThan(200);
+  expect(drawnHole[1]).toBeGreaterThan(200);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="lasso"]').click();
+  await page.locator('#primary-input').fill('#ff0000');
+  await traceStar();
+  await page.locator('#menu-edit').click();
+  await page.locator('[data-command="fill-selection"]').click();
+  const selectedArm = await pixel(page, 0.5, 0.28);
+  const selectedHole = await pixel(page, 0.5, 0.5);
+  expect(selectedArm[0]).toBeGreaterThan(200);
+  expect(selectedArm[1]).toBeLessThan(40);
+  expect(selectedHole[1]).toBeGreaterThan(200);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="dither"]').click();
+  await page.locator('#size-slider').fill('20');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('#secondary-input').fill('#000000');
+  const ditherAt = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(ditherAt.x, ditherAt.y);
+  const leftPrimary = await pixel(page, 32 / 64, 32 / 64);
+  const leftSecondary = await pixel(page, 33 / 64, 32 / 64);
+  expect(leftPrimary[0]).toBeGreaterThan(200);
+  expect(leftPrimary[1]).toBeLessThan(40);
+  expect(leftSecondary[0]).toBeGreaterThan(200);
+  expect(leftSecondary[1]).toBeGreaterThan(200);
+
+  await newCanvas(page, 64, 64);
+  const rightAt = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(rightAt.x, rightAt.y, { button: 'right' });
+  const rightPrimary = await pixel(page, 32 / 64, 32 / 64);
+  const rightSecondary = await pixel(page, 33 / 64, 32 / 64);
+  expect(rightPrimary[0]).toBeGreaterThan(200);
+  expect(rightPrimary[1]).toBeGreaterThan(200);
+  expect(rightSecondary[0]).toBeLessThan(40);
+
+  await newCanvas(page, 64, 64);
+  const bothAt = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.move(bothAt.x, bothAt.y);
+  await page.mouse.down();
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.up({ button: 'right' });
+  await page.mouse.up();
+  const bothPrimary = await pixel(page, 32 / 64, 32 / 64);
+  const bothSecondary = await pixel(page, 33 / 64, 32 / 64);
+  expect(bothPrimary[0]).toBeGreaterThan(200);
+  expect(bothPrimary[1]).toBeLessThan(40);
+  expect(bothSecondary[0]).toBeLessThan(40);
+
+  const bucket = async (color: string) => {
+    await page.locator('#primary-input').fill(color);
+    await page.locator('[data-tool="bucket"]').click();
+    const point = await paperPoint(page, 0.5, 0.5);
+    await page.mouse.click(point.x, point.y);
+  };
+
+  await newCanvas(page, 64, 64);
+  await bucket('#ff0000');
+  await page.locator('[data-tool="lighten"]').click();
+  await page.locator('#tone-amount').fill('50');
+  await page.locator('#tone-rate').fill('0');
+  await page.locator('#size-slider').fill('16');
+  const toneStart = await paperPoint(page, 0.4, 0.5);
+  const toneEnd = await paperPoint(page, 0.7, 0.5);
+  await page.mouse.move(toneStart.x, toneStart.y);
+  await page.mouse.down();
+  await page.mouse.move(toneEnd.x, toneEnd.y, { steps: 6 });
+  await page.mouse.move(toneStart.x, toneStart.y, { steps: 6 });
+  await page.mouse.up();
+  const even = await pixel(page, 0.5, 0.5);
+  expect(even[1]).toBeGreaterThan(100);
+  expect(even[1]).toBeLessThan(160);
+
+  await page.locator('#tone-rate').fill('10');
+  const hold = await paperPoint(page, 0.2, 0.2);
+  await page.mouse.move(hold.x, hold.y);
+  await page.mouse.down();
+  await page.waitForTimeout(400);
+  await page.mouse.up();
+  expect((await pixel(page, 0.2, 0.2))[1]).toBeGreaterThan(170);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="darken"]').click();
+  await page.locator('#tone-amount').fill('100');
+  await page.locator('#tone-rate').fill('0');
+  await page.locator('#size-slider').fill('8');
+  const toneClick = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(toneClick.x, toneClick.y);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBe(0);
+
+  await newCanvas(page, 64, 64);
+  await bucket('#000000');
+  await page.locator('[data-tool="lighten"]').click();
+  await page.locator('#tone-amount').fill('100');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBe(255);
+
+  await newCanvas(page, 64, 64);
+  await bucket('#000000');
+  await page.locator('[data-tool="lighten"]').click();
+  await page.locator('#tone-amount').fill('1');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  const faint = (await pixel(page, 0.5, 0.5))[0];
+  expect(faint).toBeGreaterThanOrEqual(1);
+  expect(faint).toBeLessThanOrEqual(10);
+
+  const setRange = async (low: string, high: string) => {
+    await page.locator('#random-low').fill(low);
+    await page.locator('#random-high').fill(high);
+  };
+  await newCanvas(page, 64, 64);
+  await bucket('#808080');
+  await page.locator('[data-tool="random"]').click();
+  await page.locator('#size-slider').fill('4');
+  await page.locator('#random-rate').fill('0');
+  await setRange('20', '20');
+  const randomAt = await paperPoint(page, 0.5, 0.5);
+  const randomFar = await paperPoint(page, 0.8, 0.5);
+  await page.mouse.move(randomAt.x, randomAt.y);
+  await page.mouse.down();
+  await page.mouse.move(randomFar.x, randomFar.y, { steps: 4 });
+  await page.mouse.move(randomAt.x, randomAt.y, { steps: 4 });
+  await page.mouse.up();
+  const once = await pixel(page, 0.5, 0.5);
+  expect(once[0]).toBe(148);
+  expect(once[1]).toBe(148);
+  expect(once[2]).toBe(148);
+  expect(once[3]).toBe(255);
+
+  await setRange('-30', '-30');
+  const negativeAt = await paperPoint(page, 0.5, 0.2);
+  await page.mouse.click(negativeAt.x, negativeAt.y);
+  const lowered = await pixel(page, 0.5, 0.2);
+  expect(lowered[0]).toBe(98);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="random"]').click();
+  await setRange('100', '100');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBe(255);
+
+  await newCanvas(page, 64, 64);
+  await bucket('#000000');
+  await page.locator('[data-tool="random"]').click();
+  await setRange('-255', '-255');
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBe(0);
+  expect((await pixel(page, 0.5, 0.5))[3]).toBe(255);
+
+  await newCanvas(page, 64, 64);
+  await bucket('#808080');
+  await page.locator('[data-tool="random"]').click();
+  await setRange('-40', '-40');
+  await page.locator('#random-alpha').check();
+  await page.mouse.click((await paperPoint(page, 0.5, 0.5)).x, (await paperPoint(page, 0.5, 0.5)).y);
+  const faded = await pixel(page, 0.5, 0.5);
+  expect(faded[0]).toBe(88);
+  expect(faded[3]).toBe(215);
+
+  await page.locator('#random-alpha').uncheck();
+  await page.locator('#random-rate').fill('10');
+  await setRange('20', '20');
+  const rateAt = await paperPoint(page, 0.2, 0.8);
+  await page.mouse.move(rateAt.x, rateAt.y);
+  await page.mouse.down();
+  await page.waitForTimeout(400);
+  await page.mouse.up();
+  expect((await pixel(page, 0.2, 0.8))[0]).toBeGreaterThan(170);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('4');
+  await page.locator('#primary-input').fill('#ff0000');
+  const near = await paperPoint(page, 0.2, 0.2);
+  const far = await paperPoint(page, 0.8, 0.8);
+  await page.mouse.click(near.x, near.y);
+  await page.mouse.click(far.x, far.y);
+  await page.locator('#primary-input').fill('#0000ff');
+  await page.locator('[data-tool="recolor"]').click();
+  await page.locator('#tolerance-slider').fill('0');
+  await page.mouse.click(near.x, near.y);
+  expect((await pixel(page, 0.2, 0.2))[2]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.8, 0.8))[0]).toBeGreaterThan(200);
+  await page.keyboard.press('Control+z');
+  await page.locator('#recolor-global').check();
+  await page.mouse.click(near.x, near.y);
+  expect((await pixel(page, 0.2, 0.2))[2]).toBe(255);
+  expect((await pixel(page, 0.2, 0.2))[0]).toBe(0);
+  expect((await pixel(page, 0.8, 0.8))[2]).toBe(255);
+  expect((await pixel(page, 0.8, 0.8))[0]).toBe(0);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 
