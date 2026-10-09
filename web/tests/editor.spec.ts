@@ -773,6 +773,19 @@ test('pen, tone tools, lasso, outlines, selection transforms, and title rename',
   expect((await pixel(page, 0.1, 0.1))[0]).toBeGreaterThan(200);
 });
 
+test('tool options give focus back so undo still works', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#primary-input').fill('#000000');
+  await drag(page, 0.2, 0.2, 0.6, 0.6);
+  expect((await pixel(page, 0.4, 0.4))[0]).toBeLessThan(40);
+  await page.locator('#brush-select').selectOption('squares');
+  await expect(page.locator('#brush-select')).not.toBeFocused();
+  await page.keyboard.press('Control+z');
+  expect((await pixel(page, 0.4, 0.4))[0]).toBeGreaterThan(200);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

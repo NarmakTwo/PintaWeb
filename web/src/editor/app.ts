@@ -20,8 +20,15 @@ const EXT: Record<string, string> = {
 };
 
 function editing(): boolean {
-  const tag = document.activeElement?.tagName;
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!document.querySelector('dialog[open]');
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return false;
+  if (active.closest('dialog[open]')) return true;
+  if (active.isContentEditable) return true;
+  if (active.tagName === 'TEXTAREA') return true;
+  if (active instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(active.type);
+  }
+  return false;
 }
 
 function ask(id: string): Promise<string> {
@@ -360,6 +367,13 @@ function wire(editor: Editor, tools: ToolController): void {
   $<HTMLInputElement>('size-slider').addEventListener('input', event => {
     editor.size = Number((event.target as HTMLInputElement).value);
     $('size-value').textContent = String(editor.size);
+  });
+  document.addEventListener('change', event => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.closest('dialog')) return;
+    const release = target instanceof HTMLSelectElement
+      || (target instanceof HTMLInputElement && ['range', 'color', 'checkbox', 'radio'].includes(target.type));
+    if (release) target.blur();
   });
   $<HTMLInputElement>('primary-input').addEventListener('input', event => {
     editor.colorSlot = 'primary';
@@ -853,6 +867,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     event.preventDefault();
   }
   if (editing() && event.key !== 'Escape') return;
+  if (event.target instanceof HTMLSelectElement && !ctrl && event.key !== 'Escape') return;
   if (ctrl && key === 'n') { event.preventDefault(); void run(editor, tools, 'new'); }
   else if (ctrl && key === 'o') { event.preventDefault(); void run(editor, tools, 'open'); }
   else if (ctrl && event.shiftKey && key === 's') { event.preventDefault(); void run(editor, tools, 'save-as'); }
