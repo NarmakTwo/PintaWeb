@@ -352,6 +352,7 @@ function wire(editor: Editor, tools: ToolController): void {
     const target = event.target as HTMLElement;
     if (!target.closest('.menu-wrap')) closeMenus();
     if (!target.closest('#context-menu')) closeContext();
+    if (!target.closest('#color-picker, [data-color-slot]')) closeColorPicker();
   });
   document.querySelectorAll<HTMLButtonElement>('.menu-open').forEach(button => {
     button.addEventListener('click', () => {
@@ -399,10 +400,11 @@ function wire(editor: Editor, tools: ToolController): void {
   });
   $<HTMLInputElement>('alpha-slider').addEventListener('input', event => {
     const alpha = Number((event.target as HTMLInputElement).value);
-    editor[editor.colorSlot] = withAlpha(editor[editor.colorSlot], alpha);
+    editor.primary = withAlpha(editor.primary, alpha);
     editor.notify();
   });
   $('swap-colors').addEventListener('click', () => swapColors(editor));
+  bindColorPicker(editor);
   $('undo').addEventListener('click', () => editor.undo());
   $('redo').addEventListener('click', () => editor.redo());
   $('zoom-label').addEventListener('click', () => editor.fit());
@@ -900,7 +902,8 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   else if (event.key === 'F4') { event.preventDefault(); void run(editor, tools, 'layer-properties'); }
   else if (event.key === 'Escape') {
     if (document.activeElement?.classList.contains('document-rename')) return;
-    if (!$('context-menu').hidden) closeContext();
+    if (!$('color-picker').hidden) closeColorPicker();
+    else if (!$('context-menu').hidden) closeContext();
     else if (editor.float) editor.cancelFloat();
     else editor.deselect();
   } else if (event.key === 'Delete' || event.key === 'Backspace') editor.eraseSelection();
@@ -1261,8 +1264,8 @@ function sync(editor: Editor): void {
   $<HTMLInputElement>('primary-input').value = rgbOf(editor.primary);
   $<HTMLInputElement>('secondary-input').value = rgbOf(editor.secondary);
   const alphaSlider = $<HTMLInputElement>('alpha-slider');
-  if (document.activeElement !== alphaSlider) alphaSlider.value = String(alphaOf(editor[editor.colorSlot]));
-  $('alpha-preview').style.setProperty('--alpha-color', rgbOf(editor[editor.colorSlot]));
+  if (document.activeElement !== alphaSlider) alphaSlider.value = String(alphaOf(editor.primary));
+  $('alpha-preview').style.setProperty('--alpha-color', rgbOf(editor.primary));
   $('palette').innerHTML = editor.palette.map(color => `<button type="button" data-color="${color}" style="background:${color}" aria-label="${color}"></button>`).join('');
   $('layer-list').innerHTML = layerMarkup(editor);
   $('history-list').innerHTML = doc ? doc.labels.map((label, index) => `<li><button type="button" class="history-item" data-cursor="${index}" ${index === doc.cursor ? 'aria-current="true"' : ''}>${label}</button></li>`).join('') : '';
@@ -1356,6 +1359,178 @@ function bindExtra(editor: Editor): void {
 
 function paintSwatch(id: string, color: string): void {
   $(id).style.background = color;
+}
+
+let pickerHue = 0;
+let pickerSat = 0;
+let pickerVal = 1;
+let pickerSlot: 'primary' | 'secondary' | null = null;
+
+function hsvToRgb(h: number, s: number, v: number): { r: number; g: number; b: number } {
+  const c = v * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = v - c;
+  const section = Math.floor(h / 60) % 6;
+  const parts = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][section] ?? [0, 0, 0];
+  return { r: Math.round((parts[0] + m) * 255), g: Math.round((parts[1] + m) * 255), b: Math.round((parts[2] + m) * 255) };
+}
+
+function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: number } {
+  const red = r / 255;
+  const green = g / 255;
+  const blue = b / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const delta = max - min;
+  let h = 0;
+  if (delta !== 0) {
+    if (max === red) h = ((green - blue) / delta) % 6;
+    else if (max === green) h = (blue - red) / delta + 2;
+    else h = (red - green) / delta + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return { h, s: max === 0 ? 0 : delta / max, v: max };
+}
+
+function paintColorField(): void {
+  const canvas = $<HTMLCanvasElement>('color-sv');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const { r, g, b } = hsvToRgb(pickerHue, 1, 1);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const fade = ctx.createLinearGradient(0, 0, canvas.width, 0);
+  fade.addColorStop(0, '#ffffff');
+  fade.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = fade;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const shade = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  shade.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  shade.addColorStop(1, '#000000');
+  ctx.fillStyle = shade;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const x = pickerSat * canvas.width;
+  const y = (1 - pickerVal) * canvas.height;
+  ctx.beginPath();
+  ctx.arc(x, y, 5, 0, Math.PI * 2);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = '#ffffff';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x, y, 6.5, 0, Math.PI * 2);
+  ctx.strokeStyle = '#000000';
+  ctx.stroke();
+}
+
+function pickerHex(): string {
+  const { r, g, b } = hsvToRgb(pickerHue, pickerSat, pickerVal);
+  const alpha = Number($<HTMLInputElement>('color-alpha').value);
+  return `#${[r, g, b, alpha].map(value => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0')).join('')}`;
+}
+
+function syncHex(hex: string): void {
+  const input = $<HTMLInputElement>('color-hex');
+  if (document.activeElement === input) return;
+  input.value = hex;
+}
+
+function commitColorPicker(editor: Editor): void {
+  if (!pickerSlot) return;
+  const hex = pickerHex();
+  editor.colorSlot = pickerSlot;
+  editor[pickerSlot] = hex;
+  $('color-alpha-preview').style.setProperty('--alpha-color', solidColor(hex));
+  syncHex(hex);
+  editor.notify();
+  paintColorField();
+}
+
+function applyHex(editor: Editor, raw: string, allowShort: boolean): boolean {
+  if (!pickerSlot) return false;
+  const text = raw.trim().replace(/^#/, '');
+  const pattern = allowShort ? /^(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i : /^(?:[0-9a-f]{6}|[0-9a-f]{8})$/i;
+  if (!pattern.test(text)) return false;
+  const expanded = text.length <= 4 ? text.split('').map(char => char + char).join('') : text;
+  const rgb = [0, 2, 4].map(index => Number.parseInt(expanded.slice(index, index + 2), 16));
+  const hsv = rgbToHsv(rgb[0] ?? 0, rgb[1] ?? 0, rgb[2] ?? 0);
+  pickerHue = hsv.h;
+  pickerSat = hsv.s;
+  pickerVal = hsv.v;
+  $<HTMLInputElement>('color-hue').value = String(Math.round(hsv.h));
+  if (expanded.length >= 8) $<HTMLInputElement>('color-alpha').value = String(Number.parseInt(expanded.slice(6, 8), 16));
+  commitColorPicker(editor);
+  return true;
+}
+
+function solidColor(hex: string): string {
+  const value = hex.replace('#', '');
+  const full = value.length === 3 ? value.split('').map(char => char + char).join('') : value;
+  return `#${(full.slice(0, 6) || '000000').padEnd(6, '0')}`;
+}
+
+function closeColorPicker(): void {
+  const hex = $<HTMLInputElement>('color-hex');
+  if (document.activeElement === hex) hex.blur();
+  pickerSlot = null;
+  $('color-picker').hidden = true;
+}
+
+function openColorPicker(editor: Editor, slot: 'primary' | 'secondary', anchor: HTMLElement): void {
+  pickerSlot = slot;
+  editor.colorSlot = slot;
+  const channels = editor[slot].replace('#', '');
+  const full = channels.length === 3 ? channels.split('').map(char => char + char).join('') : channels.padEnd(8, 'f');
+  const rgb = [0, 2, 4].map(index => Number.parseInt(full.slice(index, index + 2), 16) || 0);
+  const hsv = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+  pickerHue = hsv.h;
+  pickerSat = hsv.s;
+  pickerVal = hsv.v;
+  $<HTMLInputElement>('color-hue').value = String(Math.round(hsv.h));
+  $<HTMLInputElement>('color-alpha').value = String(alphaOf(editor[slot]));
+  $<HTMLInputElement>('color-hex').value = withAlpha(editor[slot], alphaOf(editor[slot]));
+  $('color-alpha-preview').style.setProperty('--alpha-color', solidColor(editor[slot]));
+  const panel = $('color-picker');
+  panel.hidden = false;
+  paintColorField();
+  const box = anchor.getBoundingClientRect();
+  placeOnScreen(panel, box.left, box.bottom + 6);
+}
+
+function bindColorPicker(editor: Editor): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-color-slot]').forEach(button => {
+    button.addEventListener('click', () => {
+      const slot = button.dataset.colorSlot === 'secondary' ? 'secondary' : 'primary';
+      if (pickerSlot === slot && !$('color-picker').hidden) closeColorPicker();
+      else openColorPicker(editor, slot, button);
+    });
+  });
+  const field = $<HTMLCanvasElement>('color-sv');
+  const pickField = (event: PointerEvent) => {
+    const rect = field.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    pickerSat = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    pickerVal = 1 - Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+    commitColorPicker(editor);
+  };
+  field.addEventListener('pointerdown', event => {
+    field.setPointerCapture(event.pointerId);
+    pickField(event);
+  });
+  field.addEventListener('pointermove', event => {
+    if (field.hasPointerCapture(event.pointerId)) pickField(event);
+  });
+  $<HTMLInputElement>('color-hue').addEventListener('input', event => {
+    pickerHue = Number((event.target as HTMLInputElement).value);
+    commitColorPicker(editor);
+  });
+  $<HTMLInputElement>('color-alpha').addEventListener('input', () => commitColorPicker(editor));
+  const hex = $<HTMLInputElement>('color-hex');
+  hex.addEventListener('input', () => { applyHex(editor, hex.value, false); });
+  hex.addEventListener('blur', () => {
+    if (!applyHex(editor, hex.value, true)) syncHex(pickerHex());
+  });
 }
 
 function formatUnit(pixels: number, unit: Unit): string {

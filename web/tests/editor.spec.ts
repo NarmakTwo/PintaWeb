@@ -1033,6 +1033,8 @@ test('the color picker keeps alpha, and transparent ink erases', async ({ page }
   await page.mouse.click(center.x, center.y);
   await expect(page.locator('#alpha-slider')).toHaveValue('128');
   await expect(page.locator('#primary-input')).toHaveValue('#ff0000');
+  await page.locator('#secondary-input').fill('#00ff00');
+  await expect(page.locator('#alpha-slider')).toHaveValue('128');
 
   await newCanvas(page, 64, 64);
   await page.locator('#alpha-slider').fill('0');
@@ -1078,6 +1080,47 @@ test('the color picker keeps alpha, and transparent ink erases', async ({ page }
   expect(pink[1]).toBeGreaterThan(40);
   expect(pink[1]).toBeLessThan(200);
   expect(pink[3]).toBeGreaterThan(200);
+});
+
+test('the swatch color picker sets transparency', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('[data-color-slot="primary"]').click();
+  const picker = page.locator('#color-picker');
+  await expect(picker).toBeVisible();
+  const field = await page.locator('#color-sv').boundingBox();
+  if (!field) throw new Error('The color field is not visible.');
+  await page.mouse.click(field.x + field.width - 4, field.y + 4);
+  await page.locator('#color-alpha').fill('128');
+  await expect(picker).toBeVisible();
+  const swatch = await page.locator('#primary-swatch').evaluate(element => getComputedStyle(element).backgroundColor);
+  const channels = swatch.match(/[\d.]+/g)?.map(Number) ?? [];
+  expect(channels[0]).toBeGreaterThan(200);
+  expect(channels[1]).toBeLessThan(40);
+  expect(channels[3] ?? 1).toBeGreaterThan(0.4);
+  expect(channels[3] ?? 1).toBeLessThan(0.6);
+  await page.locator('#color-hex').fill('#00ff00');
+  await page.locator('#color-hex').blur();
+  await expect(page.locator('#color-hex')).toHaveValue('#00ff0080');
+  const kept = await page.locator('#primary-swatch').evaluate(element => getComputedStyle(element).backgroundColor);
+  const green = kept.match(/[\d.]+/g)?.map(Number) ?? [];
+  expect(green[0]).toBeLessThan(40);
+  expect(green[1]).toBeGreaterThan(200);
+  expect(green[3] ?? 1).toBeGreaterThan(0.4);
+  expect(green[3] ?? 1).toBeLessThan(0.6);
+  await page.locator('#color-hex').fill('#0000ff00');
+  await page.locator('#color-hex').blur();
+  await expect(page.locator('#color-alpha')).toHaveValue('0');
+  await page.locator('#color-hex').fill('nope');
+  await page.locator('#color-hex').blur();
+  await expect(page.locator('#color-hex')).toHaveValue('#0000ff00');
+  await page.locator('#color-alpha').fill('0');
+  await page.keyboard.press('Escape');
+  await expect(picker).toBeHidden();
+  await page.locator('[data-tool="bucket"]').click();
+  const point = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(point.x, point.y);
+  expect((await pixel(page, 0.5, 0.5))[3]).toBe(0);
 });
 
 test.describe('touchscreen', () => {

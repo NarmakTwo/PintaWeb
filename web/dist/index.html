@@ -15,8 +15,8 @@
         document.querySelector('meta[name="theme-color"]').setAttribute('content', darkTheme ? '#242424' : '#fafafa');
       } catch (error) {}
     </script>
-    <script type="module" crossorigin src="/assets/index-DIDf-F13.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CslAy0uo.css">
+    <script type="module" crossorigin src="/assets/index-iloSYbvN.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DpxlJ2Bp.css">
   </head>
   <body>
     <div id="app">
@@ -47,18 +47,20 @@
             <div class="swatches">
               <label class="color-field primary">
                 <span id="primary-swatch" class="swatch-face"></span>
-                <input id="primary-input" type="color" value="#000000" aria-label="Primary color" />
+                <button type="button" class="swatch-open" data-color-slot="primary" aria-label="Primary color"></button>
+                <input id="primary-input" type="color" value="#000000" tabindex="-1" aria-hidden="true" />
               </label>
               <label class="color-field secondary">
                 <span id="secondary-swatch" class="swatch-face"></span>
-                <input id="secondary-input" type="color" value="#ffffff" aria-label="Secondary color" />
+                <button type="button" class="swatch-open" data-color-slot="secondary" aria-label="Secondary color"></button>
+                <input id="secondary-input" type="color" value="#ffffff" tabindex="-1" aria-hidden="true" />
               </label>
               <button type="button" class="icon-button swap" id="swap-colors" title="Swap colors (X)" aria-label="Swap colors"><i data-lucide="move-diagonal"></i></button>
             </div>
             <div id="palette" class="palette" aria-label="Palette"></div>
             <label class="alpha-control">
               <span id="alpha-preview" class="alpha-checker"></span>
-              <input id="alpha-slider" type="range" min="0" max="255" value="255" aria-label="Color transparency" />
+              <input id="alpha-slider" type="range" min="0" max="255" value="255" aria-label="Primary transparency" />
             </label>
           </div>
         </aside>
@@ -111,6 +113,15 @@
     <textarea id="text-editor" hidden aria-label="Text"></textarea>
     <div id="toast" hidden role="status"></div>
     <div id="context-menu" hidden role="menu"></div>
+    <div id="color-picker" hidden>
+      <canvas id="color-sv" width="180" height="220" aria-label="Saturation and brightness"></canvas>
+      <input id="color-hue" type="range" min="0" max="360" step="1" value="0" aria-label="Hue" />
+      <label class="alpha-control">
+        <span id="color-alpha-preview" class="alpha-checker"></span>
+        <input id="color-alpha" type="range" min="0" max="255" value="255" aria-label="Transparency" />
+      </label>
+      <input id="color-hex" type="text" spellcheck="false" autocomplete="off" maxlength="9" aria-label="Hex color" />
+    </div>
     <input id="file-input" type="file" accept="image/*" hidden />
     <input id="layer-input" type="file" accept="image/*" hidden />
     <input id="palette-input" type="file" accept=".txt,text/plain" hidden />
