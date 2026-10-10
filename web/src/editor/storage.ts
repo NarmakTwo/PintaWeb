@@ -13,6 +13,7 @@ export interface StoredLayer {
   parent?: number | null;
   alphaLock?: boolean;
   png: Blob;
+  mask?: Blob;
 }
 
 export interface StoredGroup {

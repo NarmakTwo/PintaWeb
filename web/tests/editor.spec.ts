@@ -1567,6 +1567,7 @@ test('unserrate is on for the brushes and off for the pencil', async ({ page }) 
   await flick();
   expect(await offChord()).toBe(0);
   await page.locator('#unserrate').check();
+  await page.locator('#smooth-slider').fill('70');
   await newCanvas(page, 80, 80);
   await flick();
   expect(await offChord()).toBeGreaterThan(0);
@@ -1659,6 +1660,180 @@ test('keeps Install Pinta in the Window menu until the browser offers it', async
   const item = page.locator('[data-command="install"]');
   await expect(item).toHaveText('Install Pinta');
   await expect(item).toBeDisabled();
+});
+
+test('keeps the smoothing number when Unserrate is turned off', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('[data-tool="brush"]').click();
+  await expect(page.locator('#smooth-slider')).toHaveValue('70');
+  await expect(page.locator('#unserrate')).toBeChecked();
+  await expect(page.locator('#status-note')).toHaveText('Smoothing rounds a fast stroke');
+  await page.locator('#unserrate').uncheck();
+  await expect(page.locator('#smooth-slider')).toHaveValue('70');
+  await expect(page.locator('#status-note')).toHaveText('');
+  await page.locator('[data-tool="pencil"]').click();
+  await expect(page.locator('#smooth-slider')).toHaveValue('0');
+  await expect(page.locator('#unserrate')).not.toBeChecked();
+  await page.locator('[data-tool="bucket"]').click();
+  await expect(page.locator('#smooth-edges')).toBeChecked();
+  await expect(page.locator('#status-note')).toHaveText('Fills the soft edge.');
+});
+
+test('softens the edge of a fill and leaves the dark core', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 80, 80);
+  await page.locator('[data-tool="line"]').click();
+  await page.locator('#size-slider').fill('14');
+  await page.locator('#primary-input').fill('#000000');
+  await drag(page, 0.1, 0.5, 0.9, 0.5);
+  const before = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let core: number[] | null = null;
+    let fringe: number[] | null = null;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const index = (y * canvas.width + x) * 4;
+        const red = data[index];
+        if (red < 20 && !core) core = [x, y, red];
+        if (red > 50 && red < 210 && !fringe) fringe = [x, y, red];
+      }
+    }
+    return { core, fringe, width: canvas.width, height: canvas.height };
+  });
+  expect(before.core).toBeTruthy();
+  expect(before.fringe).toBeTruthy();
+  await page.locator('[data-tool="bucket"]').click();
+  await page.locator('#primary-input').fill('#ff0000');
+  const spot = await paperPoint(page, 0.5, 0.15);
+  await page.mouse.click(spot.x, spot.y);
+  const after = await page.evaluate(({ core, fringe }) => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const at = (point: number[]) => {
+      const index = (point[1] * canvas.width + point[0]) * 4;
+      return [data[index], data[index + 1], data[index + 2]];
+    };
+    return { core: at(core!), fringe: at(fringe!) };
+  }, { core: before.core, fringe: before.fringe });
+  expect(after.core![0]).toBeLessThan(40);
+  expect(after.fringe![0]).toBeGreaterThan(after.fringe![1] + 30);
+});
+
+test('shows width, height, and angle while a selection floats', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 40, 30);
+  await page.keyboard.press('Control+a');
+  const start = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await expect(page.locator('#float-w')).toHaveValue('40');
+  await expect(page.locator('#float-h')).toHaveValue('30');
+  await expect(page.locator('#float-angle')).toHaveValue('0');
+  await expect(page.locator('#status-note')).toHaveText('Arrow keys nudge. Shift moves ten.');
+  await page.mouse.up();
+  await expect(page.locator('#float-w')).toHaveCount(0);
+});
+
+test('snaps a size-1 pencil to the grid and sticks a stroke to parallel lines', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="toggle-snap"]').click();
+  await page.keyboard.press('Escape');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('1');
+  const dot = await paperPoint(page, 10 / 64, 10 / 64);
+  await page.mouse.click(dot.x, dot.y);
+  const snapped = await pixel(page, 16 / 64, 16 / 64);
+  const missed = await pixel(page, 10 / 64, 10 / 64);
+  expect(snapped[0]).toBeLessThan(40);
+  expect(missed[0]).toBeGreaterThan(200);
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="assist-parallel"]').click();
+  await page.keyboard.press('Escape');
+  await drag(page, 0.2, 0.5, 0.8, 0.5);
+  await expect(page.locator('#status-note')).toHaveText('Parallel lines');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="toggle-snap"]').click();
+  await page.keyboard.press('Escape');
+  await drag(page, 0.3, 0.25, 0.7, 0.8);
+  const ys = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const rows: number[] = [];
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = Math.floor(canvas.width * 0.35); x < canvas.width * 0.65; x++) {
+        if (data[(y * canvas.width + x) * 4] < 40) rows.push(y);
+      }
+    }
+    return rows;
+  });
+  expect(ys.length).toBeGreaterThan(0);
+  expect(Math.max(...ys) - Math.min(...ys)).toBeLessThan(3);
+});
+
+test('rotates the view only for a clear twist and resets from the status bar', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  const twist = async (degrees: number) => {
+    return page.evaluate(angle => {
+      const fire = (type: string, id: number, x: number, y: number) => {
+        window.dispatchEvent(new PointerEvent(type, { pointerId: id, clientX: x, clientY: y, bubbles: true, cancelable: true, pointerType: 'touch' }));
+      };
+      fire('pointerdown', 11, 300, 400);
+      fire('pointerdown', 12, 500, 400);
+      const radians = angle * Math.PI / 180;
+      const cx = 400;
+      const cy = 400;
+      const place = (radius: number, turn: number) => ({ x: cx + Math.cos(turn) * radius, y: cy + Math.sin(turn) * radius });
+      const left = place(100, Math.PI + radians);
+      const right = place(100, radians);
+      fire('pointermove', 11, left.x, left.y);
+      fire('pointermove', 12, right.x, right.y);
+      fire('pointerup', 11, left.x, left.y);
+      fire('pointerup', 12, right.x, right.y);
+    }, degrees);
+  };
+  await twist(12);
+  await expect(page.locator('#view-angle')).toHaveText('0°');
+  await twist(36);
+  const turned = await page.locator('#view-angle').textContent();
+  expect(Math.abs(Number.parseInt(turned ?? '0', 10))).toBeGreaterThan(20);
+  await page.locator('#view-angle').click();
+  await expect(page.locator('#view-angle')).toHaveText('0°');
+});
+
+test('long-presses an eye, paints a mask, and picks from the mixer without undo', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 48, 48);
+  await page.locator('button[aria-label="Add layer"]').click();
+  const eye = page.locator('input[data-visible][data-layer="1"]');
+  const box = await eye.boundingBox();
+  if (!box) throw new Error('The layer eye is not visible.');
+  await eye.dispatchEvent('pointerdown', { pointerType: 'touch', clientX: box.x + 4, clientY: box.y + 4, button: 0, pointerId: 9 });
+  await expect(page.locator('#context-menu')).toContainText('Hide others', { timeout: 2000 });
+  await page.keyboard.press('Escape');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('8');
+  await page.locator('#primary-input').fill('#ff0000');
+  await drag(page, 0.5, 0.5, 0.52, 0.5);
+  await page.locator('#menu-layers').click();
+  await page.locator('[data-command="layer-mask"]').click();
+  await expect(page.locator('#status-note')).toHaveText('Painting the mask');
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('input[data-visible][data-layer="0"]').uncheck();
+  await drag(page, 0.5, 0.5, 0.52, 0.5);
+  const hidden = await pixel(page, 0.5, 0.5);
+  expect(hidden[3]).toBeLessThan(20);
+  await page.locator('#layer-list .layer').first().click();
+  await expect(page.locator('#status-note')).not.toHaveText('Painting the mask');
+  const steps = await page.locator('#history-list .history-item').count();
+  await page.locator('#mix-toggle').click();
+  await expect(page.locator('#mixer-panel')).toBeVisible();
+  await page.locator('#mixer').click();
+  await expect(page.locator('#history-list .history-item')).toHaveCount(steps);
 });
 
 test.describe('touchscreen', () => {

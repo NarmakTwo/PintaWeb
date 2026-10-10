@@ -1,9 +1,10 @@
 import { PixelEngine, rgba, type Rgba } from '../wasm/engine.ts';
 import { canvasToPng, clearSession, downloadBlob, encodeBmp, loadSession, saveSession, type SessionRecord } from './storage.ts';
 import { zipStore } from './zip.ts';
+import type { Guide } from './adjust.ts';
 import {
   boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask, TOOLS,
-  type Bounds, type BrushId, type GradientKind, type Point, type SelectMode, type ShapeStyle, type Symmetry, type TextStyle, type ToolId, type Unit,
+  type AssistantKind, type Bounds, type BrushId, type GradientKind, type GridKind, type Point, type SelectMode, type ShapeStyle, type SmoothTool, type Symmetry, type TextStyle, type ToolId, type Unit,
 } from './types.ts';
 
 export const BLEND_MODES = ['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'] as const;
@@ -49,6 +50,8 @@ export interface Layer {
   alphaLock: boolean;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
+  mask?: HTMLCanvasElement;
+  maskCtx?: CanvasRenderingContext2D;
 }
 
 export interface LayerGroup {
@@ -78,6 +81,7 @@ interface SnapshotLayer {
   parent: number | null;
   alphaLock: boolean;
   data: ImageData;
+  mask: ImageData | null;
 }
 
 interface Snapshot {
@@ -113,6 +117,9 @@ export interface FloatState {
   before: ImageData;
   mask: Uint8Array | null;
   frame: HTMLCanvasElement | null;
+  angle: number;
+  boxW: number;
+  boxH: number;
 }
 
 function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -159,17 +166,43 @@ export class Editor {
   sampleAll = false;
   sampleSize = 1;
   symmetry: Symmetry = 'off';
-  unserrate: Record<'brush' | 'eraser' | 'pen' | 'pencil', boolean> = {
+  unserrate: Record<SmoothTool, boolean> = {
     brush: true,
     eraser: true,
     pen: true,
     pencil: false,
+    dither: false,
+    recolor: false,
+    random: false,
+    lighten: false,
+    darken: false,
   };
+  smoothing: Record<SmoothTool, number> = {
+    brush: 70,
+    eraser: 70,
+    pen: 70,
+    pencil: 0,
+    dither: 0,
+    recolor: 0,
+    random: 0,
+    lighten: 0,
+    darken: 0,
+  };
+  smoothEdges = true;
+  viewAngle = 0;
+  gridKind: GridKind = 'square';
+  snap = false;
+  assistant: Guide | null = null;
+  assistantPlace: AssistantKind | null = null;
+  assistantDraft: Guide | null = null;
+  paintingMask = false;
+  fillCoverage: Float32Array | null = null;
   textStyle: TextStyle = 'fill';
   strokeWidth = 2;
   palette = [...DEFAULT_PALETTE];
   recent: string[] = [];
   private soloMemory: boolean[] | null = null;
+  private swappedCtx: CanvasRenderingContext2D | null = null;
   unit: Unit = 'px';
   show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false };
   gridSize = 16;
@@ -243,13 +276,54 @@ export class Editor {
 
   imagePoint(event: { clientX: number; clientY: number }): Point | null {
     const doc = this.doc;
-    if (!doc) return null;
+    if (!doc || !this.paper) return null;
     const rect = this.paper.getBoundingClientRect();
-    if (!rect.width || !rect.height) return null;
+    const width = this.paper.offsetWidth;
+    const height = this.paper.offsetHeight;
+    if (!width || !height) return null;
+    const dx = event.clientX - (rect.left + rect.width / 2);
+    const dy = event.clientY - (rect.top + rect.height / 2);
+    const angle = -this.viewAngle;
+    const localX = dx * Math.cos(angle) - dy * Math.sin(angle);
+    const localY = dx * Math.sin(angle) + dy * Math.cos(angle);
     return {
-      x: Math.min(doc.width, Math.max(0, (event.clientX - rect.left) / rect.width * doc.width)),
-      y: Math.min(doc.height, Math.max(0, (event.clientY - rect.top) / rect.height * doc.height)),
+      x: Math.min(doc.width, Math.max(0, (localX + width / 2) / width * doc.width)),
+      y: Math.min(doc.height, Math.max(0, (localY + height / 2) / height * doc.height)),
     };
+  }
+
+  setViewAngle(radians: number, quiet = false): void {
+    let next = radians;
+    while (next > Math.PI) next -= Math.PI * 2;
+    while (next < -Math.PI) next += Math.PI * 2;
+    if (Math.abs(next) < 0.0001) next = 0;
+    this.viewAngle = next;
+    this.applyZoom();
+    if (quiet) this.onScene?.();
+    else this.notify();
+  }
+
+  resetView(): void {
+    this.viewAngle = 0;
+    this.applyZoom();
+    this.notify();
+  }
+
+  beginSurface(): void {
+    const layer = this.layer;
+    if (!this.paintingMask || !layer?.maskCtx || this.swappedCtx) return;
+    this.swappedCtx = layer.ctx;
+    layer.ctx = layer.maskCtx;
+  }
+
+  endSurface(): void {
+    const layer = this.layer;
+    if (!this.swappedCtx || !layer) {
+      this.swappedCtx = null;
+      return;
+    }
+    layer.ctx = this.swappedCtx;
+    this.swappedCtx = null;
   }
 
   private makeLayer(name: string, visible: boolean, opacity: number, data?: ImageData): Layer {
@@ -287,6 +361,7 @@ export class Editor {
         parent: layer.parent == null ? null : doc.groups.findIndex(group => group.id === layer.parent),
         alphaLock: layer.alphaLock,
         data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
+        mask: layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null,
       })),
     };
   }
@@ -317,6 +392,15 @@ export class Editor {
       created.tag = layer.tag ?? null;
       created.parent = layer.parent == null ? null : doc.groups[layer.parent]?.id ?? null;
       created.alphaLock = !!layer.alphaLock;
+      if (layer.mask) {
+        const mask = document.createElement('canvas');
+        mask.width = snapshot.width;
+        mask.height = snapshot.height;
+        const maskCtx = context2d(mask);
+        maskCtx.putImageData(layer.mask, 0, 0);
+        created.mask = mask;
+        created.maskCtx = maskCtx;
+      }
       return created;
     });
     this.syncSize();
@@ -327,6 +411,7 @@ export class Editor {
   checkpoint(label: string): void {
     const doc = this.doc;
     if (!doc) return;
+    this.endSurface();
     doc.snapshots.length = doc.cursor + 1;
     doc.labels.length = doc.cursor + 1;
     doc.snapshots.push(this.capture());
@@ -507,6 +592,7 @@ export class Editor {
     if (!doc || !this.paper) return;
     this.paper.style.width = `${Math.max(1, doc.width * doc.zoom)}px`;
     this.paper.style.height = `${Math.max(1, doc.height * doc.zoom)}px`;
+    this.paper.style.transform = this.viewAngle ? `rotate(${this.viewAngle}rad)` : '';
     const overflow = this.paper.offsetWidth > this.stage.clientWidth - 8 || this.paper.offsetHeight > this.stage.clientHeight - 8;
     this.stage.classList.toggle('overflowing', overflow);
   }
@@ -593,6 +679,7 @@ export class Editor {
       ctx.globalAlpha = layer.opacity / 100;
       ctx.globalCompositeOperation = COMPOSITE[layer.blend] ?? 'source-over';
       let source = includeFloat && this.float && layer === this.layer ? this.floatCanvas(layer) : layer.canvas;
+      if (layer.mask) source = this.applyLayerMask(source, layer.mask);
       if (layer.clip) source = this.masked(source, lower);
       ctx.drawImage(source, 0, 0);
       ctx.restore();
@@ -607,6 +694,24 @@ export class Editor {
     ctx.drawImage(layer.canvas, 0, 0);
     if (this.float?.frame) ctx.drawImage(this.float.frame, 0, 0);
     else if (this.float) ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
+    return canvas;
+  }
+
+  private applyLayerMask(source: HTMLCanvasElement, mask: HTMLCanvasElement): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = source.width;
+    canvas.height = source.height;
+    const ctx = context2d(canvas);
+    ctx.drawImage(source, 0, 0);
+    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const maskCtx = mask.getContext('2d', { willReadFrequently: true });
+    if (!maskCtx) return canvas;
+    const maskData = maskCtx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let index = 0; index < image.data.length; index += 4) {
+      const luminance = Math.round(0.2126 * maskData[index] + 0.7152 * maskData[index + 1] + 0.0722 * maskData[index + 2]);
+      image.data[index + 3] = Math.round(image.data[index + 3] * luminance / 255);
+    }
+    ctx.putImageData(image, 0, 0);
     return canvas;
   }
 
@@ -632,15 +737,55 @@ export class Editor {
       ctx.beginPath();
       ctx.strokeStyle = 'rgba(28, 113, 216, 0.35)';
       ctx.lineWidth = 1;
-      for (let x = this.gridSize; x < doc.width; x += this.gridSize) {
-        ctx.moveTo(x + 0.5, 0);
-        ctx.lineTo(x + 0.5, doc.height);
-      }
-      for (let y = this.gridSize; y < doc.height; y += this.gridSize) {
-        ctx.moveTo(0, y + 0.5);
-        ctx.lineTo(doc.width, y + 0.5);
+      if (this.gridKind === 'iso') {
+        const height = this.gridSize * Math.sin(Math.PI / 3);
+        const slope = doc.height / Math.tan(Math.PI / 3);
+        for (let y = height; y < doc.height; y += height) {
+          ctx.moveTo(0, y);
+          ctx.lineTo(doc.width, y);
+        }
+        for (let x = -doc.height; x < doc.width + doc.height; x += this.gridSize) {
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x + slope, doc.height);
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x - slope, doc.height);
+        }
+      } else {
+        for (let x = this.gridSize; x < doc.width; x += this.gridSize) {
+          ctx.moveTo(x + 0.5, 0);
+          ctx.lineTo(x + 0.5, doc.height);
+        }
+        for (let y = this.gridSize; y < doc.height; y += this.gridSize) {
+          ctx.moveTo(0, y + 0.5);
+          ctx.lineTo(doc.width, y + 0.5);
+        }
       }
       ctx.stroke();
+    }
+    const guide = this.assistantDraft ?? this.assistant;
+    if (guide) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(28, 113, 216, 0.9)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      if (guide.kind === 'ellipse') {
+        const cx = (guide.a.x + guide.b.x) / 2;
+        const cy = (guide.a.y + guide.b.y) / 2;
+        ctx.ellipse(cx, cy, Math.max(1, Math.abs(guide.b.x - guide.a.x) / 2), Math.max(1, Math.abs(guide.b.y - guide.a.y) / 2), 0, 0, Math.PI * 2);
+      } else if (guide.kind === 'vanish') {
+        ctx.moveTo(guide.a.x, guide.a.y);
+        ctx.lineTo(guide.b.x, guide.b.y);
+      } else {
+        const dx = guide.b.x - guide.a.x;
+        const dy = guide.b.y - guide.a.y;
+        const length = Math.hypot(dx, dy) || 1;
+        const span = Math.hypot(doc.width, doc.height);
+        ctx.moveTo(guide.a.x - dx / length * span, guide.a.y - dy / length * span);
+        ctx.lineTo(guide.a.x + dx / length * span, guide.a.y + dy / length * span);
+      }
+      ctx.stroke();
+      ctx.restore();
     }
     const paintEdges = (edges: ArrayLike<number>) => {
       const limit = Math.min(edges.length, 200000);
@@ -697,6 +842,7 @@ export class Editor {
   setSelection(next: Uint8Array | null, mode: SelectMode): void {
     const doc = this.doc;
     if (!doc) return;
+    this.fillCoverage = null;
     doc.selection = next ? combineMask(mode === 'replace' ? null : doc.selection, next, mode) : null;
     this.rebuildEdges();
     this.paintOverlay();
@@ -762,7 +908,7 @@ export class Editor {
   }
 
   lockAlpha(image: ImageData, before: ImageData): void {
-    if (!this.layer?.alphaLock) return;
+    if (this.paintingMask || !this.layer?.alphaLock) return;
     const data = image.data;
     const src = before.data;
     for (let index = 3; index < data.length; index += 4) {
@@ -777,7 +923,7 @@ export class Editor {
   guardAlpha(before: ImageData): void {
     const layer = this.layer;
     const doc = this.doc;
-    if (!layer?.alphaLock || !doc) return;
+    if (this.paintingMask || !layer?.alphaLock || !doc) return;
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     this.lockAlpha(image, before);
     layer.ctx.putImageData(image, 0, 0);
@@ -934,6 +1080,14 @@ export class Editor {
       next.height = height;
       draw(context2d(next), layer.canvas);
       this.replaceLayerCanvas(layer, next);
+      if (layer.mask) {
+        const nextMask = document.createElement('canvas');
+        nextMask.width = width;
+        nextMask.height = height;
+        draw(context2d(nextMask), layer.mask);
+        layer.mask = nextMask;
+        layer.maskCtx = context2d(nextMask);
+      }
     }
     if (doc.selection) {
       const next = document.createElement('canvas');
@@ -1136,6 +1290,15 @@ export class Editor {
     copy.parent = layer.parent;
     copy.alphaLock = layer.alphaLock;
     copy.ctx.drawImage(layer.canvas, 0, 0);
+    if (layer.mask) {
+      const mask = document.createElement('canvas');
+      mask.width = layer.mask.width;
+      mask.height = layer.mask.height;
+      const maskCtx = context2d(mask);
+      maskCtx.drawImage(layer.mask, 0, 0);
+      copy.mask = mask;
+      copy.maskCtx = maskCtx;
+    }
     doc.layers.splice(doc.active + 1, 0, copy);
     doc.active++;
     this.checkpoint('Duplicate Layer');
@@ -1152,7 +1315,8 @@ export class Editor {
     lower.ctx.save();
     lower.ctx.globalAlpha = upper.opacity / 100;
     lower.ctx.globalCompositeOperation = COMPOSITE[upper.blend];
-    if (upper.visible) lower.ctx.drawImage(upper.clip ? this.masked(upper.canvas, lower.canvas) : upper.canvas, 0, 0);
+    const upperSource = upper.mask ? this.applyLayerMask(upper.canvas, upper.mask) : upper.canvas;
+    if (upper.visible) lower.ctx.drawImage(upper.clip ? this.masked(upperSource, lower.canvas) : upperSource, 0, 0);
     lower.ctx.restore();
     doc.layers.splice(doc.active, 1);
     doc.active--;
@@ -1216,6 +1380,96 @@ export class Editor {
     }
     this.renderScene();
     this.checkpoint('Solo Layer');
+  }
+
+  showAllLayers(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.soloMemory = null;
+    for (const layer of doc.layers) layer.visible = true;
+    for (const group of doc.groups) group.visible = true;
+    this.checkpoint('Show All Layers');
+  }
+
+  addMask(): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    if (!doc || !layer || layer.mask) return;
+    const mask = document.createElement('canvas');
+    mask.width = doc.width;
+    mask.height = doc.height;
+    const maskCtx = context2d(mask);
+    maskCtx.fillStyle = '#ffffff';
+    maskCtx.fillRect(0, 0, doc.width, doc.height);
+    layer.mask = mask;
+    layer.maskCtx = maskCtx;
+    this.paintingMask = true;
+    this.checkpoint('Add Mask');
+  }
+
+  removeMask(): void {
+    const layer = this.layer;
+    if (!layer?.mask) return;
+    layer.mask = undefined;
+    layer.maskCtx = undefined;
+    this.paintingMask = false;
+    this.checkpoint('Remove Mask');
+  }
+
+  reshapeFloat(width: number, height: number, degrees: number): void {
+    const doc = this.doc;
+    const float = this.float;
+    if (!doc || !float) return;
+    const bounds = float.mask ? boundsOf(float.mask, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
+    if (!bounds || bounds.w < 1 || bounds.h < 1) return;
+    const frame = document.createElement('canvas');
+    frame.width = doc.width;
+    frame.height = doc.height;
+    const ctx = context2d(frame);
+    const cx = bounds.x + bounds.w / 2;
+    const cy = bounds.y + bounds.h / 2;
+    ctx.translate(cx, cy);
+    ctx.rotate(degrees * Math.PI / 180);
+    ctx.scale(width / bounds.w, height / bounds.h);
+    ctx.translate(-cx, -cy);
+    ctx.drawImage(float.sprite, 0, 0);
+    float.frame = frame;
+    float.x = 0;
+    float.y = 0;
+    float.angle = degrees;
+    float.boxW = Math.max(1, Math.round(width));
+    float.boxH = Math.max(1, Math.round(height));
+    if (float.mask) {
+      const maskCanvas = document.createElement('canvas');
+      maskCanvas.width = doc.width;
+      maskCanvas.height = doc.height;
+      const maskCtx = context2d(maskCanvas);
+      const image = maskCtx.createImageData(doc.width, doc.height);
+      for (let index = 0; index < float.mask.length; index++) {
+        if (float.mask[index] === 0) continue;
+        image.data[index * 4 + 3] = 255;
+      }
+      maskCtx.putImageData(image, 0, 0);
+      const out = document.createElement('canvas');
+      out.width = doc.width;
+      out.height = doc.height;
+      const outCtx = context2d(out);
+      outCtx.translate(cx, cy);
+      outCtx.rotate(degrees * Math.PI / 180);
+      outCtx.scale(width / bounds.w, height / bounds.h);
+      outCtx.translate(-cx, -cy);
+      outCtx.drawImage(maskCanvas, 0, 0);
+      const sampled = outCtx.getImageData(0, 0, doc.width, doc.height);
+      const next = new Uint8Array(doc.width * doc.height);
+      for (let index = 0; index < next.length; index++) next[index] = sampled.data[index * 4 + 3] > 128 ? 255 : 0;
+      if (next.some(value => value > 0)) {
+        doc.selection = next;
+        this.rebuildEdges();
+      }
+    }
+    this.fillCoverage = null;
+    this.renderScene();
+    this.notify();
   }
 
   setGroupVisible(id: number, visible: boolean): void {
@@ -1430,13 +1684,22 @@ export class Editor {
     const color = rgba(this.primary, 255);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     const before = new ImageData(new Uint8ClampedArray(image.data), doc.width, doc.height);
+    const coverage = this.fillCoverage;
     for (let i = 0; i < doc.selection.length; i++) {
       if (doc.selection[i] === 0) continue;
       const o = i * 4;
-      image.data[o] = color.r;
-      image.data[o + 1] = color.g;
-      image.data[o + 2] = color.b;
-      image.data[o + 3] = color.a;
+      const amount = coverage && i < coverage.length ? coverage[i] : 1;
+      if (amount >= 0.999) {
+        image.data[o] = color.r;
+        image.data[o + 1] = color.g;
+        image.data[o + 2] = color.b;
+        image.data[o + 3] = color.a;
+      } else {
+        image.data[o] = Math.round(image.data[o] * (1 - amount) + color.r * amount);
+        image.data[o + 1] = Math.round(image.data[o + 1] * (1 - amount) + color.g * amount);
+        image.data[o + 2] = Math.round(image.data[o + 2] * (1 - amount) + color.b * amount);
+        image.data[o + 3] = Math.round(image.data[o + 3] * (1 - amount) + color.a * amount);
+      }
     }
     this.lockAlpha(image, before);
     layer.ctx.putImageData(image, 0, 0);
@@ -1691,6 +1954,7 @@ export class Editor {
             parent: layer.parent,
             alphaLock: layer.alphaLock,
             png: await canvasToPng(layer.canvas),
+            mask: layer.mask ? await canvasToPng(layer.mask) : undefined,
           });
         }
         documents.push({
@@ -1754,6 +2018,17 @@ export class Editor {
           created.ctx = context2d(created.canvas);
           created.ctx.drawImage(bitmap, 0, 0, stored.width, stored.height);
           bitmap.close();
+          if (layer.mask) {
+            const maskBitmap = await createImageBitmap(layer.mask);
+            const mask = document.createElement('canvas');
+            mask.width = stored.width;
+            mask.height = stored.height;
+            const maskCtx = context2d(mask);
+            maskCtx.drawImage(maskBitmap, 0, 0, stored.width, stored.height);
+            maskBitmap.close();
+            created.mask = mask;
+            created.maskCtx = maskCtx;
+          }
           doc.layers.push(created);
         }
         doc.active = Math.max(0, Math.min(stored.active, doc.layers.length - 1));

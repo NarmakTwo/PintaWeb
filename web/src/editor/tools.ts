@@ -1,6 +1,7 @@
 import type { Editor } from './document.ts';
 import { rgba } from '../wasm/engine.ts';
-import { boundsOf, modeFromPointer, shiftMask, type Bounds, type Point, type SelectMode, type ToolId } from './types.ts';
+import { paintSoft, projectPoint, snapPoint, softRegion } from './adjust.ts';
+import { boundsOf, modeFromPointer, shiftMask, type Bounds, type Point, type SelectMode, type SmoothTool, type ToolId } from './types.ts';
 
 function transformAround(ctx: CanvasRenderingContext2D, gesture: 'scale' | 'uniform' | 'rotate' | 'rotate-step', start: Point, point: Point, bounds: Bounds): void {
   const cx = bounds.x + bounds.w / 2;
@@ -510,6 +511,48 @@ function centripetal(p0: Point, p1: Point, p2: Point, p3: Point, amount: number)
   return mixPoint(b1, b2, t1, t2, t);
 }
 
+function samplePolyline(points: CurvePoint[], spacing: number): CurvePoint[] {
+  if (points.length <= 1) return points.map(point => ({ ...point }));
+  const gap = Math.max(0.5, spacing);
+  const out: CurvePoint[] = [{ ...points[0] }];
+  for (let index = 1; index < points.length; index++) {
+    const from = points[index - 1];
+    const to = points[index];
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const steps = Math.min(500, Math.max(1, Math.ceil(distance / gap)));
+    for (let step = 1; step <= steps; step++) {
+      const amount = step / steps;
+      out.push({
+        x: from.x + (to.x - from.x) * amount,
+        y: from.y + (to.y - from.y) * amount,
+        t: from.t + (to.t - from.t) * amount,
+      });
+    }
+  }
+  return out;
+}
+
+function blendSamples(points: CurvePoint[], spacing: number, amount: number): CurvePoint[] {
+  const curve = sampleCurve(points, spacing);
+  if (amount >= 100 || points.length < 3) return curve;
+  const raw = samplePolyline(points, spacing);
+  const mix = amount >= 70 ? 0.85 + (amount - 70) / 30 * 0.15 : amount / 70 * 0.85;
+  const count = Math.max(curve.length, raw.length, 1);
+  const out: CurvePoint[] = [];
+  for (let index = 0; index < count; index++) {
+    const curveIndex = Math.min(curve.length - 1, Math.round(index * (curve.length - 1) / Math.max(1, count - 1)));
+    const rawIndex = Math.min(raw.length - 1, Math.round(index * (raw.length - 1) / Math.max(1, count - 1)));
+    const curved = curve[curveIndex];
+    const straight = raw[rawIndex];
+    out.push({
+      x: straight.x + (curved.x - straight.x) * mix,
+      y: straight.y + (curved.y - straight.y) * mix,
+      t: curved.t,
+    });
+  }
+  return out;
+}
+
 function sampleCurve(points: CurvePoint[], spacing: number): CurvePoint[] {
   if (points.length <= 1) return points.map(point => ({ ...point }));
   if (points.length === 2) {
@@ -619,6 +662,7 @@ function commitText(editor: Editor): void {
 
 export class ToolController {
   private drawing = false;
+  private placing = false;
   private panning = false;
   private start: Point | null = null;
   private last: Point | null = null;
@@ -688,8 +732,17 @@ export class ToolController {
       this.pending = null;
       editor.checkpoint('Line/Curve');
     }
-    const point = editor.imagePoint(event);
-    if (!point) return;
+    const rawPoint = editor.imagePoint(event);
+    if (!rawPoint) return;
+    const point = this.adjustPoint(rawPoint, event, 'down');
+    if (editor.assistantPlace) {
+      this.placing = true;
+      this.drawing = true;
+      this.start = point;
+      this.last = point;
+      capturePointer(editor.paper, event.pointerId);
+      return;
+    }
     if (this.drawing && editor.tool === 'dither') {
       this.held = this.held | (event.buttons || (event.button === 2 ? 2 : 1));
       if (this.last) this.tone(this.last, this.last);
@@ -738,6 +791,7 @@ export class ToolController {
       return;
     }
     this.drawing = true;
+    editor.beginSurface();
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
     capturePointer(editor.paper, event.pointerId);
     if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'random') this.beginRate();
@@ -748,7 +802,11 @@ export class ToolController {
     } else if (editor.tool === 'recolor') {
       const pixel = editor.layer.ctx.getImageData(Math.min(doc.width - 1, Math.floor(point.x)), Math.min(doc.height - 1, Math.floor(point.y)), 1, 1).data;
       this.target = { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
-      this.recolor(point);
+      this.curvePath = [];
+      if (this.curves('recolor', false)) {
+        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+        this.replayCurve('recolor');
+      } else this.recolor(point);
     } else if (editor.tool === 'pencil') {
       this.pencilPath = [];
       this.curvePath = [];
@@ -772,7 +830,13 @@ export class ToolController {
         this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
         this.replayCurve('pen');
       } else this.pen(point, point, event.timeStamp);
-    } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither' || editor.tool === 'random') this.tone(point, point);
+    } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither' || editor.tool === 'random') {
+      this.curvePath = [];
+      if (this.curves(editor.tool, false)) {
+        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+        this.replayCurve(editor.tool);
+      } else this.tone(point, point);
+    }
     else if (editor.tool === 'lasso' || editor.tool === 'lasso-draw') {
       this.points = [point];
       if (editor.tool === 'lasso') this.showLasso();
@@ -782,7 +846,16 @@ export class ToolController {
 
   move(event: PointerEvent): void {
     const editor = this.editor;
-    const point = editor.imagePoint(event);
+    const rawPoint = editor.imagePoint(event);
+    const point = rawPoint ? this.adjustPoint(rawPoint, event, 'move') : null;
+    if (this.placing) {
+      const editorGuide = editor.assistantPlace;
+      if (point && this.start && editorGuide) {
+        editor.assistantDraft = { kind: editorGuide, a: this.start, b: point };
+        editor.paintOverlay();
+      }
+      return;
+    }
     if (this.panning) {
       editor.stage.scrollLeft = this.scroll.x - (event.clientX - this.scroll.cx);
       editor.stage.scrollTop = this.scroll.y - (event.clientY - this.scroll.cy);
@@ -847,6 +920,9 @@ export class ToolController {
     this.panning = false;
     if (editor.float) editor.cancelFloat();
     else if (wasDrawing && this.before && editor.layer) editor.layer.ctx.putImageData(this.before, 0, 0);
+    this.placing = false;
+    editor.assistantDraft = null;
+    editor.endSurface();
     if (this.baseMask && editor.doc) {
       editor.doc.selection = new Uint8Array(this.baseMask);
       editor.rebuildEdges();
@@ -875,6 +951,20 @@ export class ToolController {
       this.panning = false;
       return;
     }
+    if (this.placing) {
+      this.placing = false;
+      this.drawing = false;
+      const point = editor.imagePoint(event);
+      if (editor.assistantPlace && this.start && point) {
+        const placed = this.adjustPoint(point, event, 'up');
+        editor.assistant = { kind: editor.assistantPlace, a: this.start, b: placed };
+        editor.assistantPlace = null;
+      }
+      editor.assistantDraft = null;
+      editor.paintOverlay();
+      editor.notify();
+      return;
+    }
     if (!this.drawing || !this.start) return;
     if (editor.tool === 'dither' && (event.buttons & 3) !== 0) {
       this.held = event.buttons;
@@ -882,7 +972,8 @@ export class ToolController {
     }
     this.stopRate();
     this.drawing = false;
-    const point = editor.imagePoint(event) ?? this.last ?? this.start;
+    const rawPoint = editor.imagePoint(event);
+    const point = (rawPoint ? this.adjustPoint(rawPoint, event, 'up') : null) ?? this.last ?? this.start;
     const tool = editor.tool;
     clearPreview(editor);
     const curve = this.curvePath.length ? this.curveKind(tool, event.shiftKey) : null;
@@ -951,15 +1042,35 @@ export class ToolController {
     const doc = editor.doc;
     const layer = editor.layer;
     if (!doc || !layer) return;
+    editor.beginSurface();
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     const before = new ImageData(new Uint8ClampedArray(image.data), doc.width, doc.height);
     const x = Math.min(doc.width - 1, Math.max(0, point.x | 0));
     const y = Math.min(doc.height - 1, Math.max(0, point.y | 0));
     const tolerance = Math.round(editor.tolerance * 2.55);
-    if (editor.sampleAll) {
+    const fill = editor.ink(button);
+    let changed = false;
+    if (editor.smoothEdges) {
+      const sample = editor.sampleAll ? this.sampleImage() : image;
+      if (sample) {
+        const region = softRegion(sample, x, y, tolerance, true);
+        if (editor.sampleAll) changed = paintSoft(image, region, fill);
+        else changed = paintSoft(image, region, fill);
+      }
+    } else if (editor.sampleAll) {
       const sample = this.sampleImage();
-      if (sample) paintMask(image, contiguousMask(sample, x, y, tolerance), editor.ink(button));
-    } else editor.engine.flood(image, x, y, editor.ink(button), tolerance);
+      if (sample) {
+        paintMask(image, contiguousMask(sample, x, y, tolerance), fill);
+        changed = true;
+      }
+    } else {
+      editor.engine.flood(image, x, y, fill, tolerance);
+      changed = true;
+    }
+    if (!changed) {
+      editor.endSurface();
+      return;
+    }
     if (doc.selection) editor.engine.clip(image, before, doc.selection);
     editor.lockAlpha(image, before);
     layer.ctx.putImageData(image, 0, 0);
@@ -976,12 +1087,20 @@ export class ToolController {
     const x = Math.min(doc.width - 1, Math.max(0, point.x | 0));
     const y = Math.min(doc.height - 1, Math.max(0, point.y | 0));
     const tolerance = Math.round(editor.tolerance * 2.55);
-    const mask = editor.wandContiguous && !editor.sampleAll
-      ? editor.engine.wand(sample, x, y, tolerance)
-      : editor.wandContiguous
-        ? contiguousMask(sample, x, y, tolerance)
-        : matchingMask(sample, x, y, tolerance);
-    editor.setSelection(mask, mode);
+    let mask: Uint8Array;
+    if (editor.smoothEdges) {
+      const region = softRegion(sample, x, y, tolerance, editor.wandContiguous);
+      mask = region.mask;
+      editor.setSelection(mask, mode);
+      editor.fillCoverage = region.coverage;
+    } else {
+      mask = editor.wandContiguous && !editor.sampleAll
+        ? editor.engine.wand(sample, x, y, tolerance)
+        : editor.wandContiguous
+          ? contiguousMask(sample, x, y, tolerance)
+          : matchingMask(sample, x, y, tolerance);
+      editor.setSelection(mask, mode);
+    }
     if (editor.doc?.selection) editor.tool = 'move-pixels';
     editor.checkpoint('Magic Wand');
   }
@@ -1100,14 +1219,31 @@ export class ToolController {
     return true;
   }
 
+  private adjustPoint(point: Point, event: PointerEvent, phase: 'down' | 'move' | 'up'): Point {
+    const editor = this.editor;
+    const tool = editor.tool;
+    const lock = event.shiftKey && (tool === 'pencil' || tool === 'brush' || tool === 'line');
+    let next = point;
+    const sticks = tool === 'pencil' || tool === 'brush' || tool === 'pen' || tool === 'line';
+    if (editor.assistant && !lock && sticks && this.start && phase !== 'down') next = projectPoint(next, this.start, editor.assistant);
+    if (!editor.snap) return next;
+    const ends = tool === 'line' || tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse';
+    const pencil = tool === 'pencil' && (editor.size <= 1 || phase === 'down' || lock);
+    const brushEnd = tool === 'brush' && (phase === 'down' || lock);
+    if (ends || pencil || brushEnd) return snapPoint(next, editor.gridSize, editor.gridKind);
+    return next;
+  }
+
   private curves(tool: ToolId, lock: boolean): boolean {
     return this.curveKind(tool, lock) !== null;
   }
 
-  private curveKind(tool: ToolId, lock: boolean): 'brush' | 'eraser' | 'pen' | 'pencil' | null {
+  private curveKind(tool: ToolId, lock: boolean): SmoothTool | null {
     if (lock) return null;
-    if (tool !== 'brush' && tool !== 'eraser' && tool !== 'pen' && tool !== 'pencil') return null;
-    return this.editor.unserrate[tool] ? tool : null;
+    if (tool !== 'brush' && tool !== 'eraser' && tool !== 'pen' && tool !== 'pencil' && tool !== 'dither' && tool !== 'recolor' && tool !== 'random' && tool !== 'lighten' && tool !== 'darken') return null;
+    if (tool === 'recolor' && this.editor.recolorGlobal) return null;
+    if (!this.editor.unserrate[tool] || this.editor.smoothing[tool] <= 0) return null;
+    return tool;
   }
 
   private pushCurve(point: Point, time: number): void {
@@ -1119,25 +1255,32 @@ export class ToolController {
     this.curvePath.push({ x: point.x, y: point.y, t: time });
   }
 
-  private replayCurve(tool: 'brush' | 'eraser' | 'pen' | 'pencil'): void {
+  private replayCurve(tool: SmoothTool): void {
     const editor = this.editor;
     const layer = editor.layer;
     const doc = editor.doc;
     if (!layer || !doc || !this.before || !this.curvePath.length) return;
     layer.ctx.putImageData(this.before, 0, 0);
-    const samples = sampleCurve(this.curvePath, Math.max(1, editor.size / 4));
+    const samples = blendSamples(this.curvePath, Math.max(1, editor.size / 4), editor.smoothing[tool]);
     if (!samples.length) return;
     if (tool === 'pencil') {
       const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
       const size = Math.max(1, editor.size | 0);
       const ink = editor.ink(this.button);
-      const stamp = (from: Point, to: Point) => {
-        for (const [start, end] of mirroredSegments(editor, from, to)) {
-          editor.engine.stamp(image, start.x | 0, start.y | 0, end.x | 0, end.y | 0, size, ink, false);
+      if (size === 1) {
+        const path = samples.map(sample => ({ x: Math.round(sample.x), y: Math.round(sample.y) }));
+        for (const pixel of pixelPerfect(rasterize(path))) {
+          for (const spot of mirrorPoints(editor, pixel)) blendPixel(image, spot.x, spot.y, ink);
         }
-      };
-      if (samples.length === 1) stamp(samples[0], samples[0]);
-      for (let index = 1; index < samples.length; index++) stamp(samples[index - 1], samples[index]);
+      } else {
+        const stamp = (from: Point, to: Point) => {
+          for (const [start, end] of mirroredSegments(editor, from, to)) {
+            editor.engine.stamp(image, start.x | 0, start.y | 0, end.x | 0, end.y | 0, size, ink, false);
+          }
+        };
+        if (samples.length === 1) stamp(samples[0], samples[0]);
+        for (let index = 1; index < samples.length; index++) stamp(samples[index - 1], samples[index]);
+      }
       editor.lockAlpha(image, this.before);
       layer.ctx.putImageData(image, 0, 0);
     } else if (tool === 'pen') {
@@ -1145,6 +1288,12 @@ export class ToolController {
       this.strokeClock = samples[0].t;
       if (samples.length === 1) this.pen(samples[0], samples[0], samples[0].t, false, null, null, true);
       for (let index = 1; index < samples.length; index++) this.pen(samples[index - 1], samples[index], samples[index].t, false, samples[index - 1], samples[index], true);
+    } else if (tool === 'recolor') {
+      if (samples.length === 1) this.recolor(samples[0]);
+      else for (const sample of samples) this.recolor(sample);
+    } else if (tool === 'dither' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
+      if (samples.length === 1) this.tone(samples[0], samples[0]);
+      else for (let index = 1; index < samples.length; index++) this.tone(samples[index - 1], samples[index]);
     } else if (samples.length === 1) this.brush(samples[0], samples[0], true);
     else for (let index = 1; index < samples.length; index++) this.brush(samples[index - 1], samples[index], true);
     editor.renderScene();
@@ -1375,9 +1524,22 @@ export class ToolController {
       layer.ctx.putImageData(base, 0, 0);
     } else layer.ctx.clearRect(0, 0, doc.width, doc.height);
     this.armGesture(event);
-    editor.float = { sprite, x: 0, y: 0, before: this.before, mask: doc.selection ? new Uint8Array(doc.selection) : null, frame: null };
+    const bounds = doc.selection ? boundsOf(doc.selection, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
+    editor.fillCoverage = null;
+    editor.float = {
+      sprite,
+      x: 0,
+      y: 0,
+      before: this.before,
+      mask: doc.selection ? new Uint8Array(doc.selection) : null,
+      frame: null,
+      angle: 0,
+      boxW: bounds?.w ?? doc.width,
+      boxH: bounds?.h ?? doc.height,
+    };
     this.start = point;
     editor.renderScene();
+    editor.notify();
   }
 
   syncConstraint(event: KeyboardEvent): void {
@@ -1398,12 +1560,36 @@ export class ToolController {
       float.frame = null;
       float.x = Math.round(point.x - start.x);
       float.y = Math.round(point.y - start.y);
+      editor.fillCoverage = null;
       editor.renderScene();
+      editor.onScene?.();
       return;
     }
     const kind = this.gesture === 'scale' ? (shift ? 'uniform' : 'scale') : (shift ? 'rotate-step' : 'rotate');
     const bounds = float.mask ? boundsOf(float.mask, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
     if (!bounds) return;
+    const cx = bounds.x + bounds.w / 2;
+    const cy = bounds.y + bounds.h / 2;
+    if (kind === 'rotate' || kind === 'rotate-step') {
+      let angle = Math.atan2(point.y - cy, point.x - cx) - Math.atan2(start.y - cy, start.x - cx);
+      if (kind === 'rotate-step') angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12);
+      float.angle = angle * 180 / Math.PI;
+      float.boxW = bounds.w;
+      float.boxH = bounds.h;
+    } else if (kind === 'uniform') {
+      const origin = Math.hypot(start.x - cx, start.y - cy);
+      const scale = origin < 1 ? 1 : Math.hypot(point.x - cx, point.y - cy) / origin;
+      float.boxW = Math.max(1, Math.round(bounds.w * scale));
+      float.boxH = Math.max(1, Math.round(bounds.h * scale));
+    } else {
+      const ox = start.x - cx;
+      const oy = start.y - cy;
+      const sx = Math.abs(ox) < 1 ? 1 : (point.x - cx) / ox;
+      const sy = Math.abs(oy) < 1 ? 1 : (point.y - cy) / oy;
+      float.boxW = Math.max(1, Math.round(Math.abs(bounds.w * sx)));
+      float.boxH = Math.max(1, Math.round(Math.abs(bounds.h * sy)));
+    }
+    editor.fillCoverage = null;
     const frame = document.createElement('canvas');
     frame.width = doc.width;
     frame.height = doc.height;

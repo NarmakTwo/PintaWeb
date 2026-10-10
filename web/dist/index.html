@@ -16,8 +16,8 @@
         document.querySelector('meta[name="theme-color"]').setAttribute('content', darkTheme ? '#242424' : '#fafafa');
       } catch (error) {}
     </script>
-    <script type="module" crossorigin src="/assets/index-BMQH4Hwc.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-R6xbqNNF.css">
+    <script type="module" crossorigin src="/assets/index-B1v6RHTE.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DWBpiX8x.css">
   </head>
   <body>
     <div id="app">
@@ -61,6 +61,11 @@
             <div id="recent-colors" class="palette" hidden aria-label="Recent colors"></div>
             <div id="palette-divider" class="palette-divider" hidden></div>
             <div id="palette" class="palette" aria-label="Palette"></div>
+            <button type="button" id="mix-toggle" class="mix-toggle" aria-expanded="false">Mix</button>
+            <div id="mixer-panel" hidden>
+              <canvas id="mixer" width="128" height="128" aria-label="Color mixer"></canvas>
+              <button type="button" id="mixer-clear">Clear</button>
+            </div>
             <label class="alpha-control">
               <span id="alpha-preview" class="alpha-checker"></span>
               <input id="alpha-slider" type="range" min="0" max="255" value="255" aria-label="Primary transparency" />
@@ -110,6 +115,8 @@
         <span id="selection-status">No selection</span>
         <span id="cursor-pos">0, 0</span>
         <span id="image-dimensions"></span>
+        <span id="status-note"></span>
+        <button type="button" id="view-angle" title="Reset the view angle">0°</button>
         <button type="button" id="zoom-label" title="Fit the image">100%</button>
       </footer>
     </div>

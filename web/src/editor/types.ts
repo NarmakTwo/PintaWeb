@@ -12,6 +12,9 @@ export type ShapeStyle = 'outline' | 'fill' | 'both';
 export type SelectMode = 'replace' | 'union' | 'exclude' | 'xor' | 'intersect';
 export type GradientKind = 'linear' | 'radial' | 'diamond' | 'conical';
 export type Unit = 'px' | 'in' | 'cm';
+export type SmoothTool = 'brush' | 'eraser' | 'pen' | 'pencil' | 'dither' | 'recolor' | 'random' | 'lighten' | 'darken';
+export type GridKind = 'square' | 'iso';
+export type AssistantKind = 'parallel' | 'ellipse' | 'vanish';
 
 export interface Point {
   x: number;

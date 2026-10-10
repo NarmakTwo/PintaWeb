@@ -50,7 +50,16 @@ export async function start(): Promise<void> {
   buildChrome(editor, tools);
   editor.attach($('image-canvas'), $('preview-canvas'), $('overlay-canvas'), $('paper'), $('stage'));
   editor.onChanged = () => sync(editor);
-  editor.onScene = () => paintRulers(editor);
+  editor.onScene = () => {
+    paintRulers(editor);
+    const angleLabel = document.getElementById('view-angle');
+    if (angleLabel) angleLabel.textContent = `${Math.round(editor.viewAngle * 180 / Math.PI)}°`;
+    for (const id of ['float-w', 'float-h', 'float-angle'] as const) {
+      const field = document.getElementById(id) as HTMLInputElement | null;
+      if (!field || !editor.float || document.activeElement === field) continue;
+      field.value = id === 'float-w' ? String(editor.float.boxW) : id === 'float-h' ? String(editor.float.boxH) : String(Math.round(editor.float.angle));
+    }
+  };
   editor.onToast = message => showToast(message);
   editor.onSave = state => {
     const app = $('app');
@@ -180,6 +189,13 @@ function viewMenu(): string {
     item('Zoom In', 'zoom-in'), item('Zoom Out', 'zoom-out'), item('Normal Size', 'zoom-100', 'Ctrl+0'), item('Best Fit', 'zoom-fit'), item('Zoom to Selection', 'zoom-selection'), '<div class="sep"></div>',
     item('Rulers', 'toggle-rulers'), item('Status Bar', 'toggle-status'), item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'),
     item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Pixel Grid', 'toggle-grid'), item('Grid Size…', 'grid-size'),
+    item('Square Grid', 'grid-square'), item('Isometric Grid', 'grid-iso'),
+    '<button type="button" data-command="toggle-snap">Snap to Grid<span class="shortcut" id="snap-mark">Off</span></button>',
+    item('Reset View', 'reset-view'),
+    '<button type="button" data-command="assist-none">Assistant: None</button>',
+    '<button type="button" data-command="assist-parallel">Parallel Lines</button>',
+    '<button type="button" data-command="assist-ellipse">Ellipse Guide</button>',
+    '<button type="button" data-command="assist-vanish">Vanishing Point</button>',
     '<button type="button" data-command="toggle-cursor">Brush Cursor<span class="shortcut" id="cursor-mark">Off</span></button>', '<div class="sep"></div>',
     item('Pixels', 'unit-px'), item('Inches', 'unit-in'), item('Centimeters', 'unit-cm'), '<div class="sep"></div>',
     '<button type="button" data-command="theme-dark" aria-checked="false">Dark Mode<span class="shortcut" id="theme-mark">Off</span></button>',
@@ -202,6 +218,7 @@ function layerMenu(): string {
     item('Add New Layer', 'layer-add', 'Ctrl+Shift+N'), item('Delete Layer', 'layer-delete', 'Ctrl+Shift+Del'), item('Duplicate Layer', 'layer-duplicate', 'Ctrl+Shift+D'),
     item('Merge Down', 'layer-merge', 'Ctrl+M'), '<div class="sep"></div>', item('Move Up', 'layer-up'), item('Move Down', 'layer-down'), '<div class="sep"></div>',
     item('Flip Horizontal', 'layer-flip-h', 'Ctrl+F'), item('Flip Vertical', 'layer-flip-v', 'Shift+F'), item('Rotate / Zoom…', 'layer-rotate'), '<div class="sep"></div>',
+    item('Add Mask', 'layer-mask'), item('Remove Mask', 'layer-unmask'),
     item('Properties…', 'layer-properties', 'F4'), item('Import from File…', 'import-layer'),
   ].join('');
 }
@@ -332,7 +349,7 @@ function wire(editor: Editor, tools: ToolController): void {
 
   const paper = $('paper');
   const contacts = new Map<number, { x: number; y: number }>();
-  let pinch: { distance: number; cx: number; cy: number; zoom: number } | null = null;
+  let pinch: { distance: number; cx: number; cy: number; zoom: number; angle: number; mode: 'pending' | 'zoom' | 'rotate'; base: number } | null = null;
   let pinchGesture = false;
 
   const measure = () => {
@@ -343,6 +360,7 @@ function wire(editor: Editor, tools: ToolController): void {
       distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
       cx: (a.x + b.x) / 2,
       cy: (a.y + b.y) / 2,
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
     };
   };
   const zoomByWheel = (event: WheelEvent) => {
@@ -361,7 +379,7 @@ function wire(editor: Editor, tools: ToolController): void {
     pinchGesture = true;
     tools.abandon();
     const span = measure();
-    if (span && editor.doc) pinch = { ...span, zoom: editor.doc.zoom };
+    if (span && editor.doc) pinch = { ...span, zoom: editor.doc.zoom, mode: 'pending', base: editor.viewAngle };
     if (event.cancelable) event.preventDefault();
   }, true);
   window.addEventListener('pointermove', event => {
@@ -371,13 +389,29 @@ function wire(editor: Editor, tools: ToolController): void {
     const span = measure();
     if (!span || !editor.doc) return;
     if (event.cancelable) event.preventDefault();
-    editor.zoomAt(pinch.zoom * (span.distance / pinch.distance), pinch.cx, pinch.cy);
-    editor.stage.scrollLeft -= span.cx - pinch.cx;
-    editor.stage.scrollTop -= span.cy - pinch.cy;
+    let turn = span.angle - pinch.angle;
+    while (turn > Math.PI) turn -= Math.PI * 2;
+    while (turn < -Math.PI) turn += Math.PI * 2;
+    const scale = span.distance / pinch.distance;
+    const degrees = Math.abs(turn) * 180 / Math.PI;
+    const zoomDelta = Math.abs(Math.log(scale));
+    if (pinch.mode === 'pending') {
+      if (degrees >= 28 && zoomDelta < 0.06) pinch.mode = 'rotate';
+      else if (zoomDelta >= 0.1 && degrees < 20) pinch.mode = 'zoom';
+    }
+    if (pinch.mode === 'rotate') editor.setViewAngle(pinch.base + turn, true);
+    else if (pinch.mode === 'zoom' || degrees < 12) {
+      editor.zoomAt(pinch.zoom * scale, pinch.cx, pinch.cy);
+      editor.stage.scrollLeft -= span.cx - pinch.cx;
+      editor.stage.scrollTop -= span.cy - pinch.cy;
+    }
   }, true);
   const forgetContact = (event: PointerEvent) => {
     contacts.delete(event.pointerId);
-    if (contacts.size < 2) pinch = null;
+    if (contacts.size < 2) {
+      if (pinch?.mode === 'rotate' && Math.abs(editor.viewAngle) < Math.PI / 180) editor.setViewAngle(0, true);
+      pinch = null;
+    }
   };
   window.addEventListener('pointerup', forgetContact, true);
   window.addEventListener('pointercancel', forgetContact, true);
@@ -516,6 +550,7 @@ function wire(editor: Editor, tools: ToolController): void {
   $('undo').addEventListener('click', () => editor.undo());
   $('redo').addEventListener('click', () => editor.redo());
   $('zoom-label').addEventListener('click', () => editor.fit());
+  $('view-angle').addEventListener('click', () => editor.setViewAngle(0));
   $('empty-new').addEventListener('click', () => void run(editor, tools, 'new'));
   $<HTMLTextAreaElement>('text-editor').addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -551,6 +586,7 @@ function wire(editor: Editor, tools: ToolController): void {
     if (event.key === ' ') editor.space = false;
   }, true);
   window.addEventListener('resize', () => paintRulers(editor));
+  bindMixer(editor);
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
     if (localStorage.getItem('pinta-theme')) return;
     applyTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
@@ -601,10 +637,45 @@ function wire(editor: Editor, tools: ToolController): void {
   };
   $('layer-list').addEventListener('pointerdown', event => {
     const input = (event.target as HTMLElement).closest('input[data-visible]');
-    if (!(input instanceof HTMLInputElement) || !event.altKey || !input.dataset.layer) return;
-    event.preventDefault();
-    event.stopPropagation();
-    editor.soloLayer(Number(input.dataset.layer));
+    if (!(input instanceof HTMLInputElement) || !input.dataset.layer) return;
+    if (event.altKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      editor.soloLayer(Number(input.dataset.layer));
+      return;
+    }
+    if (event.pointerType === 'mouse' || event.button !== 0) return;
+    const index = Number(input.dataset.layer);
+    const originX = event.clientX;
+    const originY = event.clientY;
+    let opened = false;
+    const timer = window.setTimeout(() => {
+      opened = true;
+      suppressLayerClick = true;
+      openContext(originX, originY, [
+        { label: 'Hide others', action: () => editor.soloLayer(index) },
+        { label: 'Show all', action: () => editor.showAllLayers() },
+      ]);
+    }, 500);
+    const move = (moveEvent: PointerEvent) => {
+      if (Math.hypot(moveEvent.clientX - originX, moveEvent.clientY - originY) > 6) window.clearTimeout(timer);
+    };
+    const end = () => {
+      window.clearTimeout(timer);
+      if (opened) {
+        const stopClick = (clickEvent: Event) => {
+          clickEvent.preventDefault();
+          clickEvent.stopPropagation();
+        };
+        input.addEventListener('click', stopClick, { capture: true, once: true });
+      }
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
   });
   $('layer-list').addEventListener('click', event => {
     if (suppressLayerClick) {
@@ -618,8 +689,17 @@ function wire(editor: Editor, tools: ToolController): void {
       editor.toggleGroupCollapsed(Number(collapse.dataset.collapse));
       return;
     }
+    const maskButton = target.closest<HTMLElement>('[data-mask]');
+    if (maskButton?.dataset.mask && editor.doc) {
+      editor.doc.active = Number(maskButton.dataset.mask);
+      editor.paintingMask = true;
+      editor.renderScene();
+      editor.notify();
+      return;
+    }
     const row = target.closest<HTMLElement>('[data-layer]');
     if (!row?.dataset.layer || !editor.doc) return;
+    editor.paintingMask = false;
     editor.doc.active = Number(row.dataset.layer);
     editor.renderScene();
     editor.notify();
@@ -778,7 +858,28 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
     editor.show.grid = !editor.show.grid;
     editor.paintOverlay();
     editor.notify();
-  } else if (command === 'grid-size') {
+  } else if (command === 'grid-square' || command === 'grid-iso') {
+    editor.gridKind = command === 'grid-iso' ? 'iso' : 'square';
+    editor.show.grid = true;
+    editor.paintOverlay();
+    editor.notify();
+  } else if (command === 'toggle-snap') {
+    editor.snap = !editor.snap;
+    editor.notify();
+  } else if (command === 'reset-view') editor.resetView();
+  else if (command === 'assist-none') {
+    editor.assistant = null;
+    editor.assistantPlace = null;
+    editor.assistantDraft = null;
+    editor.paintOverlay();
+    editor.notify();
+  } else if (command === 'assist-parallel' || command === 'assist-ellipse' || command === 'assist-vanish') {
+    editor.assistantPlace = command === 'assist-parallel' ? 'parallel' : command === 'assist-ellipse' ? 'ellipse' : 'vanish';
+    editor.toast('Drag on the canvas to place the guide.');
+    editor.notify();
+  } else if (command === 'layer-mask') editor.addMask();
+  else if (command === 'layer-unmask') editor.removeMask();
+  else if (command === 'grid-size') {
     $<HTMLInputElement>('grid-size').value = String(editor.gridSize);
     const answer = await ask('grid-dialog');
     if (answer !== 'ok') return;
@@ -1083,6 +1184,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
 }
 
 let optionTool: ToolId | null = null;
+let optionFloat = false;
 
 interface ContextEntry {
   label?: string;
@@ -1237,7 +1339,7 @@ function layerMarkup(editor: Editor): string {
       if (group.collapsed) hidden = true;
     }
     if (hidden) continue;
-    rows.push(layerRow(layer, index, groupDepth(editor, layer.parent), index === doc.active));
+    rows.push(layerRow(layer, index, groupDepth(editor, layer.parent), index === doc.active, editor.paintingMask));
   }
   for (const group of doc.groups) {
     if (seen.has(group.id)) continue;
@@ -1250,8 +1352,9 @@ function groupRow(group: { id: number; name: string; visible: boolean; collapsed
   return `<li class="layer-row group-row" data-group="${group.id}" style="padding-left:${depth * 12}px"><button type="button" class="chevron${group.collapsed ? ' collapsed' : ''}" data-collapse="${group.id}" aria-label="${group.collapsed ? 'Expand group' : 'Collapse group'}"></button><button type="button" class="layer" data-group="${group.id}"><i class="tag" style="background:${group.tag || DEFAULT_TAG}"></i><span class="layer-name">${escapeHtml(group.name)}</span></button><input type="checkbox" data-group-visible="${group.id}" ${group.visible ? 'checked' : ''} aria-label="Group visible" /></li>`;
 }
 
-function layerRow(layer: { name: string; visible: boolean; opacity: number; tag: string | null }, index: number, depth: number, active: boolean): string {
-  return `<li class="layer-row" data-layer="${index}" style="padding-left:${depth * 12}px"><button type="button" class="layer" data-layer="${index}" data-active="${active}"><i class="tag" style="background:${layer.tag || DEFAULT_TAG}"></i><span class="layer-name">${escapeHtml(layer.name)}</span><span class="layer-meta">${layer.opacity}%</span></button><input type="checkbox" data-visible data-layer="${index}" ${layer.visible ? 'checked' : ''} aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}" /></li>`;
+function layerRow(layer: { name: string; visible: boolean; opacity: number; tag: string | null; mask?: HTMLCanvasElement }, index: number, depth: number, active: boolean, paintingMask: boolean): string {
+  const mask = layer.mask ? `<button type="button" class="mask-thumb" data-mask="${index}" aria-pressed="${paintingMask && active}" aria-label="Layer mask"></button>` : '';
+  return `<li class="layer-row" data-layer="${index}" style="padding-left:${depth * 12}px"><button type="button" class="layer" data-layer="${index}" data-active="${active}"><i class="tag" style="background:${layer.tag || DEFAULT_TAG}"></i><span class="layer-name">${escapeHtml(layer.name)}</span><span class="layer-meta">${layer.opacity}%</span></button>${mask}<input type="checkbox" data-visible data-layer="${index}" ${layer.visible ? 'checked' : ''} aria-label="${layer.visible ? 'Hide layer' : 'Show layer'}" /></li>`;
 }
 
 function useLayer(editor: Editor, index: number): void {
@@ -1274,6 +1377,7 @@ function layerContext(editor: Editor, index: number): ContextEntry[] {
   const layer = editor.doc?.layers[index];
   if (!layer) return [];
   return [
+    { label: layer.mask ? 'Remove mask' : 'Add mask', action: () => { useLayer(editor, index); if (layer.mask) editor.removeMask(); else editor.addMask(); } },
     { label: 'Rename', action: () => renameInline(editor, index) },
     tagMenu(tag => editor.setLayerTag(index, tag), layer.tag),
     {
@@ -1416,11 +1520,33 @@ function sync(editor: Editor): void {
     slider.value = String(editor.size);
     $('size-value').textContent = String(editor.size);
   }
-  if (optionTool !== editor.tool) {
+  const floating = editor.tool === 'move-pixels' && !!editor.float;
+  if (optionTool !== editor.tool || optionFloat !== floating) {
     optionTool = editor.tool;
+    optionFloat = floating;
     $('tool-extra').innerHTML = extraOptions(editor);
     bindExtra(editor);
   }
+  const smoothValue = document.getElementById('smooth-value');
+  const smoothSlider = document.getElementById('smooth-slider') as HTMLInputElement | null;
+  if (smoothValue && smoothSlider && document.activeElement !== smoothSlider) {
+    const tool = editor.tool;
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
+      smoothSlider.value = String(editor.smoothing[tool]);
+      smoothValue.textContent = String(editor.smoothing[tool]);
+    }
+  }
+  for (const id of ['float-w', 'float-h', 'float-angle'] as const) {
+    const field = document.getElementById(id) as HTMLInputElement | null;
+    if (!field || !editor.float || document.activeElement === field) continue;
+    field.value = id === 'float-w' ? String(editor.float.boxW) : id === 'float-h' ? String(editor.float.boxH) : String(Math.round(editor.float.angle));
+  }
+  const snapMark = document.getElementById('snap-mark');
+  if (snapMark) snapMark.textContent = editor.snap ? 'On' : 'Off';
+  const angleLabel = document.getElementById('view-angle');
+  if (angleLabel) angleLabel.textContent = `${Math.round(editor.viewAngle * 180 / Math.PI)}°`;
+  const note = document.getElementById('status-note');
+  if (note) note.textContent = statusNote(editor);
   paintSwatch('primary-swatch', editor.primary);
   paintSwatch('secondary-swatch', editor.secondary);
   $<HTMLInputElement>('primary-input').value = rgbOf(editor.primary);
@@ -1455,10 +1581,12 @@ function extraOptions(editor: Editor): string {
     parts.push(`<label class="option">Symmetry <select id="symmetry-select">${(['off', 'vertical', 'horizontal', 'orthogonal'] as const).map(id => `<option value="${id}" ${id === editor.symmetry ? 'selected' : ''}>${symmetryLabels[id]}</option>`).join('')}</select></label>`);
   }
   if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
-  if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil') {
+  if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
+    parts.push(`<label class="option">Smoothing <input id="smooth-slider" type="range" min="0" max="100" value="${editor.smoothing[tool]}" /><output id="smooth-value">${editor.smoothing[tool]}</output></label>`);
     parts.push(`<label class="check"><input id="unserrate" type="checkbox" ${editor.unserrate[tool] ? 'checked' : ''}/> Unserrate</label>`);
   }
   if (tool === 'bucket' || tool === 'wand' || tool === 'recolor') parts.push(`<label class="option">Tolerance <input id="tolerance-slider" type="range" min="0" max="100" value="${editor.tolerance}" /></label>`);
+  if (tool === 'bucket' || tool === 'wand') parts.push(`<label class="check"><input id="smooth-edges" type="checkbox" ${editor.smoothEdges ? 'checked' : ''}/> Smooth edges</label>`);
   if (tool === 'wand') parts.push(`<label class="check"><input id="wand-contiguous" type="checkbox" ${editor.wandContiguous ? 'checked' : ''}/> Contiguous</label>`);
   if (tool === 'bucket' || tool === 'wand' || tool === 'picker') parts.push(`<label class="check"><input id="sample-all" type="checkbox" ${editor.sampleAll ? 'checked' : ''}/> All layers</label>`);
   if (tool === 'picker') parts.push(`<label class="option">Sample <input id="sample-size" type="range" min="1" max="200" value="${editor.sampleSize}" /></label>`);
@@ -1487,6 +1615,11 @@ function extraOptions(editor: Editor): string {
     parts.push(`<label class="option">Random <span class="dual-range"><input id="random-low" type="range" min="-255" max="255" value="${low}" aria-label="Random minimum" /><input id="random-high" type="range" min="-255" max="255" value="${high}" aria-label="Random maximum" /></span><span id="random-readout">${low} to ${high}</span></label>`);
     parts.push(`<label class="option">Rate <input id="random-rate" type="range" min="0" max="10" step="1" value="${editor.randomRate}" /></label>`);
     parts.push(`<label class="check"><input id="random-alpha" type="checkbox" ${editor.randomAlpha ? 'checked' : ''}/> Randomize alpha</label>`);
+  }
+  if (tool === 'move-pixels' && editor.float) {
+    parts.push(`<label class="option">W <input id="float-w" type="number" min="1" value="${editor.float.boxW}" /></label>`);
+    parts.push(`<label class="option">H <input id="float-h" type="number" min="1" value="${editor.float.boxH}" /></label>`);
+    parts.push(`<label class="option">Angle <input id="float-angle" type="number" value="${Math.round(editor.float.angle)}" /></label>`);
   }
   if (tool === 'rect-select' || tool === 'ellipse-select' || tool === 'lasso' || tool === 'wand') {
     parts.push(`<label class="option">Mode <select id="select-mode">${['replace', 'union', 'exclude', 'xor', 'intersect'].map(id => `<option value="${id}" ${id === editor.selectionMode ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
@@ -1548,9 +1681,156 @@ function bindExtra(editor: Editor): void {
   });
   document.getElementById('unserrate')?.addEventListener('change', event => {
     const tool = editor.tool;
-    if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil') {
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
       editor.unserrate[tool] = (event.target as HTMLInputElement).checked;
+      editor.notify();
     }
+  });
+  document.getElementById('smooth-slider')?.addEventListener('input', event => {
+    const tool = editor.tool;
+    if (tool !== 'brush' && tool !== 'eraser' && tool !== 'pen' && tool !== 'pencil' && tool !== 'dither' && tool !== 'recolor' && tool !== 'random' && tool !== 'lighten' && tool !== 'darken') return;
+    editor.smoothing[tool] = Math.max(0, Math.min(100, Number((event.target as HTMLInputElement).value) || 0));
+    const readout = document.getElementById('smooth-value');
+    if (readout) readout.textContent = String(editor.smoothing[tool]);
+    const note = document.getElementById('status-note');
+    if (note) note.textContent = statusNote(editor);
+  });
+  document.getElementById('smooth-edges')?.addEventListener('change', event => {
+    editor.smoothEdges = (event.target as HTMLInputElement).checked;
+    const note = document.getElementById('status-note');
+    if (note) note.textContent = statusNote(editor);
+  });
+  const commitFloat = (event: Event) => {
+    const float = editor.float;
+    if (!float) return;
+    const widthField = document.getElementById('float-w') as HTMLInputElement | null;
+    const heightField = document.getElementById('float-h') as HTMLInputElement | null;
+    const angleField = document.getElementById('float-angle') as HTMLInputElement | null;
+    if (!widthField || !heightField || !angleField) return;
+    const width = Number(widthField.value);
+    const height = Number(heightField.value);
+    const angle = Number(angleField.value);
+    if (!widthField.value.trim() || !heightField.value.trim() || !angleField.value.trim() || !Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(angle)) {
+      widthField.value = String(float.boxW);
+      heightField.value = String(float.boxH);
+      angleField.value = String(Math.round(float.angle));
+      return;
+    }
+    let nextW = Math.max(1, Math.round(width));
+    let nextH = Math.max(1, Math.round(height));
+    let nextAngle = angle;
+    const shift = event instanceof KeyboardEvent && event.shiftKey;
+    if (shift && event.target === widthField && float.boxW) nextH = Math.max(1, Math.round(nextW * float.boxH / float.boxW));
+    if (shift && event.target === heightField && float.boxH) nextW = Math.max(1, Math.round(nextH * float.boxW / float.boxH));
+    if (shift && event.target === angleField) nextAngle = Math.round(nextAngle / 15) * 15;
+    editor.reshapeFloat(nextW, nextH, nextAngle);
+  };
+  for (const id of ['float-w', 'float-h', 'float-angle']) {
+    document.getElementById(id)?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        commitFloat(event);
+      }
+    });
+    document.getElementById(id)?.addEventListener('change', commitFloat);
+  }
+}
+
+function statusNote(editor: Editor): string {
+  if (editor.paintingMask) return 'Painting the mask';
+  if (editor.float && editor.tool === 'move-pixels') return 'Arrow keys nudge. Shift moves ten.';
+  const tool = editor.tool;
+  if ((tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') && editor.unserrate[tool] && editor.smoothing[tool] > 0) return 'Smoothing rounds a fast stroke';
+  if ((tool === 'bucket' || tool === 'wand') && editor.smoothEdges) return 'Fills the soft edge.';
+  if (editor.assistant) return editor.assistant.kind === 'parallel' ? 'Parallel lines' : editor.assistant.kind === 'ellipse' ? 'Ellipse guide' : 'Vanishing point';
+  if (editor.assistantPlace) return 'Drag to place the guide.';
+  return '';
+}
+
+function bindMixer(editor: Editor): void {
+  const canvas = $<HTMLCanvasElement>('mixer');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const paintPad = (color: string) => {
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+  try {
+    const saved = localStorage.getItem('pinta-mixer');
+    if (saved) {
+      const image = new Image();
+      image.onload = () => ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      image.src = saved;
+    } else paintPad(editor.primary);
+  } catch {
+    paintPad(editor.primary);
+  }
+  const save = () => {
+    try { localStorage.setItem('pinta-mixer', canvas.toDataURL()); } catch { /* storage unavailable */ }
+  };
+  let drawing = false;
+  let moved = false;
+  let last = { x: 0, y: 0 };
+  let color = editor.primary;
+  const local = (event: PointerEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: rect.width ? (event.clientX - rect.left) / rect.width * canvas.width : 0,
+      y: rect.height ? (event.clientY - rect.top) / rect.height * canvas.height : 0,
+    };
+  };
+  canvas.addEventListener('contextmenu', event => event.preventDefault());
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0 && event.button !== 2) return;
+    drawing = true;
+    moved = false;
+    color = event.button === 2 ? editor.secondary : editor.primary;
+    last = local(event);
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!drawing) return;
+    const point = local(event);
+    if (Math.hypot(point.x - last.x, point.y - last.y) > 1) moved = true;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 16;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(last.x, last.y);
+    ctx.lineTo(point.x, point.y);
+    ctx.stroke();
+    last = point;
+  });
+  const finish = (event: PointerEvent) => {
+    if (!drawing) return;
+    drawing = false;
+    if (moved) {
+      save();
+      return;
+    }
+    const point = local(event);
+    const pixel = ctx.getImageData(Math.max(0, Math.min(canvas.width - 1, point.x | 0)), Math.max(0, Math.min(canvas.height - 1, point.y | 0)), 1, 1).data;
+    const hex = `#${[pixel[0], pixel[1], pixel[2], pixel[3]].map(value => value.toString(16).padStart(2, '0')).join('')}`;
+    if (event.button === 2) {
+      editor.secondary = hex;
+      editor.colorSlot = 'secondary';
+    } else {
+      editor.primary = hex;
+      editor.colorSlot = 'primary';
+    }
+    editor.remember(hex);
+    editor.notify();
+  };
+  canvas.addEventListener('pointerup', finish);
+  canvas.addEventListener('pointercancel', () => { drawing = false; });
+  $('mixer-clear').addEventListener('click', () => {
+    paintPad(editor.primary);
+    save();
+  });
+  $('mix-toggle').addEventListener('click', () => {
+    const panel = $('mixer-panel');
+    panel.hidden = !panel.hidden;
+    $<HTMLButtonElement>('mix-toggle').setAttribute('aria-expanded', String(!panel.hidden));
   });
 }
 
