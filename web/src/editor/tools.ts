@@ -91,14 +91,57 @@ function clearPreview(editor: Editor): void {
   editor.preview.getContext('2d')?.clearRect(0, 0, editor.preview.width, editor.preview.height);
 }
 
+function colorAlpha(hex: string): number {
+  const value = hex.replace('#', '');
+  const full = value.length === 3 ? value.split('').map(char => char + char).join('') : value;
+  if (full.length < 8) return 255;
+  const alpha = Number.parseInt(full.slice(6, 8), 16);
+  return Number.isFinite(alpha) ? alpha : 255;
+}
+
+function solidColor(hex: string): string {
+  const value = hex.replace('#', '');
+  const full = value.length === 3 ? value.split('').map(char => char + char).join('') : value;
+  return `#${(full.slice(0, 6) || '000000').padEnd(6, '0')}`;
+}
+
+function applyInk(ctx: CanvasRenderingContext2D, color: string, opacity: number, erase = false): void {
+  const coverage = Math.max(0, Math.min(1, opacity / 100));
+  const alpha = colorAlpha(color);
+  if (erase || alpha <= 0) {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.globalAlpha = coverage;
+    ctx.fillStyle = '#000';
+    ctx.strokeStyle = '#000';
+    return;
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = coverage * (alpha / 255);
+  const solid = solidColor(color);
+  ctx.fillStyle = solid;
+  ctx.strokeStyle = solid;
+}
+
 function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape'], fill: string, stroke: string, rule: CanvasFillRule = 'nonzero'): void {
-  ctx.fillStyle = fill;
-  ctx.strokeStyle = stroke;
-  if (style === 'fill') ctx.fill(rule);
-  else if (style === 'both') {
-    ctx.fill(rule);
-    ctx.stroke();
-  } else ctx.stroke();
+  const paint = (kind: 'fill' | 'stroke', color: string) => {
+    ctx.save();
+    const alpha = colorAlpha(color);
+    if (alpha <= 0) {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = '#000';
+      ctx.strokeStyle = '#000';
+    } else {
+      ctx.globalAlpha *= alpha / 255;
+      const solid = solidColor(color);
+      ctx.fillStyle = solid;
+      ctx.strokeStyle = solid;
+    }
+    if (kind === 'fill') ctx.fill(rule);
+    else ctx.stroke();
+    ctx.restore();
+  };
+  if (style !== 'outline') paint('fill', fill);
+  if (style !== 'fill') paint('stroke', stroke);
 }
 
 function brushSize(editor: Editor): number {
@@ -116,11 +159,8 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
   }
   ctx.save();
   ctx.lineWidth = brushSize(editor);
-  ctx.strokeStyle = color;
-  ctx.fillStyle = color;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.globalAlpha = editor.opacity / 100;
   ctx.beginPath();
   if (tool === 'line') {
     const angle = Math.atan2(h, w);
@@ -128,8 +168,10 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
     const length = Math.hypot(w, h);
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(a.x + Math.cos(snapped) * length, a.y + Math.sin(snapped) * length);
+    applyInk(ctx, color, editor.opacity);
     ctx.stroke();
   } else if (tool === 'ellipse') {
+    ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
     ctx.ellipse(a.x + w / 2, a.y + h / 2, Math.max(Math.abs(w) / 2, 0.5), Math.max(Math.abs(h) / 2, 0.5), 0, 0, Math.PI * 2);
     paintStyle(ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
   } else {
@@ -139,6 +181,7 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
     const height = Math.abs(h);
     if (tool === 'rounded') ctx.roundRect(left, top, width, height, Math.min(editor.corner, width / 2, height / 2));
     else ctx.rect(left, top, width, height);
+    ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
     paintStyle(ctx, editor.shape, color, editor.shape === 'both' ? editor.secondary : color);
   }
   ctx.restore();
@@ -147,12 +190,11 @@ function drawShape(ctx: CanvasRenderingContext2D, editor: Editor, tool: ToolId, 
 function drawCurve(ctx: CanvasRenderingContext2D, editor: Editor, a: Point, control: Point, b: Point, color: string): void {
   ctx.save();
   ctx.lineWidth = Math.max(1, editor.size);
-  ctx.strokeStyle = color;
   ctx.lineCap = 'round';
-  ctx.globalAlpha = editor.opacity / 100;
   ctx.beginPath();
   ctx.moveTo(a.x, a.y);
   ctx.quadraticCurveTo(control.x, control.y, b.x, b.y);
+  applyInk(ctx, color, editor.opacity);
   ctx.stroke();
   ctx.restore();
 }
@@ -161,10 +203,12 @@ function stampBrush(ctx: CanvasRenderingContext2D, editor: Editor, x: number, y:
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
   const radius = Math.max(0.5, brushSize(editor) / 2);
   ctx.save();
-  ctx.globalAlpha = erase && editor.eraser === 'soft' ? editor.opacity / 200 : editor.opacity / 100;
-  ctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
-  ctx.fillStyle = color;
-  ctx.strokeStyle = color;
+  if (erase) {
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.globalAlpha = editor.eraser === 'soft' ? editor.opacity / 200 : editor.opacity / 100;
+    ctx.fillStyle = '#000';
+    ctx.strokeStyle = '#000';
+  } else applyInk(ctx, color, editor.opacity);
   ctx.lineWidth = Math.max(1, editor.size / 4);
   if (editor.brush === 'squares') ctx.fillRect(x - radius, y - radius, radius * 2, radius * 2);
   else if (editor.brush === 'circle') {
@@ -237,8 +281,7 @@ function commitText(editor: Editor): void {
   if (!layer || !doc || !text) return;
   const before = layer.ctx.getImageData(0, 0, doc.width, doc.height);
   layer.ctx.save();
-  layer.ctx.fillStyle = editor.primary;
-  layer.ctx.globalAlpha = editor.opacity / 100;
+  applyInk(layer.ctx, editor.primary, editor.opacity);
   const fontSize = Math.max(8, editor.size * 2);
   layer.ctx.font = `${fontSize}px ${editor.font}`;
   layer.ctx.textBaseline = 'top';
@@ -311,8 +354,13 @@ export class ToolController {
     if (editor.tool === 'picker') {
       const pixel = editor.layer.ctx.getImageData(Math.min(doc.width - 1, Math.floor(point.x)), Math.min(doc.height - 1, Math.floor(point.y)), 1, 1).data;
       const hex = `#${[pixel[0], pixel[1], pixel[2], pixel[3]].map(value => value.toString(16).padStart(2, '0')).join('')}`;
-      if (event.button === 2) editor.secondary = hex;
-      else editor.primary = hex;
+      if (event.button === 2) {
+        editor.secondary = hex;
+        editor.colorSlot = 'secondary';
+      } else {
+        editor.primary = hex;
+        editor.colorSlot = 'primary';
+      }
       editor.tool = editor.toolBeforePicker === 'picker' ? 'brush' : editor.toolBeforePicker;
       editor.notify();
       return;
@@ -564,6 +612,7 @@ export class ToolController {
         image.data[index] = fill.r;
         image.data[index + 1] = fill.g;
         image.data[index + 2] = fill.b;
+        image.data[index + 3] = fill.a;
       }
     } else editor.engine.recolor(image, point.x | 0, point.y | 0, Math.max(1, editor.size / 2), target, fill, tolerance);
     layer.ctx.putImageData(image, 0, 0);
@@ -658,8 +707,7 @@ export class ToolController {
     const color = editor.color(this.button);
     walk(from, to, Math.max(0.75, radius / 2), mark => {
       layer.ctx.save();
-      layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
-      layer.ctx.fillStyle = color;
+      applyInk(layer.ctx, color, editor.opacity);
       layer.ctx.beginPath();
       layer.ctx.arc(mark.x, mark.y, radius, 0, Math.PI * 2);
       layer.ctx.fill();
@@ -701,10 +749,18 @@ export class ToolController {
             const primaryCell = BAYER[cell] <= 7;
             const color = primaryCell ? (left ? primary : null) : (right ? secondary : null);
             if (!color) continue;
-            image.data[index] = color.r;
-            image.data[index + 1] = color.g;
-            image.data[index + 2] = color.b;
-            image.data[index + 3] = Math.max(image.data[index + 3], color.a);
+            if (color.a <= 0) {
+              image.data[index + 3] = 0;
+              continue;
+            }
+            const source = color.a;
+            const destination = image.data[index + 3];
+            const out = source + Math.round(destination * (255 - source) / 255);
+            const inverse = 255 - source;
+            image.data[index] = Math.round((color.r * source + image.data[index] * destination / 255 * inverse) / Math.max(1, out));
+            image.data[index + 1] = Math.round((color.g * source + image.data[index + 1] * destination / 255 * inverse) / Math.max(1, out));
+            image.data[index + 2] = Math.round((color.b * source + image.data[index + 2] * destination / 255 * inverse) / Math.max(1, out));
+            image.data[index + 3] = out;
             continue;
           }
           if (image.data[index + 3] === 0 || !this.allowPixel(pixel, rate)) continue;

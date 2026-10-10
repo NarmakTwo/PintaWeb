@@ -1015,6 +1015,71 @@ test('lasso even-odd, inverse dither, global recolor, tone amount, and random br
   expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
 });
 
+test('the color picker keeps alpha, and transparent ink erases', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('#alpha-slider').fill('128');
+  await page.locator('[data-tool="bucket"]').click();
+  const center = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(center.x, center.y);
+  const translucent = await pixel(page, 0.5, 0.5);
+  expect(translucent[0]).toBeGreaterThan(200);
+  expect(translucent[1]).toBeLessThan(40);
+  expect(translucent[3]).toBeGreaterThan(100);
+  expect(translucent[3]).toBeLessThan(160);
+
+  await page.locator('[data-tool="picker"]').click();
+  await page.mouse.click(center.x, center.y);
+  await expect(page.locator('#alpha-slider')).toHaveValue('128');
+  await expect(page.locator('#primary-input')).toHaveValue('#ff0000');
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#alpha-slider').fill('0');
+  await page.locator('[data-tool="bucket"]').click();
+  const cleared = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(cleared.x, cleared.y);
+  expect((await pixel(page, 0.5, 0.5))[3]).toBe(0);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#alpha-slider').fill('255');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('4');
+  const near = await paperPoint(page, 0.25, 0.5);
+  const far = await paperPoint(page, 0.75, 0.5);
+  await page.mouse.click(near.x, near.y);
+  await page.mouse.click(far.x, far.y);
+  await page.locator('#primary-input').fill('#0000ff');
+  await page.locator('#alpha-slider').fill('0');
+  await page.locator('[data-tool="recolor"]').click();
+  await page.locator('#tolerance-slider').fill('0');
+  await page.locator('#size-slider').fill('8');
+  await page.mouse.click(near.x, near.y);
+  expect((await pixel(page, 0.25, 0.5))[3]).toBe(0);
+  expect((await pixel(page, 0.75, 0.5))[0]).toBeGreaterThan(200);
+  expect((await pixel(page, 0.75, 0.5))[3]).toBe(255);
+  await page.keyboard.press('Control+z');
+  await page.locator('#recolor-global').check();
+  await page.mouse.click(near.x, near.y);
+  expect((await pixel(page, 0.25, 0.5))[3]).toBe(0);
+  expect((await pixel(page, 0.75, 0.5))[3]).toBe(0);
+  expect((await pixel(page, 0.5, 0.2))[3]).toBe(255);
+
+  await newCanvas(page, 64, 64);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('#alpha-slider').fill('128');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('16');
+  const brushed = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(brushed.x, brushed.y);
+  const pink = await pixel(page, 0.5, 0.5);
+  expect(pink[0]).toBeGreaterThan(200);
+  expect(pink[1]).toBeGreaterThan(40);
+  expect(pink[1]).toBeLessThan(200);
+  expect(pink[3]).toBeGreaterThan(200);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

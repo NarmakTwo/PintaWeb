@@ -49,7 +49,7 @@ export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string;
   { id: 'eraser', label: 'Eraser', shortcut: 'E', icon: 'eraser', hint: 'Erase to transparent. Right-click paints the secondary color.' },
   { id: 'bucket', label: 'Paint Bucket', shortcut: 'F', icon: 'paint-bucket', hint: 'Fill a connected area of similar color.' },
   { id: 'gradient', label: 'Gradient', shortcut: 'G', icon: 'blend', hint: 'Drag to blend from the primary color to the secondary color.' },
-  { id: 'picker', label: 'Color Picker', shortcut: 'K', icon: 'pipette', hint: 'Click to choose the primary color. Right-click chooses the secondary color.' },
+  { id: 'picker', label: 'Color Picker', shortcut: 'K', icon: 'pipette', hint: 'Click to choose the primary color and its transparency. Right-click chooses the secondary color.' },
   { id: 'text', label: 'Text', shortcut: 'T', icon: 'type', hint: 'Click to place text. Enter commits it. Shift+Enter adds a line.' },
   { id: 'line', label: 'Line/Curve', shortcut: 'O', icon: 'spline', hint: 'Drag a straight line. In curve mode, move after releasing to bend it, then click to commit.' },
   { id: 'rectangle', label: 'Rectangle', shortcut: 'O', icon: 'square', hint: 'Drag a rectangle. Hold Shift for a square.' },

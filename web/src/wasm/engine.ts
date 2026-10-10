@@ -16,7 +16,7 @@ interface Exports {
   setColor(r: number, g: number, b: number): void;
   flood(w: number, h: number, x: number, y: number, r: number, g: number, b: number, a: number, tol: number): void;
   wand(w: number, h: number, x: number, y: number, tol: number): void;
-  recolor(w: number, h: number, cx: number, cy: number, radius: number, tr: number, tg: number, tb: number, fr: number, fg: number, fb: number, tol: number): void;
+  recolor(w: number, h: number, cx: number, cy: number, radius: number, tr: number, tg: number, tb: number, ta: number, fr: number, fg: number, fb: number, fa: number, tol: number): void;
   stamp(w: number, h: number, x0: number, y0: number, x1: number, y1: number, size: number, r: number, g: number, b: number, a: number, erase: number): void;
   paintGradient(w: number, h: number, x0: number, y0: number, x1: number, y1: number, r0: number, g0: number, b0: number, a0: number, r1: number, g1: number, b1: number, a1: number, kind: number): void;
   clip(w: number, h: number): void;
@@ -89,7 +89,7 @@ export class PixelEngine {
     const n = image.width * image.height;
     const memory = this.prepare(n * 4 + 32);
     memory.set(image.data, 0);
-    this.ex.recolor(image.width, image.height, cx | 0, cy | 0, radius | 0, target.r, target.g, target.b, fill.r, fill.g, fill.b, tolerance | 0);
+    this.ex.recolor(image.width, image.height, cx | 0, cy | 0, radius | 0, target.r, target.g, target.b, target.a, fill.r, fill.g, fill.b, fill.a, tolerance | 0);
     image.data.set(this.view().subarray(0, n * 4));
   }
 

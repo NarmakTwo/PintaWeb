@@ -192,7 +192,7 @@ export function wand(w: i32, h: i32, x: i32, y: i32, tol: i32): void {
   spanFill(x, y);
 }
 
-export function recolor(w: i32, h: i32, cx: i32, cy: i32, radius: i32, tr: i32, tg: i32, tb: i32, fr: i32, fg: i32, fb: i32, tol: i32): void {
+export function recolor(w: i32, h: i32, cx: i32, cy: i32, radius: i32, tr: i32, tg: i32, tb: i32, ta: i32, fr: i32, fg: i32, fb: i32, fa: i32, tol: i32): void {
   if (radius < 1) radius = 1;
   const rad2 = radius * radius;
   for (let y = cy - radius; y <= cy + radius; y++) {
@@ -203,10 +203,11 @@ export function recolor(w: i32, h: i32, cx: i32, cy: i32, radius: i32, tr: i32, 
       const dy = y - cy;
       if (dx * dx + dy * dy > rad2) continue;
       const o = (y * w + x) * 4;
-      if (coldist(o, tr, tg, tb, load8(o + 3)) <= tol) {
+      if (coldist(o, tr, tg, tb, ta) <= tol) {
         store8(o, fr);
         store8(o + 1, fg);
         store8(o + 2, fb);
+        store8(o + 3, fa);
       }
     }
   }
@@ -223,13 +224,8 @@ function plot(w: i32, h: i32, cx: i32, cy: i32, size: i32, r: i32, g: i32, b: i3
       const dy = y - cy;
       if (dx * dx + dy * dy > rad2) continue;
       const o = (y * w + x) * 4;
-      if (erase != 0) store8(o + 3, 0);
-      else {
-        store8(o, r);
-        store8(o + 1, g);
-        store8(o + 2, b);
-        store8(o + 3, a);
-      }
+      if (erase != 0 || a <= 0) store8(o + 3, 0);
+      else over(o, r, g, b, a);
     }
   }
 }
