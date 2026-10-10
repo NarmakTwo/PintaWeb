@@ -16,12 +16,30 @@ function serviceWorker(version: string, urls: string[]): string {
   return `const CACHE = ${JSON.stringify(`pinta-${version}`)};
 const FILES = ${JSON.stringify(urls)};
 
+async function usable(response) {
+  if (!response || !response.redirected) return response;
+  const headers = new Headers(response.headers);
+  headers.delete('content-encoding');
+  headers.delete('content-length');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE).then(async cache => {
-    await cache.addAll(FILES);
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    await Promise.all(FILES.map(async url => {
+      const response = await fetch(url);
+      if (!response.ok || response.type !== 'basic') throw new Error(url);
+      await cache.put(url, await usable(response));
+    }));
     const index = await cache.match('/index.html');
     if (index) await cache.put('/', index.clone());
-  }).then(() => self.skipWaiting()));
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener('activate', event => {
@@ -35,19 +53,19 @@ self.addEventListener('fetch', event => {
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
-  if (request.mode === 'navigate') {
-    event.respondWith(caches.match('/index.html').then(cached => cached || fetch(request)));
-    return;
-  }
+  const key = request.mode === 'navigate' ? '/index.html' : request;
   event.respondWith((async () => {
-    const cached = await caches.match(request);
-    if (cached) return cached;
+    const cached = await caches.match(key);
+    if (cached) return usable(cached);
     const response = await fetch(request);
-    if (response.ok && response.type === 'basic') {
+    const cacheable = response.ok && response.type === 'basic';
+    const clean = await usable(response);
+    if (cacheable) {
       const cache = await caches.open(CACHE);
-      await cache.put(request, response.clone());
+      await cache.put(key, clean.clone());
+      if (request.mode === 'navigate') await cache.put('/', clean.clone());
     }
-    return response;
+    return clean;
   })());
 });
 `;
