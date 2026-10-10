@@ -102,6 +102,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
     wrap.innerHTML = `<button type="button" class="menu-open" id="menu-${menu.id}" aria-haspopup="true" aria-expanded="false">${menu.label}</button><div class="menu-panel" id="panel-${menu.id}" hidden role="menu">${menu.items}</div>`;
     bar.append(wrap);
   }
+  syncInstallItem();
   const list = $('tool-list');
   for (const tool of TOOLS) {
     const button = document.createElement('button');
@@ -178,7 +179,8 @@ function viewMenu(): string {
   return [
     item('Zoom In', 'zoom-in'), item('Zoom Out', 'zoom-out'), item('Normal Size', 'zoom-100', 'Ctrl+0'), item('Best Fit', 'zoom-fit'), item('Zoom to Selection', 'zoom-selection'), '<div class="sep"></div>',
     item('Rulers', 'toggle-rulers'), item('Status Bar', 'toggle-status'), item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'),
-    item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Pixel Grid', 'toggle-grid'), item('Grid Size…', 'grid-size'), '<div class="sep"></div>',
+    item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Pixel Grid', 'toggle-grid'), item('Grid Size…', 'grid-size'),
+    '<button type="button" data-command="toggle-cursor">Brush Cursor<span class="shortcut" id="cursor-mark">Off</span></button>', '<div class="sep"></div>',
     item('Pixels', 'unit-px'), item('Inches', 'unit-in'), item('Centimeters', 'unit-cm'), '<div class="sep"></div>',
     '<button type="button" data-command="theme-dark" aria-checked="false">Dark Mode<span class="shortcut" id="theme-mark">Off</span></button>',
     '<div class="sep"></div>', item('Fullscreen', 'fullscreen'),
@@ -205,7 +207,75 @@ function layerMenu(): string {
 }
 
 function windowMenu(): string {
-  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status')].join('');
+  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), '<div class="sep"></div>', '<button type="button" data-command="install" disabled>Install Pinta</button>'].join('');
+}
+
+type InstallEvent = Event & { prompt: () => Promise<void> };
+let installEvent: InstallEvent | null = null;
+let installFinished = false;
+
+function syncInstallItem(): void {
+  const button = document.querySelector<HTMLButtonElement>('[data-command="install"]');
+  if (!button) return;
+  const standalone = window.matchMedia('(display-mode: standalone)').matches;
+  if (installFinished || standalone) {
+    button.textContent = 'Installed';
+    button.disabled = true;
+    return;
+  }
+  button.textContent = 'Install Pinta';
+  button.disabled = !installEvent;
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeinstallprompt', event => {
+    event.preventDefault();
+    installEvent = event as InstallEvent;
+    syncInstallItem();
+  });
+  window.addEventListener('appinstalled', () => {
+    installFinished = true;
+    installEvent = null;
+    syncInstallItem();
+  });
+}
+
+let brushCursor = false;
+try { brushCursor = localStorage.getItem('pinta-brush-cursor') === '1'; } catch { /* storage unavailable */ }
+let dabTimer = 0;
+
+function placeDab(editor: Editor, left: number, top: number): void {
+  const el = $('dab-cursor');
+  const doc = editor.doc;
+  if (!doc) return;
+  const diameter = Math.max(1, editor.size * doc.zoom);
+  el.style.width = `${diameter}px`;
+  el.style.height = `${diameter}px`;
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  el.hidden = false;
+}
+
+function showDabCenter(editor: Editor): void {
+  const paper = $('paper');
+  if (paper.hidden || !editor.doc) return;
+  const slider = $<HTMLInputElement>('size-slider');
+  if (document.activeElement !== slider) {
+    slider.value = String(editor.size);
+    $('size-value').textContent = String(editor.size);
+  }
+  placeDab(editor, paper.clientWidth / 2, paper.clientHeight / 2);
+  window.clearTimeout(dabTimer);
+  if (!brushCursor) dabTimer = window.setTimeout(() => { $('dab-cursor').hidden = true; }, 800);
+}
+
+function showDabPointer(editor: Editor, event: PointerEvent): void {
+  if (!brushCursor || !editor.doc || $('paper').hidden) return;
+  const paint = editor.tool === 'brush' || editor.tool === 'pencil' || editor.tool === 'pen' || editor.tool === 'eraser' || editor.tool === 'dither' || editor.tool === 'recolor' || editor.tool === 'random' || editor.tool === 'lighten' || editor.tool === 'darken';
+  if (!paint) return;
+  window.clearTimeout(dabTimer);
+  const rect = $('paper').getBoundingClientRect();
+  placeDab(editor, event.clientX - rect.left, event.clientY - rect.top);
 }
 
 function helpMenu(): string {
@@ -344,6 +414,10 @@ function wire(editor: Editor, tools: ToolController): void {
     const point = editor.imagePoint(event);
     if (!point || !editor.doc) return;
     $('cursor-pos').textContent = `${formatUnit(point.x, editor.unit)}, ${formatUnit(point.y, editor.unit)}`;
+    showDabPointer(editor, event);
+  });
+  paper.addEventListener('pointerleave', () => {
+    if (brushCursor) $('dab-cursor').hidden = true;
   });
   const release = (event: PointerEvent) => {
     if (pinchGesture) return;
@@ -412,6 +486,7 @@ function wire(editor: Editor, tools: ToolController): void {
   $<HTMLInputElement>('size-slider').addEventListener('input', event => {
     editor.size = Number((event.target as HTMLInputElement).value);
     $('size-value').textContent = String(editor.size);
+    showDabCenter(editor);
   });
   document.addEventListener('change', event => {
     const target = event.target;
@@ -524,6 +599,13 @@ function wire(editor: Editor, tools: ToolController): void {
     const to = Number(row.dataset.layer);
     editor.reorderLayer(from, to, editor.doc.layers[to]?.parent ?? null);
   };
+  $('layer-list').addEventListener('pointerdown', event => {
+    const input = (event.target as HTMLElement).closest('input[data-visible]');
+    if (!(input instanceof HTMLInputElement) || !event.altKey || !input.dataset.layer) return;
+    event.preventDefault();
+    event.stopPropagation();
+    editor.soloLayer(Number(input.dataset.layer));
+  });
   $('layer-list').addEventListener('click', event => {
     if (suppressLayerClick) {
       suppressLayerClick = false;
@@ -682,7 +764,17 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   else if (command === 'toggle-toolbar') toggleShow(editor, 'toolbar');
   else if (command === 'toggle-docks') toggleShow(editor, 'docks');
   else if (command === 'toggle-tabs') toggleShow(editor, 'tabs');
-  else if (command === 'toggle-grid') {
+  else if (command === 'toggle-cursor') {
+    brushCursor = !brushCursor;
+    try { localStorage.setItem('pinta-brush-cursor', brushCursor ? '1' : '0'); } catch { /* storage unavailable */ }
+    if (!brushCursor) $('dab-cursor').hidden = true;
+    editor.notify();
+  } else if (command === 'install') {
+    if (!installEvent) return;
+    await installEvent.prompt();
+    installEvent = null;
+    syncInstallItem();
+  } else if (command === 'toggle-grid') {
     editor.show.grid = !editor.show.grid;
     editor.paintOverlay();
     editor.notify();
@@ -940,6 +1032,14 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     event.preventDefault();
   }
   if (editing() && event.key !== 'Escape') return;
+  if (event.key.startsWith('Arrow') && editor.doc?.selection && editor.tool === 'move-pixels') {
+    event.preventDefault();
+    const step = event.shiftKey ? 10 : 1;
+    const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
+    const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
+    if (dx || dy) tools.nudge(dx, dy);
+    return;
+  }
   if (event.key === 'Alt') event.preventDefault();
   if (event.target instanceof HTMLSelectElement && !ctrl && event.key !== 'Escape') return;
   if (ctrl && key === 'n') { event.preventDefault(); void run(editor, tools, 'new'); }
@@ -967,8 +1067,8 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     else if (editor.float) editor.cancelFloat();
     else editor.deselect();
   } else if (event.key === 'Delete' || event.key === 'Backspace') editor.eraseSelection();
-  else if (event.key === '[') editor.size = Math.max(1, editor.size - 1);
-  else if (event.key === ']') editor.size = Math.min(200, editor.size + 1);
+  else if (event.key === '[') { editor.size = Math.max(1, editor.size - 1); showDabCenter(editor); }
+  else if (event.key === ']') { editor.size = Math.min(200, editor.size + 1); showDabCenter(editor); }
   else if (!ctrl && !event.altKey && key === 'x') swapColors(editor);
   else if (!ctrl && !event.altKey && key.length === 1) {
     const next = toolFromShortcut(key, editor.tool);
@@ -1291,6 +1391,8 @@ function sync(editor: Editor): void {
   if (themeButton) themeButton.setAttribute('aria-checked', String(dark));
   const themeMark = document.getElementById('theme-mark');
   if (themeMark) themeMark.textContent = dark ? 'On' : 'Off';
+  const cursorMark = document.getElementById('cursor-mark');
+  if (cursorMark) cursorMark.textContent = brushCursor ? 'On' : 'Off';
   app.dataset.rulers = editor.show.rulers ? '1' : '0';
   app.dataset.status = editor.show.status ? '1' : '0';
   app.dataset.tools = editor.show.tools ? '1' : '0';
@@ -1353,6 +1455,9 @@ function extraOptions(editor: Editor): string {
     parts.push(`<label class="option">Symmetry <select id="symmetry-select">${(['off', 'vertical', 'horizontal', 'orthogonal'] as const).map(id => `<option value="${id}" ${id === editor.symmetry ? 'selected' : ''}>${symmetryLabels[id]}</option>`).join('')}</select></label>`);
   }
   if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
+  if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil') {
+    parts.push(`<label class="check"><input id="unserrate" type="checkbox" ${editor.unserrate[tool] ? 'checked' : ''}/> Unserrate</label>`);
+  }
   if (tool === 'bucket' || tool === 'wand' || tool === 'recolor') parts.push(`<label class="option">Tolerance <input id="tolerance-slider" type="range" min="0" max="100" value="${editor.tolerance}" /></label>`);
   if (tool === 'wand') parts.push(`<label class="check"><input id="wand-contiguous" type="checkbox" ${editor.wandContiguous ? 'checked' : ''}/> Contiguous</label>`);
   if (tool === 'bucket' || tool === 'wand' || tool === 'picker') parts.push(`<label class="check"><input id="sample-all" type="checkbox" ${editor.sampleAll ? 'checked' : ''}/> All layers</label>`);
@@ -1441,6 +1546,12 @@ function bindExtra(editor: Editor): void {
   document.getElementById('sample-all')?.addEventListener('change', event => {
     editor.sampleAll = (event.target as HTMLInputElement).checked;
   });
+  document.getElementById('unserrate')?.addEventListener('change', event => {
+    const tool = editor.tool;
+    if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil') {
+      editor.unserrate[tool] = (event.target as HTMLInputElement).checked;
+    }
+  });
 }
 
 function paintSwatch(id: string, color: string): void {
@@ -1497,8 +1608,9 @@ function paintColorField(): void {
   shade.addColorStop(1, '#000000');
   ctx.fillStyle = shade;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const x = pickerSat * canvas.width;
-  const y = (1 - pickerVal) * canvas.height;
+  const radius = 6;
+  const x = radius + pickerSat * (canvas.width - radius * 2);
+  const y = radius + (1 - pickerVal) * (canvas.height - radius * 2);
   ctx.beginPath();
   ctx.arc(x, y, 5, 0, Math.PI * 2);
   ctx.lineWidth = 1.5;

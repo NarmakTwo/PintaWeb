@@ -484,6 +484,71 @@ function averagedColor(image: ImageData, x: number, y: number, size: number): st
   return `#${[red, green, blue, alpha].map(value => Math.round(value / scale).toString(16).padStart(2, '0')).join('')}`;
 }
 
+type CurvePoint = Point & { t: number };
+
+function knot(a: Point, b: Point, start: number): number {
+  return start + Math.sqrt(Math.max(1e-4, Math.hypot(b.x - a.x, b.y - a.y)));
+}
+
+function mixPoint(a: Point, b: Point, from: number, to: number, t: number): Point {
+  const span = to - from;
+  const amount = span === 0 ? 0 : (t - from) / span;
+  return { x: a.x + (b.x - a.x) * amount, y: a.y + (b.y - a.y) * amount };
+}
+
+function centripetal(p0: Point, p1: Point, p2: Point, p3: Point, amount: number): Point {
+  const t0 = 0;
+  const t1 = knot(p0, p1, t0);
+  const t2 = knot(p1, p2, t1);
+  const t3 = knot(p2, p3, t2);
+  const t = t1 + (t2 - t1) * amount;
+  const a1 = mixPoint(p0, p1, t0, t1, t);
+  const a2 = mixPoint(p1, p2, t1, t2, t);
+  const a3 = mixPoint(p2, p3, t2, t3, t);
+  const b1 = mixPoint(a1, a2, t0, t2, t);
+  const b2 = mixPoint(a2, a3, t1, t3, t);
+  return mixPoint(b1, b2, t1, t2, t);
+}
+
+function sampleCurve(points: CurvePoint[], spacing: number): CurvePoint[] {
+  if (points.length <= 1) return points.map(point => ({ ...point }));
+  if (points.length === 2) {
+    const out: CurvePoint[] = [{ ...points[0] }];
+    const distance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+    const steps = Math.min(500, Math.max(1, Math.ceil(distance / Math.max(0.5, spacing))));
+    for (let index = 1; index <= steps; index++) {
+      const amount = index / steps;
+      out.push({
+        x: points[0].x + (points[1].x - points[0].x) * amount,
+        y: points[0].y + (points[1].y - points[0].y) * amount,
+        t: points[0].t + (points[1].t - points[0].t) * amount,
+      });
+    }
+    return out;
+  }
+  const gap = Math.max(0.5, spacing);
+  const out: CurvePoint[] = [];
+  const push = (point: CurvePoint) => {
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(point.x - last.x, point.y - last.y) >= gap * 0.5) out.push(point);
+  };
+  for (let index = 0; index < points.length - 1; index++) {
+    const p0 = points[Math.max(0, index - 1)];
+    const p1 = points[index];
+    const p2 = points[index + 1];
+    const p3 = points[Math.min(points.length - 1, index + 2)];
+    const distance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const steps = Math.min(64, Math.max(2, Math.ceil(distance / gap)));
+    for (let step = 0; step <= steps; step++) {
+      if (index > 0 && step === 0) continue;
+      const amount = step / steps;
+      const point = centripetal(p0, p1, p2, p3, amount);
+      push({ x: point.x, y: point.y, t: p1.t + (p2.t - p1.t) * amount });
+    }
+  }
+  return out.length ? out : points.map(point => ({ ...point }));
+}
+
 function walk(from: Point, to: Point, spacing: number, visit: (point: Point) => void): void {
   if (!Number.isFinite(from.x) || !Number.isFinite(from.y) || !Number.isFinite(to.x) || !Number.isFinite(to.y)) return;
   const distance = Math.hypot(to.x - from.x, to.y - from.y);
@@ -571,6 +636,7 @@ export class ToolController {
   private penWidth = 0;
   private strokeClock = 0;
   private pencilPath: Point[] = [];
+  private curvePath: CurvePoint[] = [];
   private held = 0;
   private touched = new Map<number, number>();
   private rateTimer = 0;
@@ -579,6 +645,33 @@ export class ToolController {
 
   commitText(): void {
     commitText(this.editor);
+  }
+
+  nudge(dx: number, dy: number): void {
+    const editor = this.editor;
+    const doc = editor.doc;
+    const layer = editor.layer;
+    if (!doc?.selection || !layer || editor.tool !== 'move-pixels' || dx === 0 && dy === 0) return;
+    if (editor.float && this.gesture === 'move') {
+      editor.float.frame = null;
+      editor.float.x += dx;
+      editor.float.y += dy;
+      if (this.start) this.start = { x: this.start.x - dx, y: this.start.y - dy };
+      if (editor.float.mask) {
+        doc.selection = shiftMask(editor.float.mask, doc.width, doc.height, editor.float.x, editor.float.y);
+        editor.rebuildEdges();
+      }
+      editor.renderScene();
+      return;
+    }
+    this.before = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    this.gesture = 'move';
+    this.moved = true;
+    this.startMove({ x: 0, y: 0 }, { altKey: false, ctrlKey: false, metaKey: false } as PointerEvent);
+    if (!editor.float) return;
+    editor.float.x = dx;
+    editor.float.y = dy;
+    this.finishMove();
   }
 
   down(event: PointerEvent): void {
@@ -658,15 +751,27 @@ export class ToolController {
       this.recolor(point);
     } else if (editor.tool === 'pencil') {
       this.pencilPath = [];
-      this.pencil(point, event.shiftKey);
+      this.curvePath = [];
+      if (this.curves('pencil', event.shiftKey)) {
+        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+        this.replayCurve('pencil');
+      } else this.pencil(point, event.shiftKey);
     } else if (editor.tool === 'brush' || editor.tool === 'eraser') {
       this.resetStroke(point);
-      this.brush(point, point);
+      this.curvePath = [];
+      if (this.curves(editor.tool, event.shiftKey)) {
+        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+        this.replayCurve(editor.tool);
+      } else this.brush(point, point);
     } else if (editor.tool === 'pen') {
       this.resetStroke(point);
       this.penWidth = brushSize(editor);
       this.strokeClock = event.timeStamp;
-      this.pen(point, point, event.timeStamp);
+      this.curvePath = [];
+      if (this.curves('pen', false)) {
+        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+        this.replayCurve('pen');
+      } else this.pen(point, point, event.timeStamp);
     } else if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'dither' || editor.tool === 'random') this.tone(point, point);
     else if (editor.tool === 'lasso' || editor.tool === 'lasso-draw') {
       this.points = [point];
@@ -696,7 +801,11 @@ export class ToolController {
     const lock = event.shiftKey && (tool === 'pencil' || tool === 'brush' || tool === 'line');
     const aimed = lock && this.start ? snap45(this.start, point) : point;
     const sample = (tool === 'brush' || tool === 'eraser' || tool === 'pen') && !(lock && tool === 'brush') ? this.smoothToward(point) : aimed;
-    if (tool === 'brush' || tool === 'eraser') this.brush(this.last, sample);
+    const curve = this.curveKind(tool, lock);
+    if (curve) {
+      this.pushCurve(aimed, event.timeStamp);
+      this.replayCurve(curve);
+    } else if (tool === 'brush' || tool === 'eraser') this.brush(this.last, sample);
     else if (tool === 'pen') this.pen(this.last, sample, event.timeStamp, false, this.lastRaw, point);
     else if (tool === 'pencil') this.pencil(aimed, event.shiftKey);
     else if (tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'random') this.tone(this.last, point);
@@ -746,6 +855,7 @@ export class ToolController {
     this.baseMask = null;
     this.points = [];
     this.pencilPath = [];
+    this.curvePath = [];
     this.start = null;
     this.smooth = null;
     this.lastRaw = null;
@@ -775,7 +885,12 @@ export class ToolController {
     const point = editor.imagePoint(event) ?? this.last ?? this.start;
     const tool = editor.tool;
     clearPreview(editor);
-    if (tool === 'brush' || tool === 'eraser' || tool === 'pen') this.catchUp(point, tool, event.timeStamp);
+    const curve = this.curvePath.length ? this.curveKind(tool, event.shiftKey) : null;
+    if (curve) {
+      this.pushCurve(point, event.timeStamp);
+      this.replayCurve(curve);
+    } else if (tool === 'brush' || tool === 'eraser' || tool === 'pen') this.catchUp(point, tool, event.timeStamp);
+    this.curvePath = [];
     if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'pen' || tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'recolor' || tool === 'random') {
       if (this.before) {
         editor.applyClip(this.before);
@@ -905,7 +1020,7 @@ export class ToolController {
     editor.renderScene();
   }
 
-  private brush(from: Point, to: Point): void {
+  private brush(from: Point, to: Point, quiet = false): void {
     const editor = this.editor;
     const layer = editor.layer;
     if (!layer) return;
@@ -921,7 +1036,7 @@ export class ToolController {
       walk(start, end, Math.max(1, editor.size / 4), point => stampBrush(layer.ctx, editor, point.x, point.y, color, erase));
     }
     if (this.before) editor.guardAlpha(this.before);
-    editor.renderScene();
+    if (!quiet) editor.renderScene();
   }
 
   private recolor(point: Point): void {
@@ -985,6 +1100,56 @@ export class ToolController {
     return true;
   }
 
+  private curves(tool: ToolId, lock: boolean): boolean {
+    return this.curveKind(tool, lock) !== null;
+  }
+
+  private curveKind(tool: ToolId, lock: boolean): 'brush' | 'eraser' | 'pen' | 'pencil' | null {
+    if (lock) return null;
+    if (tool !== 'brush' && tool !== 'eraser' && tool !== 'pen' && tool !== 'pencil') return null;
+    return this.editor.unserrate[tool] ? tool : null;
+  }
+
+  private pushCurve(point: Point, time: number): void {
+    const last = this.curvePath[this.curvePath.length - 1];
+    if (last && Math.hypot(point.x - last.x, point.y - last.y) < 0.75) {
+      last.t = time;
+      return;
+    }
+    this.curvePath.push({ x: point.x, y: point.y, t: time });
+  }
+
+  private replayCurve(tool: 'brush' | 'eraser' | 'pen' | 'pencil'): void {
+    const editor = this.editor;
+    const layer = editor.layer;
+    const doc = editor.doc;
+    if (!layer || !doc || !this.before || !this.curvePath.length) return;
+    layer.ctx.putImageData(this.before, 0, 0);
+    const samples = sampleCurve(this.curvePath, Math.max(1, editor.size / 4));
+    if (!samples.length) return;
+    if (tool === 'pencil') {
+      const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+      const size = Math.max(1, editor.size | 0);
+      const ink = editor.ink(this.button);
+      const stamp = (from: Point, to: Point) => {
+        for (const [start, end] of mirroredSegments(editor, from, to)) {
+          editor.engine.stamp(image, start.x | 0, start.y | 0, end.x | 0, end.y | 0, size, ink, false);
+        }
+      };
+      if (samples.length === 1) stamp(samples[0], samples[0]);
+      for (let index = 1; index < samples.length; index++) stamp(samples[index - 1], samples[index]);
+      editor.lockAlpha(image, this.before);
+      layer.ctx.putImageData(image, 0, 0);
+    } else if (tool === 'pen') {
+      this.penWidth = 0;
+      this.strokeClock = samples[0].t;
+      if (samples.length === 1) this.pen(samples[0], samples[0], samples[0].t, false, null, null, true);
+      for (let index = 1; index < samples.length; index++) this.pen(samples[index - 1], samples[index], samples[index].t, false, samples[index - 1], samples[index], true);
+    } else if (samples.length === 1) this.brush(samples[0], samples[0], true);
+    else for (let index = 1; index < samples.length; index++) this.brush(samples[index - 1], samples[index], true);
+    editor.renderScene();
+  }
+
   private resetStroke(point: Point): void {
     this.smooth = null;
     this.lastRaw = point;
@@ -1018,7 +1183,7 @@ export class ToolController {
     this.last = cursor;
   }
 
-  private pen(from: Point, to: Point, time: number, holdWidth = false, rawFrom?: Point | null, rawTo?: Point | null): void {
+  private pen(from: Point, to: Point, time: number, holdWidth = false, rawFrom?: Point | null, rawTo?: Point | null, quiet = false): void {
     const editor = this.editor;
     const layer = editor.layer;
     if (!layer) return;
@@ -1049,7 +1214,7 @@ export class ToolController {
       });
     }
     if (this.before) editor.guardAlpha(this.before);
-    editor.renderScene();
+    if (!quiet) editor.renderScene();
   }
 
   private tone(from: Point, to: Point): void {

@@ -159,10 +159,17 @@ export class Editor {
   sampleAll = false;
   sampleSize = 1;
   symmetry: Symmetry = 'off';
+  unserrate: Record<'brush' | 'eraser' | 'pen' | 'pencil', boolean> = {
+    brush: true,
+    eraser: true,
+    pen: true,
+    pencil: false,
+  };
   textStyle: TextStyle = 'fill';
   strokeWidth = 2;
   palette = [...DEFAULT_PALETTE];
   recent: string[] = [];
+  private soloMemory: boolean[] | null = null;
   unit: Unit = 'px';
   show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false };
   gridSize = 16;
@@ -1190,8 +1197,25 @@ export class Editor {
   setLayerVisible(index: number, visible: boolean): void {
     const layer = this.doc?.layers[index];
     if (!layer || layer.visible === visible) return;
+    this.soloMemory = null;
     layer.visible = visible;
     this.checkpoint(visible ? 'Show Layer' : 'Hide Layer');
+  }
+
+  soloLayer(index: number): void {
+    const doc = this.doc;
+    const layers = doc?.layers;
+    if (!doc || !layers?.[index]) return;
+    const alone = layers.every((layer, layerIndex) => layerIndex === index || !layer.visible);
+    if (alone && layers[index].visible && this.soloMemory) {
+      layers.forEach((layer, layerIndex) => { layer.visible = this.soloMemory?.[layerIndex] ?? layer.visible; });
+      this.soloMemory = null;
+    } else {
+      this.soloMemory = layers.map(layer => layer.visible);
+      layers.forEach((layer, layerIndex) => { layer.visible = layerIndex === index; });
+    }
+    this.renderScene();
+    this.checkpoint('Solo Layer');
   }
 
   setGroupVisible(id: number, visible: boolean): void {

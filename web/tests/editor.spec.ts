@@ -1375,6 +1375,19 @@ test('the swatch color picker sets transparency', async ({ page }) => {
   await page.locator('[data-color-slot="primary"]').click();
   const picker = page.locator('#color-picker');
   await expect(picker).toBeVisible();
+  const thumb = await page.locator('#color-hue').evaluate(element => {
+    const style = getComputedStyle(element, '::-webkit-slider-thumb');
+    return { width: Number.parseFloat(style.width), background: style.backgroundColor };
+  });
+  expect(thumb.width).toBeGreaterThan(8);
+  await page.locator('#color-hue').fill('120');
+  const hue = await page.locator('#color-sv').evaluate(canvas => {
+    const image = canvas as HTMLCanvasElement;
+    return Array.from(image.getContext('2d')!.getImageData(image.width - 2, 2, 1, 1).data);
+  });
+  expect(hue[1]).toBeGreaterThan(200);
+  expect(hue[0]).toBeLessThan(40);
+  await page.locator('#color-hue').fill('0');
   const field = await page.locator('#color-sv').boundingBox();
   if (!field) throw new Error('The color field is not visible.');
   await page.mouse.click(field.x + field.width - 4, field.y + 4);
@@ -1459,6 +1472,193 @@ test('zoom shortcuts change the canvas and leave the page scale alone', async ({
   await page.keyboard.press('Control+Equal');
   expect(await percent()).toBeGreaterThan(reduced);
   expect(await pageScale()).toBe(1);
+});
+
+test('rounds a fast brush stroke instead of leaving straight segments', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 80, 80);
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('3');
+  const ratios: [number, number][] = [[0.1, 0.75], [0.5, 0.1], [0.9, 0.75]];
+  const box = await page.locator('#paper').boundingBox();
+  if (!box) throw new Error('The canvas is not visible.');
+  const at = (x: number, y: number) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+  const start = at(ratios[0][0], ratios[0][1]);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  for (const ratio of ratios.slice(1)) {
+    const point = at(ratio[0], ratio[1]);
+    await page.mouse.move(point.x, point.y);
+  }
+  await page.mouse.up();
+  const offChord = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const chords: [number, number, number, number][] = [[8, 60, 40, 8], [40, 8, 72, 60]];
+    const distance = (x: number, y: number, x0: number, y0: number, x1: number, y1: number) => {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const length = Math.hypot(dx, dy) || 1;
+      const t = Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / (length * length)));
+      return Math.hypot(x - (x0 + dx * t), y - (y0 + dy * t));
+    };
+    let found = 0;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const index = (y * canvas.width + x) * 4;
+        if (data[index] > 80) continue;
+        const nearest = Math.min(...chords.map(chord => distance(x, y, chord[0], chord[1], chord[2], chord[3])));
+        if (nearest > 3) found++;
+      }
+    }
+    return found;
+  });
+  expect(offChord).toBeGreaterThan(0);
+});
+
+test('unserrate is on for the brushes and off for the pencil', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 80, 80);
+  const offChord = async () => page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const chords: [number, number, number, number][] = [[8, 60, 40, 8], [40, 8, 72, 60]];
+    const distance = (x: number, y: number, x0: number, y0: number, x1: number, y1: number) => {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const length = Math.hypot(dx, dy) || 1;
+      const t = Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / (length * length)));
+      return Math.hypot(x - (x0 + dx * t), y - (y0 + dy * t));
+    };
+    let found = 0;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const index = (y * canvas.width + x) * 4;
+        if (data[index] > 80) continue;
+        const nearest = Math.min(...chords.map(chord => distance(x, y, chord[0], chord[1], chord[2], chord[3])));
+        if (nearest > 5) found++;
+      }
+    }
+    return found;
+  });
+  const flick = async () => {
+    const ratios: [number, number][] = [[0.1, 0.75], [0.5, 0.1], [0.9, 0.75]];
+    const box = await page.locator('#paper').boundingBox();
+    if (!box) throw new Error('The canvas is not visible.');
+    const at = (x: number, y: number) => ({ x: box.x + box.width * x, y: box.y + box.height * y });
+    const start = at(ratios[0][0], ratios[0][1]);
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    for (const ratio of ratios.slice(1)) {
+      const point = at(ratio[0], ratio[1]);
+      await page.mouse.move(point.x, point.y);
+    }
+    await page.mouse.up();
+  };
+  await page.locator('[data-tool="brush"]').click();
+  await expect(page.locator('#unserrate')).toBeChecked();
+  await page.locator('[data-tool="eraser"]').click();
+  await expect(page.locator('#unserrate')).toBeChecked();
+  await page.locator('[data-tool="pen"]').click();
+  await expect(page.locator('#unserrate')).toBeChecked();
+  await page.locator('[data-tool="pencil"]').click();
+  await expect(page.locator('#unserrate')).not.toBeChecked();
+  await page.locator('#size-slider').fill('4');
+  await flick();
+  expect(await offChord()).toBe(0);
+  await page.locator('#unserrate').check();
+  await newCanvas(page, 80, 80);
+  await flick();
+  expect(await offChord()).toBeGreaterThan(0);
+  await page.locator('[data-tool="brush"]').click();
+  await expect(page.locator('#unserrate')).toBeChecked();
+  await page.locator('#unserrate').uncheck();
+  await newCanvas(page, 80, 80);
+  await page.locator('#size-slider').fill('3');
+  await flick();
+  const painted = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let dark = 0;
+    for (let index = 0; index < data.length; index += 4) if (data[index] < 80) dark++;
+    return dark;
+  });
+  expect(painted).toBeGreaterThan(10);
+});
+
+test('nudges selected pixels with the arrow keys', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('1');
+  await page.locator('#primary-input').fill('#ff0000');
+  const dot = await paperPoint(page, 0.25, 0.5);
+  await page.mouse.click(dot.x, dot.y);
+  await page.keyboard.press('Control+a');
+  const before = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const index = (y * canvas.width + x) * 4;
+        if (data[index] > 200 && data[index + 1] < 40) return x;
+      }
+    }
+    return -1;
+  });
+  await page.keyboard.press('ArrowRight');
+  const after = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const index = (y * canvas.width + x) * 4;
+        if (data[index] > 200 && data[index + 1] < 40) return x;
+      }
+    }
+    return -1;
+  });
+  expect(before).toBeGreaterThan(-1);
+  expect(after).toBe(before + 1);
+});
+
+test('solos a layer from its eye and restores the others', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('button[aria-label="Add layer"]').click();
+  const top = page.locator('#layer-list input[data-visible][data-layer="1"]');
+  const bottom = page.locator('#layer-list input[data-visible][data-layer="0"]');
+  await top.click({ modifiers: ['Alt'] });
+  await expect(bottom).not.toBeChecked();
+  await expect(top).toBeChecked();
+  await top.click({ modifiers: ['Alt'] });
+  await expect(bottom).toBeChecked();
+});
+
+test('shows the dab size in the middle of the canvas while the size changes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('#menu-view').click();
+  await expect(page.locator('#cursor-mark')).toHaveText('Off');
+  await page.keyboard.press('Escape');
+  await page.locator('#size-slider').fill('48');
+  const cursor = page.locator('#dab-cursor');
+  await expect(cursor).toBeVisible();
+  const paper = await page.locator('#paper').boundingBox();
+  const mark = await cursor.boundingBox();
+  if (!paper || !mark) throw new Error('The canvas is not visible.');
+  const centerX = mark.x + mark.width / 2;
+  const centerY = mark.y + mark.height / 2;
+  expect(Math.abs(centerX - (paper.x + paper.width / 2))).toBeLessThan(3);
+  expect(Math.abs(centerY - (paper.y + paper.height / 2))).toBeLessThan(3);
+});
+
+test('keeps Install Pinta in the Window menu until the browser offers it', async ({ page }) => {
+  await ready(page);
+  await page.locator('#menu-window').click();
+  const item = page.locator('[data-command="install"]');
+  await expect(item).toHaveText('Install Pinta');
+  await expect(item).toBeDisabled();
 });
 
 test.describe('touchscreen', () => {
