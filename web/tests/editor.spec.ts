@@ -1427,6 +1427,40 @@ test('loads the editor from the service worker while offline', async ({ page, co
   expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
 });
 
+test('zoom shortcuts change the canvas and leave the page scale alone', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  const percent = () => page.locator('#zoom-label').innerText().then(text => Number(text.replace('%', '')));
+  const pageScale = () => page.evaluate(() => window.visualViewport?.scale ?? 1);
+  const start = await percent();
+  await page.locator('#menubar').evaluate(element => {
+    const fire = (type: string, id: number, x: number, y: number) => element.dispatchEvent(new PointerEvent(type, {
+      pointerId: id, clientX: x, clientY: y, bubbles: true, cancelable: true, pointerType: 'touch',
+    }));
+    fire('pointerdown', 7, 40, 24);
+    fire('pointerdown', 8, 70, 24);
+    fire('pointermove', 8, 120, 24);
+    fire('pointerup', 8, 120, 24);
+    fire('pointerup', 7, 40, 24);
+  });
+  const pinched = await percent();
+  expect(pinched).toBeGreaterThan(start);
+  await page.locator('#menubar').evaluate(element => {
+    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, ctrlKey: true, bubbles: true, cancelable: true, clientX: 24, clientY: 24 }));
+  });
+  const zoomed = await percent();
+  expect(zoomed).toBeGreaterThan(pinched);
+  expect(await pageScale()).toBe(1);
+
+  await page.keyboard.press('Control+Minus');
+  const reduced = await percent();
+  expect(reduced).toBeLessThan(zoomed);
+  expect(await pageScale()).toBe(1);
+  await page.keyboard.press('Control+Equal');
+  expect(await percent()).toBeGreaterThan(reduced);
+  expect(await pageScale()).toBe(1);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

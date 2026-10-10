@@ -60,7 +60,7 @@ html, body {
   color: var(--ink);
   font-family: var(--font);
   font-size: 13px;
-  touch-action: manipulation;
+  touch-action: pan-x pan-y;
 }
 
 button, input, select, textarea {

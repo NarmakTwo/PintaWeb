@@ -263,6 +263,7 @@ function wire(editor: Editor, tools: ToolController): void {
   const paper = $('paper');
   const contacts = new Map<number, { x: number; y: number }>();
   let pinch: { distance: number; cx: number; cy: number; zoom: number } | null = null;
+  let pinchGesture = false;
 
   const measure = () => {
     const points = [...contacts.values()];
@@ -274,42 +275,78 @@ function wire(editor: Editor, tools: ToolController): void {
       cy: (a.y + b.y) / 2,
     };
   };
+  const zoomByWheel = (event: WheelEvent) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    if (!editor.doc || !event.deltaY) return;
+    editor.zoomAt(editor.doc.zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
+  };
+  const rememberContact = (event: PointerEvent) => {
+    contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  };
+
+  window.addEventListener('pointerdown', event => {
+    rememberContact(event);
+    if (contacts.size < 2) return;
+    pinchGesture = true;
+    tools.abandon();
+    const span = measure();
+    if (span && editor.doc) pinch = { ...span, zoom: editor.doc.zoom };
+    if (event.cancelable) event.preventDefault();
+  }, true);
+  window.addEventListener('pointermove', event => {
+    if (!contacts.has(event.pointerId)) return;
+    rememberContact(event);
+    if (!pinch || contacts.size < 2) return;
+    const span = measure();
+    if (!span || !editor.doc) return;
+    if (event.cancelable) event.preventDefault();
+    editor.zoomAt(pinch.zoom * (span.distance / pinch.distance), pinch.cx, pinch.cy);
+    editor.stage.scrollLeft -= span.cx - pinch.cx;
+    editor.stage.scrollTop -= span.cy - pinch.cy;
+  }, true);
+  const forgetContact = (event: PointerEvent) => {
+    contacts.delete(event.pointerId);
+    if (contacts.size < 2) pinch = null;
+  };
+  window.addEventListener('pointerup', forgetContact, true);
+  window.addEventListener('pointercancel', forgetContact, true);
+  window.addEventListener('pointerup', () => {
+    if (contacts.size === 0) pinchGesture = false;
+  });
+  window.addEventListener('pointercancel', () => {
+    if (contacts.size === 0) pinchGesture = false;
+  });
+  window.addEventListener('wheel', zoomByWheel, { capture: true, passive: false });
+  let gestureZoom = 1;
+  const onGesture = (event: Event) => {
+    event.preventDefault();
+    const gesture = event as Event & { scale?: number; clientX?: number; clientY?: number };
+    if (event.type === 'gesturestart') {
+      gestureZoom = editor.doc?.zoom ?? 1;
+      return;
+    }
+    if (!editor.doc || !gesture.scale) return;
+    editor.zoomAt(gestureZoom * gesture.scale, gesture.clientX ?? window.innerWidth / 2, gesture.clientY ?? window.innerHeight / 2);
+  };
+  window.addEventListener('gesturestart', onGesture, { passive: false });
+  window.addEventListener('gesturechange', onGesture, { passive: false });
 
   paper.addEventListener('pointerdown', event => {
     if (event.cancelable) event.preventDefault();
-    contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
     try { paper.setPointerCapture(event.pointerId); } catch { /* already captured */ }
-    if (contacts.size > 1) {
-      tools.abandon();
-      const span = measure();
-      if (span && editor.doc) pinch = { ...span, zoom: editor.doc.zoom };
-      return;
-    }
+    if (pinchGesture) return;
     tools.down(event);
   });
   paper.addEventListener('pointermove', event => {
-    if (contacts.has(event.pointerId)) contacts.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (pinch && contacts.size > 1) {
-      const span = measure();
-      if (span && editor.doc) {
-        editor.zoomAt(pinch.zoom * (span.distance / pinch.distance), pinch.cx, pinch.cy);
-        editor.stage.scrollLeft -= span.cx - pinch.cx;
-        editor.stage.scrollTop -= span.cy - pinch.cy;
-      }
-      return;
-    }
+    if (pinchGesture) return;
     tools.move(event);
     const point = editor.imagePoint(event);
     if (!point || !editor.doc) return;
     $('cursor-pos').textContent = `${formatUnit(point.x, editor.unit)}, ${formatUnit(point.y, editor.unit)}`;
   });
   const release = (event: PointerEvent) => {
-    const pinching = pinch !== null;
-    contacts.delete(event.pointerId);
-    if (pinching) {
-      if (contacts.size < 2) pinch = null;
-      return;
-    }
+    if (pinchGesture) return;
     if (event.type === 'pointercancel') tools.abandon();
     else tools.up(event);
   };
@@ -318,11 +355,6 @@ function wire(editor: Editor, tools: ToolController): void {
   paper.addEventListener('contextmenu', event => {
     event.preventDefault();
   });
-  paper.addEventListener('wheel', event => {
-    if (!event.ctrlKey || !editor.doc) return;
-    event.preventDefault();
-    editor.zoomAt(editor.doc.zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), event.clientX, event.clientY);
-  }, { passive: false });
 
   $('context-menu').addEventListener('pointerover', event => {
     const host = (event.target as HTMLElement).closest<HTMLElement>('.menu-sub');
@@ -875,8 +907,26 @@ function askAdjust(title: string, fields: Field[], preview: ((values: AdjustValu
   return ask('adjust-dialog').then(answer => (answer === 'ok' ? read() : null));
 }
 
+function canvasZoomKey(event: KeyboardEvent): 'in' | 'out' | 'reset' | null {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return null;
+  const code = event.code;
+  if (!event.shiftKey && (event.key === '0' || code === 'Digit0' || code === 'Numpad0')) return 'reset';
+  if (event.key === '+' || event.key === '=' || code === 'NumpadAdd' || code === 'Equal') return 'in';
+  if (event.key === '-' || event.key === '_' || code === 'NumpadSubtract' || code === 'Minus') return 'out';
+  return null;
+}
+
 function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): void {
   tools.syncConstraint(event);
+  const zoomKey = canvasZoomKey(event);
+  if (zoomKey) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!editor.doc) return;
+    if (zoomKey === 'reset') editor.setZoom(1);
+    else editor.setZoom(zoomKey === 'in' ? editor.doc.zoom * 1.25 : editor.doc.zoom / 1.25);
+    return;
+  }
   const key = event.key.toLowerCase();
   const ctrl = event.ctrlKey || event.metaKey;
   if (ctrl && !event.shiftKey && key === 'd') {
