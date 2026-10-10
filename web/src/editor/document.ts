@@ -3,7 +3,7 @@ import { canvasToPng, clearSession, downloadBlob, encodeBmp, loadSession, saveSe
 import { zipStore } from './zip.ts';
 import {
   boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask, TOOLS,
-  type Bounds, type BrushId, type GradientKind, type Point, type SelectMode, type ShapeStyle, type ToolId, type Unit,
+  type Bounds, type BrushId, type GradientKind, type Point, type SelectMode, type ShapeStyle, type Symmetry, type TextStyle, type ToolId, type Unit,
 } from './types.ts';
 
 export const BLEND_MODES = ['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'] as const;
@@ -46,6 +46,7 @@ export interface Layer {
   clip: boolean;
   tag: string | null;
   parent: number | null;
+  alphaLock: boolean;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
 }
@@ -75,6 +76,7 @@ interface SnapshotLayer {
   clip: boolean;
   tag: string | null;
   parent: number | null;
+  alphaLock: boolean;
   data: ImageData;
 }
 
@@ -153,7 +155,14 @@ export class Editor {
   randomRate = 0;
   randomAlpha = false;
   recolorGlobal = false;
+  wandContiguous = true;
+  sampleAll = false;
+  sampleSize = 1;
+  symmetry: Symmetry = 'off';
+  textStyle: TextStyle = 'fill';
+  strokeWidth = 2;
   palette = [...DEFAULT_PALETTE];
+  recent: string[] = [];
   unit: Unit = 'px';
   show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false };
   gridSize = 16;
@@ -243,7 +252,7 @@ export class Editor {
     canvas.height = data?.height ?? doc?.height ?? 1;
     const ctx = context2d(canvas);
     if (data) ctx.putImageData(data, 0, 0);
-    return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: DEFAULT_TAG, parent: null, canvas, ctx };
+    return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: DEFAULT_TAG, parent: null, alphaLock: false, canvas, ctx };
   }
 
   private capture(): Snapshot {
@@ -269,6 +278,7 @@ export class Editor {
         clip: layer.clip,
         tag: layer.tag,
         parent: layer.parent == null ? null : doc.groups.findIndex(group => group.id === layer.parent),
+        alphaLock: layer.alphaLock,
         data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
       })),
     };
@@ -299,6 +309,7 @@ export class Editor {
       created.clip = !!layer.clip;
       created.tag = layer.tag ?? null;
       created.parent = layer.parent == null ? null : doc.groups[layer.parent]?.id ?? null;
+      created.alphaLock = !!layer.alphaLock;
       return created;
     });
     this.syncSize();
@@ -743,6 +754,34 @@ export class Editor {
     layer.ctx.putImageData(after, 0, 0);
   }
 
+  lockAlpha(image: ImageData, before: ImageData): void {
+    if (!this.layer?.alphaLock) return;
+    const data = image.data;
+    const src = before.data;
+    for (let index = 3; index < data.length; index += 4) {
+      if (src[index] !== 0) continue;
+      data[index - 3] = src[index - 3];
+      data[index - 2] = src[index - 2];
+      data[index - 1] = src[index - 1];
+      data[index] = src[index];
+    }
+  }
+
+  guardAlpha(before: ImageData): void {
+    const layer = this.layer;
+    const doc = this.doc;
+    if (!layer?.alphaLock || !doc) return;
+    const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    this.lockAlpha(image, before);
+    layer.ctx.putImageData(image, 0, 0);
+  }
+
+  remember(color: string): void {
+    const next = color.trim().toLowerCase();
+    if (!/^#[0-9a-f]{3,8}$/.test(next)) return;
+    this.recent = [next, ...this.recent.filter(item => item !== next)].slice(0, 8);
+  }
+
   beginPreview(): void {
     const layer = this.layer;
     const doc = this.doc;
@@ -759,6 +798,7 @@ export class Editor {
     this.engine.setColor(this.primary);
     this.engine.run(copy, id, p1, p2, p3);
     if (doc.selection) this.engine.clip(copy, base, doc.selection);
+    this.lockAlpha(copy, base);
     layer.ctx.putImageData(copy, 0, 0);
     this.renderScene();
   }
@@ -1087,6 +1127,7 @@ export class Editor {
     copy.clip = layer.clip;
     copy.tag = layer.tag;
     copy.parent = layer.parent;
+    copy.alphaLock = layer.alphaLock;
     copy.ctx.drawImage(layer.canvas, 0, 0);
     doc.layers.splice(doc.active + 1, 0, copy);
     doc.active++;
@@ -1122,12 +1163,13 @@ export class Editor {
     this.checkpoint(direction < 0 ? 'Move Layer Down' : 'Move Layer Up');
   }
 
-  setLayerProperties(name: string, opacity: number, visible: boolean): void {
+  setLayerProperties(name: string, opacity: number, visible: boolean, alphaLock: boolean): void {
     const layer = this.layer;
     if (!layer) return;
     layer.name = name.trim() || layer.name;
     layer.opacity = Math.max(0, Math.min(100, opacity));
     layer.visible = visible;
+    layer.alphaLock = alphaLock;
     this.checkpoint('Layer Properties');
   }
 
@@ -1363,6 +1405,7 @@ export class Editor {
     }
     const color = rgba(this.primary, 255);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    const before = new ImageData(new Uint8ClampedArray(image.data), doc.width, doc.height);
     for (let i = 0; i < doc.selection.length; i++) {
       if (doc.selection[i] === 0) continue;
       const o = i * 4;
@@ -1371,6 +1414,7 @@ export class Editor {
       image.data[o + 2] = color.b;
       image.data[o + 3] = color.a;
     }
+    this.lockAlpha(image, before);
     layer.ctx.putImageData(image, 0, 0);
     this.checkpoint('Fill Selection');
   }
@@ -1512,6 +1556,7 @@ export class Editor {
         clip: layer.clip,
         tag: layer.tag,
         parent: layer.parent,
+        alphaLock: layer.alphaLock,
         file,
       });
     }
@@ -1535,6 +1580,7 @@ export class Editor {
           clip: !!layer.clip,
           tag: layer.tag ?? null,
           parent: layer.parent ?? null,
+          alphaLock: !!layer.alphaLock,
           file,
         });
       }
@@ -1619,6 +1665,7 @@ export class Editor {
             clip: layer.clip,
             tag: layer.tag,
             parent: layer.parent,
+            alphaLock: layer.alphaLock,
             png: await canvasToPng(layer.canvas),
           });
         }
@@ -1677,6 +1724,7 @@ export class Editor {
           created.clip = !!layer.clip;
           created.tag = layer.tag ?? null;
           created.parent = layer.parent ?? null;
+          created.alphaLock = !!layer.alphaLock;
           created.canvas.width = stored.width;
           created.canvas.height = stored.height;
           created.ctx = context2d(created.canvas);

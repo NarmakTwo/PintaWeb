@@ -5,7 +5,9 @@ export type ToolId =
   | 'line' | 'rectangle' | 'rounded' | 'ellipse'
   | 'lighten' | 'darken' | 'dither' | 'recolor' | 'random';
 
-export type BrushId = 'plain' | 'circle' | 'squares' | 'splatter' | 'slash' | 'grid';
+export type BrushId = 'plain' | 'circle' | 'squares' | 'splatter' | 'slash' | 'grid' | 'smudge';
+export type Symmetry = 'off' | 'vertical' | 'horizontal' | 'orthogonal';
+export type TextStyle = 'fill' | 'stroke' | 'both';
 export type ShapeStyle = 'outline' | 'fill' | 'both';
 export type SelectMode = 'replace' | 'union' | 'exclude' | 'xor' | 'intersect';
 export type GradientKind = 'linear' | 'radial' | 'diamond' | 'conical';
@@ -41,20 +43,20 @@ export const TOOLS: { id: ToolId; label: string; shortcut: string; icon: string;
   { id: 'ellipse-select', label: 'Ellipse Select', shortcut: 'S', icon: 'circle-dashed', hint: 'Drag an elliptical selection. Hold Shift for a circle.' },
   { id: 'lasso', label: 'Lasso Select', shortcut: 'S', icon: 'lasso-select', hint: 'Draw around the area you want to select. A loop that crosses itself leaves the overlap unselected. The outline marches while you draw.' },
   { id: 'lasso-draw', label: 'Lasso', shortcut: 'S', icon: 'lasso', hint: 'Draw a closed shape. A loop that crosses itself leaves the overlap unfilled. Fill and outline uses the secondary color for the outline.' },
-  { id: 'wand', label: 'Magic Wand', shortcut: 'S', icon: 'wand', hint: 'Click a color to select the connected area. Raise tolerance to include similar colors.' },
-  { id: 'brush', label: 'Paintbrush', shortcut: 'B', icon: 'brush', hint: 'Draw with the primary color. Right-click uses the secondary color. Fast strokes are smoothed.' },
+  { id: 'wand', label: 'Magic Wand', shortcut: 'S', icon: 'wand', hint: 'Click a color to select the connected area. Turn off Contiguous to select every match. All layers reads the flattened image.' },
+  { id: 'brush', label: 'Paintbrush', shortcut: 'B', icon: 'brush', hint: 'Draw with the primary color. Right-click uses the secondary color. Choose Smudge to drag paint already on the layer. Hold Shift to lock the stroke to 45° steps.' },
   { id: 'pen', label: 'Fountain Pen', shortcut: 'B', icon: 'pen', hint: 'A slow stroke stays thick. A fast stroke thins down. Right-click uses the secondary color.' },
   { id: 'random', label: 'Random Brush', shortcut: 'B', icon: 'random-brush', hint: 'Shift each pixel’s color by a random amount from the range. Rate 0 changes a pixel once. Rate 10 can change it 10 times a second.' },
-  { id: 'pencil', label: 'Pencil', shortcut: 'P', icon: 'pencil', hint: 'Draw hard-edged pixels. Right-click uses the secondary color.' },
+  { id: 'pencil', label: 'Pencil', shortcut: 'P', icon: 'pencil', hint: 'Draw hard-edged pixels. At size 1, corners stay one pixel wide. Hold Shift to lock the stroke to 45° steps.' },
   { id: 'eraser', label: 'Eraser', shortcut: 'E', icon: 'eraser', hint: 'Erase to transparent. Right-click paints the secondary color.' },
-  { id: 'bucket', label: 'Paint Bucket', shortcut: 'F', icon: 'paint-bucket', hint: 'Fill a connected area of similar color.' },
+  { id: 'bucket', label: 'Paint Bucket', shortcut: 'F', icon: 'paint-bucket', hint: 'Fill a connected area of similar color. All layers matches the flattened image and paints this layer.' },
   { id: 'gradient', label: 'Gradient', shortcut: 'G', icon: 'blend', hint: 'Drag to blend from the primary color to the secondary color.' },
-  { id: 'picker', label: 'Color Picker', shortcut: 'K', icon: 'pipette', hint: 'Click to choose the primary color and its transparency. Right-click chooses the secondary color.' },
-  { id: 'text', label: 'Text', shortcut: 'T', icon: 'type', hint: 'Click to place text. Enter commits it. Shift+Enter adds a line.' },
-  { id: 'line', label: 'Line/Curve', shortcut: 'O', icon: 'spline', hint: 'Drag a straight line. In curve mode, move after releasing to bend it, then click to commit.' },
-  { id: 'rectangle', label: 'Rectangle', shortcut: 'O', icon: 'square', hint: 'Drag a rectangle. Hold Shift for a square.' },
-  { id: 'rounded', label: 'Rounded Rectangle', shortcut: 'O', icon: 'rectangle-horizontal', hint: 'Drag a rounded rectangle. Hold Shift for a square.' },
-  { id: 'ellipse', label: 'Ellipse', shortcut: 'O', icon: 'circle', hint: 'Drag an ellipse. Hold Shift for a circle.' },
+  { id: 'picker', label: 'Color Picker', shortcut: 'K', icon: 'pipette', hint: 'Click to choose the primary color and its transparency. Right-click chooses the secondary color. Sample size averages a square of pixels.' },
+  { id: 'text', label: 'Text', shortcut: 'T', icon: 'type', hint: 'Click to place text. Enter commits it. Size is the type size. Stroke sets the outline width.' },
+  { id: 'line', label: 'Line/Curve', shortcut: 'O', icon: 'spline', hint: 'Drag a straight line. Hold Shift to lock it to 45° steps. In curve mode, move after releasing to bend it, then click to commit.' },
+  { id: 'rectangle', label: 'Rectangle', shortcut: 'O', icon: 'square', hint: 'Drag a rectangle. Hold Shift for a square. Hold Alt to draw from the center.' },
+  { id: 'rounded', label: 'Rounded Rectangle', shortcut: 'O', icon: 'rectangle-horizontal', hint: 'Drag a rounded rectangle. Hold Shift for a square. Hold Alt to draw from the center.' },
+  { id: 'ellipse', label: 'Ellipse', shortcut: 'O', icon: 'circle', hint: 'Drag an ellipse. Hold Shift for a circle. Hold Alt to draw from the center.' },
   { id: 'lighten', label: 'Lighten', shortcut: 'L', icon: 'sun', hint: 'Paint to lighten existing colors. Amount 100% turns a color white. Rate 0 changes each pixel once.' },
   { id: 'darken', label: 'Darken', shortcut: 'D', icon: 'moon', hint: 'Paint to darken existing colors. Amount 100% turns a color black. Rate 0 changes each pixel once.' },
   { id: 'dither', label: 'Dither', shortcut: 'D', icon: 'grid-3x3', hint: 'Paint a stippled pattern. Right-click paints the opposite cells in the secondary color. Hold both buttons for both colors.' },

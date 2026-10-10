@@ -352,7 +352,7 @@ function wire(editor: Editor, tools: ToolController): void {
     const target = event.target as HTMLElement;
     if (!target.closest('.menu-wrap')) closeMenus();
     if (!target.closest('#context-menu')) closeContext();
-    if (!target.closest('#color-picker, [data-color-slot]')) closeColorPicker();
+    if (!target.closest('#color-picker, [data-color-slot]')) closeColorPicker(editor);
   });
   document.querySelectorAll<HTMLButtonElement>('.menu-open').forEach(button => {
     button.addEventListener('click', () => {
@@ -403,6 +403,7 @@ function wire(editor: Editor, tools: ToolController): void {
     editor.primary = withAlpha(editor.primary, alpha);
     editor.notify();
   });
+  $<HTMLInputElement>('alpha-slider').addEventListener('change', () => editor.remember(editor.primary));
   $('swap-colors').addEventListener('click', () => swapColors(editor));
   bindColorPicker(editor);
   $('undo').addEventListener('click', () => editor.undo());
@@ -448,11 +449,18 @@ function wire(editor: Editor, tools: ToolController): void {
     applyTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     editor.notify();
   });
+  const takeSwatch = (color: string) => {
+    editor.primary = color;
+    editor.remember(color);
+    editor.notify();
+  };
   $('palette').addEventListener('click', event => {
     const button = (event.target as HTMLElement).closest('button');
-    if (!button?.dataset.color) return;
-    editor.primary = button.dataset.color;
-    editor.notify();
+    if (button?.dataset.color) takeSwatch(button.dataset.color);
+  });
+  $('recent-colors').addEventListener('click', event => {
+    const button = (event.target as HTMLElement).closest('button');
+    if (button?.dataset.color) takeSwatch(button.dataset.color);
   });
   $('palette').addEventListener('contextmenu', event => {
     const button = (event.target as HTMLElement).closest('button');
@@ -460,8 +468,8 @@ function wire(editor: Editor, tools: ToolController): void {
     event.preventDefault();
     const color = button.dataset.color;
     openContext(event.clientX, event.clientY, [
-      { label: 'Use as primary', action: () => { editor.colorSlot = 'primary'; editor.primary = color; editor.notify(); } },
-      { label: 'Use as secondary', action: () => { editor.colorSlot = 'secondary'; editor.secondary = color; editor.notify(); } },
+      { label: 'Use as primary', action: () => { editor.colorSlot = 'primary'; editor.primary = color; editor.remember(color); editor.notify(); } },
+      { label: 'Use as secondary', action: () => { editor.colorSlot = 'secondary'; editor.secondary = color; editor.remember(color); editor.notify(); } },
       { label: 'Remove', action: () => { editor.palette = editor.palette.filter(item => item !== color); editor.notify(); } },
     ]);
   });
@@ -691,7 +699,8 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
     $<HTMLInputElement>('layer-name').value = editor.layer.name;
     $<HTMLInputElement>('layer-opacity').value = String(editor.layer.opacity);
     $<HTMLInputElement>('layer-visible').checked = editor.layer.visible;
-    if (await ask('layer-dialog') === 'ok') editor.setLayerProperties($<HTMLInputElement>('layer-name').value, Number($<HTMLInputElement>('layer-opacity').value), $<HTMLInputElement>('layer-visible').checked);
+    $<HTMLInputElement>('layer-alpha-lock').checked = editor.layer.alphaLock;
+    if (await ask('layer-dialog') === 'ok') editor.setLayerProperties($<HTMLInputElement>('layer-name').value, Number($<HTMLInputElement>('layer-opacity').value), $<HTMLInputElement>('layer-visible').checked, $<HTMLInputElement>('layer-alpha-lock').checked);
   } else if (command === 'shortcuts' || command === 'about') await ask(`${command}-dialog`);
   tools.commitText();
 }
@@ -881,6 +890,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     event.preventDefault();
   }
   if (editing() && event.key !== 'Escape') return;
+  if (event.key === 'Alt') event.preventDefault();
   if (event.target instanceof HTMLSelectElement && !ctrl && event.key !== 'Escape') return;
   if (ctrl && key === 'n') { event.preventDefault(); void run(editor, tools, 'new'); }
   else if (ctrl && key === 'o') { event.preventDefault(); void run(editor, tools, 'open'); }
@@ -902,7 +912,7 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   else if (event.key === 'F4') { event.preventDefault(); void run(editor, tools, 'layer-properties'); }
   else if (event.key === 'Escape') {
     if (document.activeElement?.classList.contains('document-rename')) return;
-    if (!$('color-picker').hidden) closeColorPicker();
+    if (!$('color-picker').hidden) closeColorPicker(editor);
     else if (!$('context-menu').hidden) closeContext();
     else if (editor.float) editor.cancelFloat();
     else editor.deselect();
@@ -1266,6 +1276,10 @@ function sync(editor: Editor): void {
   const alphaSlider = $<HTMLInputElement>('alpha-slider');
   if (document.activeElement !== alphaSlider) alphaSlider.value = String(alphaOf(editor.primary));
   $('alpha-preview').style.setProperty('--alpha-color', rgbOf(editor.primary));
+  const recent = $('recent-colors');
+  recent.innerHTML = editor.recent.map(color => `<button type="button" data-color="${color}" style="background:${color}" aria-label="${color}"></button>`).join('');
+  recent.hidden = editor.recent.length === 0;
+  $('palette-divider').hidden = editor.recent.length === 0;
   $('palette').innerHTML = editor.palette.map(color => `<button type="button" data-color="${color}" style="background:${color}" aria-label="${color}"></button>`).join('');
   $('layer-list').innerHTML = layerMarkup(editor);
   $('history-list').innerHTML = doc ? doc.labels.map((label, index) => `<li><button type="button" class="history-item" data-cursor="${index}" ${index === doc.cursor ? 'aria-current="true"' : ''}>${label}</button></li>`).join('') : '';
@@ -1281,10 +1295,18 @@ function extraOptions(editor: Editor): string {
     parts.push(`<label class="option">Opacity <input id="opacity-slider" type="range" min="1" max="100" value="${editor.opacity}" /></label>`);
   }
   if (tool === 'brush' || tool === 'eraser') {
-    parts.push(`<label class="option">Brush <select id="brush-select">${['plain', 'circle', 'squares', 'splatter', 'slash', 'grid'].map(id => `<option value="${id}" ${id === editor.brush ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
+    const brushes = tool === 'brush' ? ['plain', 'circle', 'squares', 'splatter', 'slash', 'grid', 'smudge'] : ['plain', 'circle', 'squares', 'splatter', 'slash', 'grid'];
+    parts.push(`<label class="option">Brush <select id="brush-select">${brushes.map(id => `<option value="${id}" ${id === editor.brush ? 'selected' : ''}>${id === 'smudge' ? 'Smudge' : id}</option>`).join('')}</select></label>`);
+  }
+  if (tool === 'brush' || tool === 'pen' || tool === 'pencil') {
+    const symmetryLabels = { off: 'Off', vertical: 'Vertical', horizontal: 'Horizontal', orthogonal: 'Orthogonal' } as const;
+    parts.push(`<label class="option">Symmetry <select id="symmetry-select">${(['off', 'vertical', 'horizontal', 'orthogonal'] as const).map(id => `<option value="${id}" ${id === editor.symmetry ? 'selected' : ''}>${symmetryLabels[id]}</option>`).join('')}</select></label>`);
   }
   if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
   if (tool === 'bucket' || tool === 'wand' || tool === 'recolor') parts.push(`<label class="option">Tolerance <input id="tolerance-slider" type="range" min="0" max="100" value="${editor.tolerance}" /></label>`);
+  if (tool === 'wand') parts.push(`<label class="check"><input id="wand-contiguous" type="checkbox" ${editor.wandContiguous ? 'checked' : ''}/> Contiguous</label>`);
+  if (tool === 'bucket' || tool === 'wand' || tool === 'picker') parts.push(`<label class="check"><input id="sample-all" type="checkbox" ${editor.sampleAll ? 'checked' : ''}/> All layers</label>`);
+  if (tool === 'picker') parts.push(`<label class="option">Sample <input id="sample-size" type="range" min="1" max="200" value="${editor.sampleSize}" /></label>`);
   if (tool === 'recolor') parts.push(`<label class="check"><input id="recolor-global" type="checkbox" ${editor.recolorGlobal ? 'checked' : ''}/> Global</label>`);
   if (tool === 'rectangle' || tool === 'rounded' || tool === 'ellipse' || tool === 'lasso-draw') {
     parts.push(`<label class="option">Style <select id="shape-select"><option value="outline">Outline</option><option value="fill" ${editor.shape === 'fill' ? 'selected' : ''}>Fill</option><option value="both" ${editor.shape === 'both' ? 'selected' : ''}>Fill and outline</option></select></label>`);
@@ -1295,7 +1317,11 @@ function extraOptions(editor: Editor): string {
     parts.push(`<label class="check"><input id="alias-check" type="checkbox" ${editor.antialias ? 'checked' : ''}/> Antialias</label>`);
   }
   if (tool === 'gradient') parts.push(`<label class="option">Kind <select id="gradient-select">${['linear', 'radial', 'diamond', 'conical'].map(id => `<option value="${id}" ${id === editor.gradient ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
-  if (tool === 'text') parts.push(`<label class="option">Font <input id="font-input" type="text" value="${editor.font}" /></label>`);
+  if (tool === 'text') {
+    parts.push(`<label class="option">Font <input id="font-input" type="text" value="${editor.font}" /></label>`);
+    parts.push(`<label class="option">Style <select id="text-style"><option value="fill" ${editor.textStyle === 'fill' ? 'selected' : ''}>Fill</option><option value="stroke" ${editor.textStyle === 'stroke' ? 'selected' : ''}>Stroke</option><option value="both" ${editor.textStyle === 'both' ? 'selected' : ''}>Fill & stroke</option></select></label>`);
+    parts.push(`<label class="option">Stroke <input id="stroke-width" type="range" min="1" max="64" value="${editor.strokeWidth}" /></label>`);
+  }
   if (tool === 'lighten' || tool === 'darken') {
     parts.push(`<label class="option">Amount <input id="tone-amount" type="range" min="1" max="100" value="${editor.toneAmount}" /></label>`);
     parts.push(`<label class="option">Rate <input id="tone-rate" type="range" min="0" max="10" step="1" value="${editor.toneRate}" /></label>`);
@@ -1320,6 +1346,10 @@ function bindExtra(editor: Editor): void {
   };
   listen('opacity-slider', value => { editor.opacity = Number(value); });
   listen('brush-select', value => { editor.brush = value as Editor['brush']; });
+  listen('symmetry-select', value => { editor.symmetry = value === 'vertical' || value === 'horizontal' || value === 'orthogonal' ? value : 'off'; });
+  listen('sample-size', value => { editor.sampleSize = Math.max(1, Math.min(200, Number(value) || 1)); });
+  listen('stroke-width', value => { editor.strokeWidth = Math.max(1, Math.min(64, Number(value) || 1)); });
+  listen('text-style', value => { editor.textStyle = value === 'stroke' || value === 'both' ? value : 'fill'; });
   listen('eraser-select', value => { editor.eraser = value === 'soft' ? 'soft' : 'hard'; });
   listen('tolerance-slider', value => { editor.tolerance = Number(value); });
   listen('shape-select', value => { editor.shape = value as Editor['shape']; });
@@ -1354,6 +1384,12 @@ function bindExtra(editor: Editor): void {
   });
   document.getElementById('alias-check')?.addEventListener('change', event => {
     editor.antialias = (event.target as HTMLInputElement).checked;
+  });
+  document.getElementById('wand-contiguous')?.addEventListener('change', event => {
+    editor.wandContiguous = (event.target as HTMLInputElement).checked;
+  });
+  document.getElementById('sample-all')?.addEventListener('change', event => {
+    editor.sampleAll = (event.target as HTMLInputElement).checked;
   });
 }
 
@@ -1470,11 +1506,15 @@ function solidColor(hex: string): string {
   return `#${(full.slice(0, 6) || '000000').padEnd(6, '0')}`;
 }
 
-function closeColorPicker(): void {
+function closeColorPicker(editor?: Editor): void {
+  const panel = $('color-picker');
+  if (panel.hidden) return;
   const hex = $<HTMLInputElement>('color-hex');
   if (document.activeElement === hex) hex.blur();
+  if (editor && pickerSlot) editor.remember(editor[pickerSlot]);
   pickerSlot = null;
-  $('color-picker').hidden = true;
+  panel.hidden = true;
+  editor?.notify();
 }
 
 function openColorPicker(editor: Editor, slot: 'primary' | 'secondary', anchor: HTMLElement): void {
@@ -1502,7 +1542,7 @@ function bindColorPicker(editor: Editor): void {
   document.querySelectorAll<HTMLButtonElement>('[data-color-slot]').forEach(button => {
     button.addEventListener('click', () => {
       const slot = button.dataset.colorSlot === 'secondary' ? 'secondary' : 'primary';
-      if (pickerSlot === slot && !$('color-picker').hidden) closeColorPicker();
+      if (pickerSlot === slot && !$('color-picker').hidden) closeColorPicker(editor);
       else openColorPicker(editor, slot, button);
     });
   });

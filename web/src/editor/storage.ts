@@ -11,6 +11,7 @@ export interface StoredLayer {
   clip?: boolean;
   tag?: string | null;
   parent?: number | null;
+  alphaLock?: boolean;
   png: Blob;
 }
 

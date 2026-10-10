@@ -55,6 +55,8 @@
               </label>
               <button type="button" class="icon-button swap" id="swap-colors" title="Swap colors (X)" aria-label="Swap colors"><i data-lucide="move-diagonal"></i></button>
             </div>
+            <div id="recent-colors" class="palette" hidden aria-label="Recent colors"></div>
+            <div id="palette-divider" class="palette-divider" hidden></div>
             <div id="palette" class="palette" aria-label="Palette"></div>
             <label class="alpha-control">
               <span id="alpha-preview" class="alpha-checker"></span>
@@ -217,6 +219,7 @@
         <label>Name <input id="layer-name" type="text" required /></label>
         <label>Opacity <input id="layer-opacity" type="number" min="0" max="100" required /></label>
         <label class="check"><input id="layer-visible" type="checkbox" /> Visible</label>
+        <label class="check"><input id="layer-alpha-lock" type="checkbox" /> Lock transparent pixels</label>
         <div class="dialog-actions">
           <button type="submit" value="cancel">Cancel</button>
           <button type="submit" id="layer-ok" value="ok">OK</button>

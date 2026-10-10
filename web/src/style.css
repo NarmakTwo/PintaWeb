@@ -466,6 +466,15 @@ kbd, .shortcut {
   gap: 2px;
 }
 
+#recent-colors[hidden],
+.palette-divider[hidden] { display: none; }
+
+.palette-divider {
+  height: 1px;
+  margin: 8px 0 0;
+  background: var(--line);
+}
+
 .palette button {
   width: 16px;
   height: 16px;
