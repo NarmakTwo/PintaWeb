@@ -1,6 +1,6 @@
 import { PixelEngine, rgba, type Rgba } from '../wasm/engine.ts';
 import { canvasToPng, clearFileHandles, clearSession, downloadBlob, encodeBmp, forgetFileHandle, loadFileHandles, loadSession, saveSession, type SessionRecord } from './storage.ts';
-import { zipStore } from './zip.ts';
+import { unzip, zipStore } from './zip.ts';
 import type { Guide } from './adjust.ts';
 import {
   boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask, TOOLS,
@@ -136,6 +136,22 @@ function bytesToBase64(bytes: Uint8Array): string {
     text += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
   }
   return btoa(text);
+}
+
+function base64ToBytes(text: string): Uint8Array {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[]): T | null {
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : null;
+}
+
+async function bitmapFromPng(bytes: Uint8Array): Promise<ImageBitmap> {
+  const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  return createImageBitmap(new Blob([copy], { type: 'image/png' }));
 }
 
 export class Editor {
@@ -1859,13 +1875,34 @@ export class Editor {
 
   async exportPinta(filename: string, handle: FileSystemFileHandle | null = null): Promise<void> {
     const doc = this.doc;
-    if (!doc) return;
-    this.cancelFloat();
+    const archive = await this.archiveDocument(this.index);
+    if (!doc || !archive) return;
+    if (handle) {
+      const writable = await handle.createWritable();
+      await writable.write(archive);
+      await writable.close();
+    } else downloadBlob(archive, filename);
+    doc.fileBase = filename.replace(/\.[^.]+$/, '') || doc.fileBase;
+    doc.fileMime = 'application/pinta';
+    doc.name = filename;
+    doc.savedCursor = doc.cursor;
+    this.notify();
+  }
+
+  async archiveDocument(index: number): Promise<Blob | null> {
+    const doc = this.docs[index];
+    if (!doc) return null;
+    if (index === this.index) this.cancelFloat();
     const files: { name: string; data: Uint8Array }[] = [];
     const layerFiles = [];
     for (const layer of doc.layers) {
       const file = `${layer.id}.png`;
       files.push({ name: file, data: new Uint8Array(await (await canvasToPng(layer.canvas)).arrayBuffer()) });
+      let mask: string | undefined;
+      if (layer.mask) {
+        mask = `masks/${layer.id}.png`;
+        files.push({ name: mask, data: new Uint8Array(await (await canvasToPng(layer.mask)).arrayBuffer()) });
+      }
       layerFiles.push({
         id: layer.id,
         name: layer.name,
@@ -1877,15 +1914,16 @@ export class Editor {
         parent: layer.parent,
         alphaLock: layer.alphaLock,
         file,
+        mask,
       });
     }
     const history = [];
     for (let step = 0; step < doc.snapshots.length; step++) {
       const snapshot = doc.snapshots[step];
       const layers = [];
-      for (let index = 0; index < snapshot.layers.length; index++) {
-        const layer = snapshot.layers[index];
-        const file = `history/${step}/${index}.png`;
+      for (let layerIndex = 0; layerIndex < snapshot.layers.length; layerIndex++) {
+        const layer = snapshot.layers[layerIndex];
+        const file = `history/${step}/${layerIndex}.png`;
         const canvas = document.createElement('canvas');
         canvas.width = snapshot.width;
         canvas.height = snapshot.height;
@@ -1925,43 +1963,218 @@ export class Editor {
         zoom: doc.zoom,
         selection: doc.selection ? bytesToBase64(doc.selection) : null,
       },
-      settings: {
-        primary: this.primary,
-        secondary: this.secondary,
-        palette: this.palette,
-        tool: this.tool,
-        size: this.size,
-        opacity: this.opacity,
-        tolerance: this.tolerance,
-        brush: this.brush,
-        shape: this.shape,
-        selectionMode: this.selectionMode,
-        antialias: this.antialias,
-        lineMode: this.lineMode,
-        gradient: this.gradient,
-        corner: this.corner,
-        eraser: this.eraser,
-        font: this.font,
-        unit: this.unit,
-        gridSize: this.gridSize,
-        show: this.show,
-      },
+      settings: this.settingsRecord(),
       groups: doc.groups.map(group => ({ ...group })),
       layers: layerFiles,
       history: { cursor: doc.cursor, steps: history },
     };
     files.unshift({ name: 'manifest.json', data: new TextEncoder().encode(JSON.stringify(manifest)) });
-    const archive = zipStore(files);
-    if (handle) {
-      const writable = await handle.createWritable();
-      await writable.write(archive);
-      await writable.close();
-    } else downloadBlob(archive, filename);
-    doc.fileBase = filename.replace(/\.[^.]+$/, '') || doc.fileBase;
-    doc.fileMime = 'application/pinta';
-    doc.name = filename;
-    doc.savedCursor = doc.cursor;
-    this.notify();
+    return zipStore(files);
+  }
+
+  settingsRecord(): Record<string, unknown> {
+    return {
+      tool: this.tool,
+      primary: this.primary,
+      secondary: this.secondary,
+      palette: [...this.palette],
+      recent: [...this.recent],
+      size: this.size,
+      opacity: this.opacity,
+      tolerance: this.tolerance,
+      brush: this.brush,
+      shape: this.shape,
+      selectionMode: this.selectionMode,
+      antialias: this.antialias,
+      lineMode: this.lineMode,
+      gradient: this.gradient,
+      corner: this.corner,
+      eraser: this.eraser,
+      font: this.font,
+      textStyle: this.textStyle,
+      strokeWidth: this.strokeWidth,
+      toneAmount: this.toneAmount,
+      toneRate: this.toneRate,
+      randomLow: this.randomLow,
+      randomHigh: this.randomHigh,
+      randomRate: this.randomRate,
+      randomAlpha: this.randomAlpha,
+      recolorGlobal: this.recolorGlobal,
+      wandContiguous: this.wandContiguous,
+      sampleAll: this.sampleAll,
+      sampleSize: this.sampleSize,
+      symmetry: this.symmetry,
+      unserrate: { ...this.unserrate },
+      smoothing: { ...this.smoothing },
+      smoothEdges: this.smoothEdges,
+      unit: this.unit,
+      gridSize: this.gridSize,
+      gridKind: this.gridKind,
+      snap: this.snap,
+      show: { ...this.show },
+      viewAngle: this.viewAngle,
+    };
+  }
+
+  applySettings(raw: unknown): void {
+    if (!raw || typeof raw !== 'object') return;
+    const data = raw as Record<string, unknown>;
+    const tool = oneOf(data.tool, TOOLS.map(item => item.id));
+    if (tool) this.tool = tool;
+    if (typeof data.primary === 'string') this.primary = data.primary;
+    if (typeof data.secondary === 'string') this.secondary = data.secondary;
+    if (Array.isArray(data.palette) && data.palette.every(color => typeof color === 'string') && data.palette.length) this.palette = data.palette;
+    if (Array.isArray(data.recent) && data.recent.every(color => typeof color === 'string')) this.recent = data.recent;
+    if (typeof data.size === 'number') this.size = data.size;
+    if (typeof data.opacity === 'number') this.opacity = data.opacity;
+    if (typeof data.tolerance === 'number') this.tolerance = data.tolerance;
+    const brush = oneOf(data.brush, ['plain', 'circle', 'squares', 'splatter', 'slash', 'grid', 'smudge'] as const);
+    if (brush) this.brush = brush;
+    const shape = oneOf(data.shape, ['outline', 'fill', 'both'] as const);
+    if (shape) this.shape = shape;
+    const selectionMode = oneOf(data.selectionMode, ['replace', 'union', 'exclude', 'xor', 'intersect'] as const);
+    if (selectionMode) this.selectionMode = selectionMode;
+    if (typeof data.antialias === 'boolean') this.antialias = data.antialias;
+    const lineMode = oneOf(data.lineMode, ['straight', 'curve'] as const);
+    if (lineMode) this.lineMode = lineMode;
+    const gradient = oneOf(data.gradient, ['linear', 'radial', 'diamond', 'conical'] as const);
+    if (gradient) this.gradient = gradient;
+    if (typeof data.corner === 'number') this.corner = data.corner;
+    const eraser = oneOf(data.eraser, ['hard', 'soft'] as const);
+    if (eraser) this.eraser = eraser;
+    if (typeof data.font === 'string') this.font = data.font;
+    const textStyle = oneOf(data.textStyle, ['fill', 'stroke', 'both'] as const);
+    if (textStyle) this.textStyle = textStyle;
+    if (typeof data.strokeWidth === 'number') this.strokeWidth = data.strokeWidth;
+    if (typeof data.toneAmount === 'number') this.toneAmount = data.toneAmount;
+    if (typeof data.toneRate === 'number') this.toneRate = data.toneRate;
+    if (typeof data.randomLow === 'number') this.randomLow = data.randomLow;
+    if (typeof data.randomHigh === 'number') this.randomHigh = data.randomHigh;
+    if (typeof data.randomRate === 'number') this.randomRate = data.randomRate;
+    if (typeof data.randomAlpha === 'boolean') this.randomAlpha = data.randomAlpha;
+    if (typeof data.recolorGlobal === 'boolean') this.recolorGlobal = data.recolorGlobal;
+    if (typeof data.wandContiguous === 'boolean') this.wandContiguous = data.wandContiguous;
+    if (typeof data.sampleAll === 'boolean') this.sampleAll = data.sampleAll;
+    if (typeof data.sampleSize === 'number') this.sampleSize = data.sampleSize;
+    const symmetry = oneOf(data.symmetry, ['off', 'vertical', 'horizontal', 'orthogonal'] as const);
+    if (symmetry) this.symmetry = symmetry;
+    const smoothKeys = ['brush', 'eraser', 'pen', 'pencil', 'dither', 'recolor', 'random', 'lighten', 'darken'] as const;
+    if (data.unserrate && typeof data.unserrate === 'object') {
+      const source = data.unserrate as Record<string, unknown>;
+      for (const key of smoothKeys) if (typeof source[key] === 'boolean') this.unserrate[key] = source[key];
+    }
+    if (data.smoothing && typeof data.smoothing === 'object') {
+      const source = data.smoothing as Record<string, unknown>;
+      for (const key of smoothKeys) if (typeof source[key] === 'number') this.smoothing[key] = source[key];
+    }
+    if (typeof data.smoothEdges === 'boolean') this.smoothEdges = data.smoothEdges;
+    const unit = oneOf(data.unit, ['px', 'in', 'cm'] as const);
+    if (unit) this.unit = unit;
+    if (typeof data.gridSize === 'number') this.gridSize = data.gridSize;
+    const gridKind = oneOf(data.gridKind, ['square', 'iso'] as const);
+    if (gridKind) this.gridKind = gridKind;
+    if (typeof data.snap === 'boolean') this.snap = data.snap;
+    if (data.show && typeof data.show === 'object') {
+      const show = data.show as Record<string, unknown>;
+      for (const key of ['rulers', 'status', 'tools', 'toolbar', 'docks', 'tabs', 'grid'] as const) {
+        if (typeof show[key] === 'boolean') this.show[key] = show[key];
+      }
+    }
+    if (typeof data.viewAngle === 'number') this.setViewAngle(data.viewAngle, true);
+  }
+
+  async installArchives(archives: Uint8Array[], active: number): Promise<void> {
+    this.restoring = true;
+    try {
+      this.cancelFloat();
+      this.float = null;
+      for (const doc of this.docs) void forgetFileHandle(doc.id);
+      this.docs = [];
+      this.index = -1;
+      for (const bytes of archives) await this.readPinta(bytes);
+      this.index = this.docs.length ? Math.max(0, Math.min(active, this.docs.length - 1)) : -1;
+      this.syncSize();
+      this.rebuildEdges();
+      this.renderScene();
+      this.notify();
+    } finally {
+      this.restoring = false;
+    }
+    this.scheduleSave();
+  }
+
+  private async readPinta(bytes: Uint8Array): Promise<boolean> {
+    const files = await unzip(bytes);
+    const raw = files.get('manifest.json');
+    if (!raw) return false;
+    let manifest: { format?: string; document?: { name?: string; width?: number; height?: number; active?: number; zoom?: number; selection?: string | null }; groups?: LayerGroup[]; layers?: Array<Record<string, unknown>> };
+    try { manifest = JSON.parse(new TextDecoder().decode(raw)); } catch { return false; }
+    if (manifest.format !== 'pinta' || !manifest.document) return false;
+    const info = manifest.document;
+    const width = Number(info.width);
+    const height = Number(info.height);
+    if (!width || !height || width * height > MAX_PIXELS) return false;
+    const before = this.docs.length;
+    try {
+      const doc = this.blank(width, height, typeof info.name === 'string' && info.name ? info.name : 'Untitled');
+      this.docs.push(doc);
+      this.index = this.docs.length - 1;
+      doc.zoom = Number(info.zoom) || 1;
+      if (typeof info.selection === 'string') {
+        const selection = base64ToBytes(info.selection);
+        if (selection.length === width * height) doc.selection = selection;
+      }
+      doc.groups = Array.isArray(manifest.groups) ? manifest.groups.filter(group => group && typeof group === 'object').map(group => ({
+        id: Number(group.id) || 0,
+        name: String(group.name || 'Group'),
+        visible: group.visible !== false,
+        collapsed: !!group.collapsed,
+        tag: group.tag ?? null,
+        parent: group.parent ?? null,
+      })) : [];
+      doc.layers = [];
+      for (const layer of manifest.layers ?? []) {
+        const file = typeof layer.file === 'string' ? files.get(layer.file) : undefined;
+        if (!file) continue;
+        const bitmap = await bitmapFromPng(file);
+        const created = this.makeLayer(typeof layer.name === 'string' ? layer.name : 'Layer', layer.visible !== false, Number(layer.opacity) || 100);
+        created.blend = BLEND_MODES.includes(layer.blend as BlendMode) ? layer.blend as BlendMode : 'normal';
+        created.clip = !!layer.clip;
+        created.tag = typeof layer.tag === 'string' ? layer.tag : null;
+        created.parent = typeof layer.parent === 'number' ? layer.parent : null;
+        created.alphaLock = !!layer.alphaLock;
+        created.canvas.width = width;
+        created.canvas.height = height;
+        created.ctx = context2d(created.canvas);
+        created.ctx.drawImage(bitmap, 0, 0, width, height);
+        bitmap.close();
+        const maskName = typeof layer.mask === 'string' ? layer.mask : '';
+        const maskBytes = maskName ? files.get(maskName) : undefined;
+        if (maskBytes) {
+          const maskBitmap = await bitmapFromPng(maskBytes);
+          const mask = document.createElement('canvas');
+          mask.width = width;
+          mask.height = height;
+          const maskCtx = context2d(mask);
+          maskCtx.drawImage(maskBitmap, 0, 0, width, height);
+          maskBitmap.close();
+          created.mask = mask;
+          created.maskCtx = maskCtx;
+        }
+        doc.layers.push(created);
+      }
+      if (!doc.layers.length) doc.layers = [this.makeLayer('Layer 1', true, 100)];
+      doc.active = Math.max(0, Math.min(Number(info.active) || 0, doc.layers.length - 1));
+      doc.snapshots = [this.capture()];
+      doc.labels = ['Imported'];
+      doc.cursor = 0;
+      doc.savedCursor = 0;
+      return true;
+    } catch {
+      this.docs.splice(before);
+      this.index = this.docs.length - 1;
+      return false;
+    }
   }
 
   scheduleSave(): void {

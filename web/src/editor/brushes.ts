@@ -68,6 +68,7 @@ export interface BrushPreset {
   stabilizer: number;
   settle: boolean;
   category: string | null;
+  pinned: boolean;
 }
 
 export interface StrokeSample {
@@ -134,6 +135,7 @@ function preset(partial: Pick<BrushPreset, 'id' | 'name' | 'tab' | 'tip'> & Part
     stabilizer: 0,
     settle: false,
     category: null,
+    pinned: false,
     ...partial,
   };
 }
@@ -163,6 +165,7 @@ let libraryPruned = false;
 let categories: BrushCategory[] = [];
 let categoryOpen: Record<string, boolean> = {};
 let selected: Record<BrushTab, string> = { paint: 'factory-plain', smudge: 'factory-smudge', erase: 'factory-hard' };
+let recent: Record<BrushTab, string[]> = { paint: [], smudge: [], erase: [] };
 let tab: BrushTab = 'paint';
 let editing = false;
 let serial = 0;
@@ -210,8 +213,28 @@ function mark(): void {
   serial += 1;
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
-    void saveBrushRecord({ presets, selected, tab, categories, prunedLoose: libraryPruned }).catch(() => undefined);
+    void saveBrushRecord(exportBrushRecord()).catch(() => undefined);
   }, 200);
+}
+
+export function exportBrushRecord(): unknown {
+  return { presets, selected, tab, categories, recent, prunedLoose: libraryPruned };
+}
+
+export async function importBrushRecord(record: unknown): Promise<void> {
+  window.clearTimeout(saveTimer);
+  await saveBrushRecord(record);
+  await loadBrushes();
+}
+
+export function refreshBrushLibrary(editor: Editor): void {
+  const panel = document.getElementById('brush-panel');
+  if (panel && !panel.hidden) {
+    editing = false;
+    renderPanel();
+  }
+  refreshBrushPreview(editor);
+  paintBrushMark(editor);
 }
 
 function factoryBrush(item: BrushPreset): boolean {
@@ -220,13 +243,13 @@ function factoryBrush(item: BrushPreset): boolean {
 
 export async function loadBrushes(): Promise<void> {
   try {
-    const raw = await loadBrushRecord() as { presets?: BrushPreset[]; selected?: Record<BrushTab, string>; tab?: BrushTab; categories?: BrushCategory[]; prunedLoose?: boolean } | null;
+    const raw = await loadBrushRecord() as { presets?: BrushPreset[]; selected?: Record<BrushTab, string>; tab?: BrushTab; categories?: BrushCategory[]; prunedLoose?: boolean; recent?: Partial<Record<BrushTab, string[]>> } | null;
     if (!raw?.presets?.length) {
       libraryPruned = true;
       return;
     }
     presets = raw.presets.map(item => ({ ...preset({ id: item.id, name: item.name, tab: item.tab, tip: item.tip }), ...item, category: item.category ?? null }));
-    categories = Array.isArray(raw.categories) ? raw.categories.filter(item => item && (item.tab === 'paint' || item.tab === 'smudge' || item.tab === 'erase') && item.id && item.name).map(item => ({ id: item.id, name: item.name, tab: item.tab, openByDefault: item.openByDefault !== false })) : [];
+    categories = Array.isArray(raw.categories) ? raw.categories.filter(item => item && (item.tab === 'paint' || item.tab === 'smudge' || item.tab === 'erase') && item.id && item.name).map(item => ({ id: item.id, name: item.name, tab: item.tab, openByDefault: item.openByDefault === true })) : [];
     let changed = false;
     for (const factory of factories()) {
       if (presets.some(item => item.id === factory.id)) continue;
@@ -244,6 +267,12 @@ export async function loadBrushes(): Promise<void> {
     }
     if (raw.selected) selected = { ...selected, ...raw.selected };
     if (raw.tab) tab = raw.tab;
+    if (raw.recent) {
+      for (const name of TABS) {
+        const ids = raw.recent[name];
+        if (Array.isArray(ids)) recent[name] = ids.filter(id => typeof id === 'string' && presets.some(item => item.id === id)).slice(0, 8);
+      }
+    }
     for (const name of TABS) {
       if (!presets.some(item => item.id === selected[name] && item.tab === name)) {
         const fallback = presets.find(item => item.tab === name);
@@ -1123,10 +1152,38 @@ function applyCategoryDefaults(): void {
   categoryOpen = Object.fromEntries(categories.map(category => [category.id, category.openByDefault]));
 }
 
-function brushRow(item: BrushPreset, currentId: string): string {
+function brushQuery(): string {
+  return document.querySelector<HTMLInputElement>('#brush-search')?.value.trim().toLowerCase() ?? '';
+}
+
+function brushMatches(item: BrushPreset, query: string): boolean {
+  return !query || item.name.toLowerCase().includes(query);
+}
+
+function rememberBrush(id: string): void {
+  const item = presets.find(row => row.id === id);
+  if (!item) return;
+  recent[item.tab] = [id, ...recent[item.tab].filter(row => row !== id)].slice(0, 8);
+}
+
+function forgetBrush(id: string): void {
+  for (const name of TABS) recent[name] = recent[name].filter(row => row !== id);
+}
+
+function focusBrushSearch(): void {
+  if (editing) return;
+  const field = document.querySelector<HTMLInputElement>('#brush-search');
+  if (!field) return;
+  field.focus();
+  field.select();
+}
+
+function brushRow(item: BrushPreset, currentId: string, shortcut = false): string {
   const missing = item.tip === 'image' && (item.tipMissing || (item.tipImage ? imageCache.get(item.tipImage) === 'missing' : false));
   const remove = factoryBrush(item) ? '' : `<button type="button" class="brush-icon brush-delete" data-preset-delete="${item.id}" aria-label="Delete brush">${TRASH}</button>`;
-  return `<div class="brush-row" data-preset="${item.id}" data-drop-category="${escapeHtml(categoryOf(item) ?? '')}" aria-pressed="${item.id === currentId}"><button type="button" data-preset-use="${item.id}">${escapeHtml(item.name)}${missing ? ' Missing' : ''}</button><button type="button" class="brush-icon" data-preset-edit="${item.id}" aria-label="Edit brush">${PENCIL}</button>${remove}</div>`;
+  const pressed = !shortcut && item.id === currentId;
+  const drop = shortcut ? '' : ` data-drop-category="${escapeHtml(categoryOf(item) ?? '')}"`;
+  return `<div class="brush-row${shortcut ? ' brush-shortcut' : ''}" data-preset="${item.id}"${drop} aria-pressed="${pressed}"><button type="button" data-preset-use="${item.id}">${escapeHtml(item.name)}${missing ? ' Missing' : ''}</button><button type="button" class="brush-icon" data-preset-edit="${item.id}" aria-label="Edit brush">${PENCIL}</button>${remove}</div>`;
 }
 
 function renderPanel(): void {
@@ -1138,16 +1195,26 @@ function renderPanel(): void {
   });
   list.hidden = editing;
   edit.hidden = !editing;
+  const bar = document.querySelector<HTMLElement>('.brush-list-bar');
+  if (bar) bar.hidden = editing;
   const rows = presets.filter(item => item.tab === tab);
   const current = currentPreset();
+  const query = brushQuery();
   if (!editing) {
-    const loose = rows.filter(item => !categoryOf(item)).map(item => brushRow(item, current.id)).join('');
+    const visible = (item: BrushPreset) => brushMatches(item, query);
+    const loose = rows.filter(item => !categoryOf(item) && visible(item)).map(item => brushRow(item, current.id)).join('');
     const blocks = categories.filter(category => category.tab === tab).map(category => {
-      const open = categoryOpen[category.id] ?? category.openByDefault;
-      const body = rows.filter(item => categoryOf(item) === category.id).map(item => brushRow(item, current.id)).join('');
+      const body = rows.filter(item => categoryOf(item) === category.id && visible(item)).map(item => brushRow(item, current.id)).join('');
+      if (query && !body) return '';
+      const open = query ? true : (categoryOpen[category.id] ?? category.openByDefault);
       return `<section class="brush-category"><button type="button" class="brush-category-head" data-category-id="${category.id}" data-drop-category="${category.id}" aria-expanded="${open}">${CHEVRON}<span>${escapeHtml(category.name)}</span></button><div class="brush-category-body" data-drop-category="${category.id}" ${open ? '' : 'hidden'}>${body}</div></section>`;
     }).join('');
-    list.innerHTML = `<div class="brush-list-bar"><button type="button" id="brush-add" aria-label="New brush">${PLUS}</button><button type="button" id="brush-upload" aria-label="Import brushes">${UPLOAD}</button></div><div class="brush-loose" data-drop-category="">${loose}</div>${blocks}`;
+    const pins = query ? '' : rows.filter(item => item.pinned).map(item => brushRow(item, current.id, true)).join('');
+    const lately = query ? '' : recent[tab].map(id => rows.find(item => item.id === id)).filter((item): item is BrushPreset => !!item).map(item => brushRow(item, current.id, true)).join('');
+    const pinBlock = pins ? `<div class="brush-section">Pinned</div><div class="brush-pinned">${pins}</div>` : '';
+    const recentBlock = lately ? `<div class="brush-section">Recent</div><div class="brush-recent">${lately}</div>` : '';
+    const empty = query && !loose && !blocks ? '<p class="brush-empty">No matching brushes.</p>' : '';
+    list.innerHTML = `${pinBlock}${recentBlock}${empty}<div class="brush-loose" data-drop-category="">${loose}</div>${blocks}`;
     return;
   }
   const hideWet = tab === 'erase';
@@ -1252,6 +1319,7 @@ async function deleteBrush(editor: Editor, id: string): Promise<void> {
   }
   if (!await confirmChoice(`Delete ${item.name}?`, 'Delete this brush?', 'Delete', 'Cancel')) return;
   presets = presets.filter(row => row.id !== id);
+  forgetBrush(id);
   if (selected[item.tab] === id) selected[item.tab] = presets.find(row => row.tab === item.tab)?.id ?? selected[item.tab];
   mark();
   renderPanel();
@@ -1278,6 +1346,7 @@ async function deleteCategory(editor: Editor, id: string): Promise<void> {
   presets = kept;
   categories = categories.filter(item => item.id !== id);
   delete categoryOpen[id];
+  for (const name of TABS) recent[name] = recent[name].filter(brushId => presets.some(item => item.id === brushId));
   if (!presets.some(item => item.id === selected[category.tab] && item.tab === category.tab)) {
     selected[category.tab] = presets.find(item => item.tab === category.tab)?.id ?? selected[category.tab];
   }
@@ -1292,7 +1361,7 @@ function newCategory(): void {
   const name = window.prompt('Category name')?.replace(/\s+/g, ' ').trim();
   if (!name) return;
   const id = `category-${Date.now()}`;
-  categories.push({ id, name, tab, openByDefault: true });
+  categories.push({ id, name, tab, openByDefault: false });
   categoryOpen[id] = true;
   mark();
   renderPanel();
@@ -1300,6 +1369,7 @@ function newCategory(): void {
 
 function showCategoryMenu(x: number, y: number, categoryId: string | null, editor: Editor): void {
   document.getElementById('brush-category-menu')?.remove();
+  document.getElementById('brush-menu')?.remove();
   const category = categories.find(item => item.id === categoryId);
   const menu = document.createElement('div');
   menu.id = 'brush-category-menu';
@@ -1323,6 +1393,30 @@ function showCategoryMenu(x: number, y: number, categoryId: string | null, edito
       found.openByDefault = !found.openByDefault;
       mark();
     } else if (node.dataset.categoryDelete) void deleteCategory(editor, node.dataset.categoryDelete);
+  });
+}
+
+function showBrushMenu(x: number, y: number, id: string): void {
+  document.getElementById('brush-category-menu')?.remove();
+  document.getElementById('brush-menu')?.remove();
+  const item = presets.find(row => row.id === id);
+  if (!item) return;
+  const menu = document.createElement('div');
+  menu.id = 'brush-menu';
+  menu.innerHTML = `<button type="button" data-brush-pin="${item.id}">${item.pinned ? 'Unpin' : 'Pin'}</button>`;
+  document.body.append(menu);
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  const box = menu.getBoundingClientRect();
+  if (box.right > window.innerWidth - 8) menu.style.left = `${Math.max(8, window.innerWidth - box.width - 8)}px`;
+  if (box.bottom > window.innerHeight - 8) menu.style.top = `${Math.max(8, window.innerHeight - box.height - 8)}px`;
+  menu.addEventListener('click', () => {
+    const found = presets.find(row => row.id === id);
+    menu.remove();
+    if (!found) return;
+    found.pinned = !found.pinned;
+    mark();
+    renderPanel();
   });
 }
 
@@ -1356,6 +1450,7 @@ export function mountBrushes(editor: Editor): void {
       <button type="button" data-brush-tab="erase" aria-pressed="false">Erase</button>
     </div>
     <canvas id="brush-preview" width="220" height="72" aria-hidden="true"></canvas>
+    <div class="brush-list-bar"><input id="brush-search" type="search" placeholder="Search brushes" autocomplete="off" spellcheck="false" aria-label="Search brushes" /><button type="button" id="brush-add" aria-label="New brush">${PLUS}</button><button type="button" id="brush-upload" aria-label="Import brushes">${UPLOAD}</button></div>
     <div id="brush-list"></div>
     <div id="brush-edit" hidden></div>
     <input id="brush-file" type="file" accept="image/*" hidden />
@@ -1364,6 +1459,12 @@ export function mountBrushes(editor: Editor): void {
   document.body.append(panel);
   const file = panel.querySelector<HTMLInputElement>('#brush-file');
   const importFile = panel.querySelector<HTMLInputElement>('#brush-import-file');
+  panel.querySelector('#brush-search')?.addEventListener('keydown', event => {
+    if ((event as KeyboardEvent).key !== 'Enter') return;
+    event.preventDefault();
+    if (!brushQuery()) return;
+    panel.querySelector<HTMLElement>('#brush-list [data-preset-use]')?.click();
+  });
   onImageReady = () => {
     refreshBrushPreview(editor);
     paintBrushMark(editor);
@@ -1375,9 +1476,12 @@ export function mountBrushes(editor: Editor): void {
     if (editor.tool === 'eraser') tab = 'erase';
     editing = false;
     applyCategoryDefaults();
+    const field = document.querySelector<HTMLInputElement>('#brush-search');
+    if (field) field.value = '';
     renderPanel();
     refreshBrushPreview(editor);
     placePanel();
+    focusBrushSearch();
   };
   button.addEventListener('click', () => {
     if (panel.hidden) open();
@@ -1400,6 +1504,7 @@ export function mountBrushes(editor: Editor): void {
     const use = target.closest<HTMLElement>('[data-preset-use]')?.dataset.presetUse;
     if (use) {
       selected[tab] = use;
+      rememberBrush(use);
       mark();
       closeBrushPanel();
       editor.notify();
@@ -1431,13 +1536,14 @@ export function mountBrushes(editor: Editor): void {
     }
     const categoryId = target.closest<HTMLElement>('[data-category-id]')?.dataset.categoryId;
     if (categoryId) {
-      categoryOpen[categoryId] = !(categoryOpen[categoryId] ?? true);
+      categoryOpen[categoryId] = !(categoryOpen[categoryId] ?? false);
       renderPanel();
       return;
     }
     else if (target.id === 'brush-edit-back') {
       editing = false;
       renderPanel();
+      focusBrushSearch();
     } else if (target.id === 'brush-grain') {
       fileKind = 'grain';
       file?.click();
@@ -1463,6 +1569,10 @@ export function mountBrushes(editor: Editor): void {
   });
   panel.addEventListener('input', event => {
     const input = event.target as HTMLInputElement;
+    if (input.id === 'brush-search') {
+      renderPanel();
+      return;
+    }
     const value = Number(input.value);
     if (input.id === 'brush-hardness') updatePreset({ hardness: value });
     else if (input.id === 'brush-spacing') updatePreset({ spacing: value });
@@ -1517,7 +1627,7 @@ export function mountBrushes(editor: Editor): void {
             let id = groups.get(item.tab);
             if (!id) {
               id = `category-${Date.now()}-${categories.length}-${groups.size}`;
-              categories.push({ id, name: title, tab: item.tab, openByDefault: true });
+              categories.push({ id, name: title, tab: item.tab, openByDefault: false });
               categoryOpen[id] = true;
               groups.set(item.tab, id);
             }
@@ -1595,7 +1705,7 @@ export function mountBrushes(editor: Editor): void {
     suppressClick = false;
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
-    if (target.closest('[data-preset-edit], [data-preset-delete], #brush-add, #brush-upload, .brush-category-head')) return;
+    if (target.closest('[data-preset-edit], [data-preset-delete], #brush-add, #brush-upload, #brush-search, .brush-category-head, .brush-shortcut')) return;
     const row = target.closest<HTMLElement>('.brush-row');
     if (!row?.dataset.preset) return;
     dragId = row.dataset.preset;
@@ -1608,16 +1718,22 @@ export function mountBrushes(editor: Editor): void {
   });
   panel.addEventListener('contextmenu', event => {
     const target = event.target as HTMLElement;
-    if (editing || target.closest('.brush-row')) return;
+    if (editing || target.closest('#brush-search')) return;
+    const row = target.closest<HTMLElement>('.brush-row');
+    if (row?.dataset.preset) {
+      event.preventDefault();
+      showBrushMenu(event.clientX, event.clientY, row.dataset.preset);
+      return;
+    }
     const head = target.closest<HTMLElement>('[data-category-id]');
-    if (!head && !target.closest('#brush-list')) return;
+    if (!head && !target.closest('#brush-list, .brush-list-bar')) return;
     event.preventDefault();
     showCategoryMenu(event.clientX, event.clientY, head?.dataset.categoryId ?? null, editor);
   });
   document.addEventListener('pointerdown', event => {
-    const menu = document.getElementById('brush-category-menu');
-    if (!menu || menu.contains(event.target as Node)) return;
-    menu.remove();
+    document.querySelectorAll('#brush-category-menu, #brush-menu').forEach(menu => {
+      if (!menu.contains(event.target as Node)) menu.remove();
+    });
   });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && !panel.hidden) {

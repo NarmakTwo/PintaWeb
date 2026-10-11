@@ -110,6 +110,9 @@ const COMMANDS: { id: string; label: string; shortcut: string; sentence: string 
   { id: 'customize', label: 'Customize', shortcut: '', sentence: 'Rearrange the toolbox, menus, shortcuts, and docks.' },
   { id: 'file-access', label: 'Give File Access', shortcut: '', sentence: 'Save later changes straight into the opened or saved file.' },
   { id: 'install', label: 'Install Pinta', shortcut: '', sentence: 'Install Pinta on this device.' },
+  { id: 'import-config', label: 'Import Config', shortcut: '', sentence: 'Load images, brushes, and settings from a config file.' },
+  { id: 'export-config', label: 'Export Config', shortcut: '', sentence: 'Save images, brushes, and settings to a config file.' },
+  { id: 'restore-defaults', label: 'Restore to default', shortcut: '', sentence: 'Erase saved images, brushes, settings, and cached files on this site.' },
   { id: 'shortcuts', label: 'Keyboard Shortcuts', shortcut: '', sentence: 'Show the shortcut list.' },
   { id: 'about', label: 'About Pinta', shortcut: '', sentence: 'Show what this app is.' },
 ];
@@ -139,7 +142,7 @@ function defaultMenus(): Record<MenuId, string[]> {
     layers: ['layer-add', 'layer-delete', 'layer-duplicate', 'layer-merge', 'sep', 'layer-up', 'layer-down', 'sep', 'layer-flip-h', 'layer-flip-v', 'layer-rotate', 'sep', 'layer-mask', 'layer-unmask', 'layer-properties', 'import-layer'],
     adjustments: effectTokens(ADJUSTMENTS),
     effects: effectMenuTokens(),
-    window: ['toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-status', 'customize', 'sep', 'file-access', 'install'],
+    window: ['toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-status', 'customize', 'sep', 'file-access', 'install', 'sep', 'import-config', 'export-config', 'sep', 'restore-defaults'],
     help: ['shortcuts', 'about'],
   };
 }
@@ -248,6 +251,12 @@ export function loadLayout(): void {
       if (installAt >= 0) next.menus.window.splice(installAt, 0, 'file-access');
       else next.menus.window.push('file-access');
     }
+    if (Array.isArray(next.menus.window) && !next.menus.window.includes('import-config')) {
+      const installAt = next.menus.window.indexOf('install');
+      const tail = ['sep', 'import-config', 'export-config', 'sep', 'restore-defaults'];
+      if (installAt >= 0) next.menus.window.splice(installAt + 1, 0, ...tail);
+      else next.menus.window.push(...tail);
+    }
     next.menuCustom = { ...next.menuCustom, ...parsed.menuCustom };
     next.shortcuts = parsed.shortcuts ?? {};
     next.toolboxSide = parsed.toolboxSide === 'right' ? 'right' : 'left';
@@ -260,6 +269,16 @@ export function loadLayout(): void {
 function persist(): void {
   layout.custom = true;
   try { localStorage.setItem(KEY, JSON.stringify(layout)); } catch { /* storage unavailable */ }
+  emit();
+}
+
+export function adoptLayout(raw: unknown): void {
+  if (!raw || typeof raw !== 'object') {
+    resetLayout();
+    return;
+  }
+  try { localStorage.setItem(KEY, JSON.stringify(raw)); } catch { /* storage unavailable */ }
+  loadLayout();
   emit();
 }
 

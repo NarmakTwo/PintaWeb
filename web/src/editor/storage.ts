@@ -169,6 +169,31 @@ export async function clearFileHandles(): Promise<void> {
   }
 }
 
+export async function clearDatabase(): Promise<void> {
+  const db = await openDb();
+  try {
+    const names = [...db.objectStoreNames];
+    if (!names.length) return;
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(names, 'readwrite');
+      for (const name of names) tx.objectStore(name).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export function deleteDatabase(): Promise<void> {
+  return new Promise(resolve => {
+    const request = indexedDB.deleteDatabase(DB_NAME);
+    request.onsuccess = () => resolve();
+    request.onerror = () => resolve();
+    request.onblocked = () => resolve();
+  });
+}
+
 export async function clearSession(): Promise<void> {
   const db = await openDb();
   try {

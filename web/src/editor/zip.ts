@@ -67,3 +67,30 @@ export function zipStore(entries: ZipEntry[], date = new Date()): Blob {
   const parts: BlobPart[] = [...locals, ...centrals, new Uint8Array(end.buffer)];
   return new Blob(parts, { type: 'application/zip' });
 }
+
+export async function unzip(bytes: Uint8Array): Promise<Map<string, Uint8Array>> {
+  const files = new Map<string, Uint8Array>();
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  while (offset + 30 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
+    const flags = view.getUint16(offset + 6, true);
+    const method = view.getUint16(offset + 8, true);
+    const compressed = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    const start = offset + 30 + nameLength + extraLength;
+    const path = new TextDecoder().decode(bytes.subarray(offset + 30, offset + 30 + nameLength));
+    if ((flags & 8) !== 0 || start + compressed > bytes.length) break;
+    const slice = bytes.subarray(start, start + compressed);
+    offset = start + compressed;
+    if (!path || path.endsWith('/') || path.startsWith('__MACOSX/')) continue;
+    const data = method === 0 ? slice : method === 8 ? await inflate(slice) : null;
+    if (data) files.set(path, data);
+  }
+  return files;
+}
+
+async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}

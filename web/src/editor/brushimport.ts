@@ -851,6 +851,7 @@ function makePreset(patch: Pick<BrushPreset, 'name'> & Partial<BrushPreset>): Br
     stabilizer: 0,
     settle: false,
     category: null,
+    pinned: false,
     ...patch,
   };
 }

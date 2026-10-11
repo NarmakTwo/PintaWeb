@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 
 const RED_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -1667,6 +1668,71 @@ test('keeps Install Pinta in the Window menu until the browser offers it', async
   await expect(item).toBeDisabled();
 });
 
+test('exports and imports a config of images, brushes, and settings', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 32, 32);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="bucket"]').click();
+  const origin = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(origin.x, origin.y);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
+  await page.locator('#brush-library').click();
+  await page.locator('.brush-row[data-preset="factory-grid"]').click({ button: 'right' });
+  await page.locator('[data-brush-pin]').click();
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => localStorage.setItem('pinta-theme', 'dark'));
+  await page.locator('#menu-window').click();
+  const commands = await page.locator('#panel-window').evaluate(panel => [...panel.children].map(node => node.getAttribute('data-command') || (node.classList.contains('sep') ? 'sep' : '')));
+  const installAt = commands.indexOf('install');
+  expect(commands.slice(installAt, installAt + 6)).toEqual(['install', 'sep', 'import-config', 'export-config', 'sep', 'restore-defaults']);
+  await expect(page.locator('[data-command="restore-defaults"]')).toHaveClass(/menu-danger/);
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('[data-command="export-config"]').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(/^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.pintaconfig$/);
+  const file = await download.path();
+  if (!file) throw new Error('The config was not downloaded.');
+  const packed = readFileSync(file).toString('latin1');
+  expect(packed).toContain('pintaconfig');
+  expect(packed).toContain('brushes.json');
+  expect(packed).toContain('layout.json');
+  expect(packed).toContain('settings.json');
+  expect(packed).toContain('appearance.json');
+  expect(packed).toContain('mixer.json');
+  expect(packed).toContain('.pinta');
+  await page.locator('#brush-library').click();
+  await page.locator('.brush-pinned [data-preset="factory-grid"]').click({ button: 'right' });
+  await page.locator('[data-brush-pin]').click();
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => {
+    localStorage.setItem('pinta-theme', 'light');
+    document.documentElement.dataset.theme = 'light';
+  });
+  await page.locator('#primary-input').fill('#0000ff');
+  await page.mouse.click(origin.x, origin.y);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[2]).toBeGreaterThan(200);
+  await page.locator('#config-input').setInputFiles(file);
+  await expect(page.locator('#confirm-body')).toHaveText('Replace the images, brushes, and settings on this site with this file?');
+  await page.locator('#confirm-ok').click();
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.locator('#brush-library').click();
+  await expect(page.locator('.brush-pinned [data-preset-use="factory-grid"]')).toBeVisible();
+});
+
+test('restores the site to its defaults', async ({ page }) => {
+  await ready(page);
+  await page.evaluate(() => localStorage.setItem('pinta-theme', 'dark'));
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="restore-defaults"]').click();
+  await expect(page.locator('#confirm-body')).toHaveText('Delete the images, brushes, settings, and cached files saved in this browser?');
+  const loaded = page.waitForEvent('load');
+  await page.locator('#confirm-ok').click();
+  await loaded;
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
+  expect(await page.evaluate(() => localStorage.getItem('pinta-theme'))).toBeNull();
+});
+
 test('saves an opened file in place after Give File Access', async ({ page }) => {
   await ready(page);
   await page.evaluate(() => {
@@ -1935,6 +2001,7 @@ test('imports Procreate brushes and a Photoshop brush set', async ({ page }) => 
   await expect(palm).toHaveCount(1);
   await palm.locator('[data-preset-use]').click();
   await page.locator('#brush-library').click();
+  await page.locator('.brush-category-head', { hasText: /^Earth$/ }).click();
   await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
   await expect(page.locator('#brush-tip')).toHaveValue('image');
   await expect(page.locator('#brush-spacing')).toHaveValue('26');
@@ -1970,6 +2037,7 @@ test('imports Procreate brushes and a Photoshop brush set', async ({ page }) => 
   await page.locator('#brush-edit-back').click();
   await page.locator('[data-preset-use]', { hasText: /^Hard Round 100$/ }).click();
   await page.locator('#brush-library').click();
+  await page.locator('.brush-category-head', { hasText: /^Default HD Brushes$/ }).click();
   await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
   await expect(page.locator('#brush-tip')).toHaveValue('image');
   await page.keyboard.press('Escape');
@@ -2056,6 +2124,12 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await page.locator('#brush-library').click();
   await expect(page.locator('.brush-row[aria-pressed="true"]')).toContainText('Plain');
   await expect(page.locator('.brush-row[data-preset="factory-plain"] [data-preset-delete]')).toHaveCount(0);
+  await expect(page.locator('#brush-search')).toBeFocused();
+  await page.locator('#brush-search').fill('grid');
+  await expect(page.locator('[data-preset-use="factory-grid"]')).toBeVisible();
+  await expect(page.locator('[data-preset-use="factory-circle"]')).toHaveCount(0);
+  await page.locator('#brush-search').fill('');
+  await expect(page.locator('[data-preset-use="factory-circle"]')).toBeVisible();
   await expect(page.locator('#brush-import, #brush-edit-open')).toHaveCount(0);
   await page.locator('.brush-row', { hasText: 'Grid' }).dragTo(page.locator('[data-preset-use="factory-plain"]'));
   const order = await page.locator('.brush-loose [data-preset-use]').allTextContents();
@@ -2066,7 +2140,7 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await page.locator('#brush-edit-back').click();
   await expect(page.locator('.brush-row[aria-pressed="true"]')).toContainText('New brush');
 
-  await page.locator('.brush-list-bar').click({ button: 'right' });
+  await page.locator('#brush-add').click({ button: 'right' });
   page.once('dialog', dialog => dialog.accept('Inks'));
   await page.locator('[data-category-new]').click();
   await expect(page.locator('.brush-category-head')).toContainText('Inks');
@@ -2083,11 +2157,11 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await expect(page.locator('.brush-category-body')).toBeVisible();
 
   await page.locator('.brush-category-head', { hasText: 'Inks' }).click({ button: 'right' });
-  await expect(page.locator('[data-category-default] .menu-mark')).toHaveClass(/on/);
+  await expect(page.locator('[data-category-default] .menu-mark')).not.toHaveClass(/on/);
   await page.locator('[data-category-default]').click();
   await page.locator('#brush-library').click();
   await page.locator('#brush-library').click();
-  await expect(page.locator('.brush-category-body')).toBeHidden();
+  await expect(page.locator('.brush-category-body')).toBeVisible();
 
   await page.locator('.brush-category-head', { hasText: 'Inks' }).click({ button: 'right' });
   await page.locator('[data-category-delete]').click();
@@ -2105,6 +2179,13 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await page.locator('#confirm-ok').click();
   await expect(page.locator('#confirm-dialog')).toBeHidden();
   await expect(page.locator('.brush-row', { hasText: 'New brush' })).toHaveCount(0);
+
+  await page.locator('.brush-row[data-preset="factory-grid"]').click({ button: 'right' });
+  await page.locator('[data-brush-pin]').click();
+  await expect(page.locator('.brush-pinned [data-preset-use="factory-grid"]')).toBeVisible();
+  await page.locator('.brush-pinned [data-preset-use="factory-grid"]').click();
+  await page.locator('#brush-library').click();
+  await expect(page.locator('.brush-recent [data-preset-use="factory-grid"]')).toBeVisible();
 });
 
 test.describe('touchscreen', () => {

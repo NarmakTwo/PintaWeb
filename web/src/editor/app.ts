@@ -11,6 +11,7 @@ import { activePreset, clearAdjust, closeBrushPanel, hasLastStroke, loadBrushes,
 import {
   effectiveShortcut, getLayout, loadLayout, matchShortcut, MENU_IDS, menuEntries, menuIsCustom, onLayout, setDocks, shortcutLabel, type MenuId,
 } from './layout.ts';
+import { exportConfig, importConfigFile, restoreDefaults, type ConfigAppearance } from './config.ts';
 import { canvasToPng, downloadBlob, parsePalette, saveFileHandle, serializePalette } from './storage.ts';
 import { ToolController } from './tools.ts';
 import { boundsOf, DEFAULT_PALETTE, TOOLS, type ToolId, type Unit } from './types.ts';
@@ -284,6 +285,9 @@ function customMenu(id: MenuId): string {
     if (entry === 'theme-dark') return '<button type="button" data-command="theme-dark">Dark theme<span class="shortcut" id="theme-mark">Off</span></button>';
     if (entry === 'install') return '<button type="button" data-command="install" disabled>Install Pinta</button>';
     if (entry === 'file-access') return fileAccessButton();
+    if (entry === 'import-config') return item('Import Config', 'import-config');
+    if (entry === 'export-config') return item('Export Config', 'export-config');
+    if (entry === 'restore-defaults') return '<button type="button" class="menu-danger" data-command="restore-defaults">Restore to default</button>';
     return item(commandText(entry), entry, shortcutLabel(effectiveShortcut(entry)));
   }).join('');
 }
@@ -302,7 +306,7 @@ function commandText(id: string): string {
     'crop-canvas': 'Crop to Selection', flatten: 'Flatten', rotate: 'Rotate 90° Clockwise', 'flip-horizontal': 'Flip Horizontal', 'flip-vertical': 'Flip Vertical',
     'layer-add': 'Add Layer', 'layer-delete': 'Delete Layer', 'layer-duplicate': 'Duplicate Layer', 'layer-merge': 'Merge Down', 'layer-import': 'Import from File…',
     'layer-flip-h': 'Flip Horizontal', 'layer-flip-v': 'Flip Vertical', 'layer-rotate-cw': 'Rotate 90° Clockwise', 'layer-rotate-ccw': 'Rotate 90° Counterclockwise',
-    'layer-offset': 'Offset Layer…', 'layer-properties': 'Layer Properties…', customize: 'Customize', 'file-access': 'Give File Access', 'toggle-fullscreen': 'Fullscreen',
+    'layer-offset': 'Offset Layer…', 'layer-properties': 'Layer Properties…', customize: 'Customize', 'file-access': 'Give File Access', 'import-config': 'Import Config', 'export-config': 'Export Config', 'restore-defaults': 'Restore to default', 'toggle-fullscreen': 'Fullscreen',
     shortcuts: 'Keyboard Shortcuts', about: 'About',
   };
   return labels[id] ?? id;
@@ -336,7 +340,7 @@ function fileAccessButton(): string {
 }
 
 function windowMenu(): string {
-  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), item('Customize', 'customize'), '<div class="sep"></div>', fileAccessButton(), '<button type="button" data-command="install" disabled>Install Pinta</button>'].join('');
+  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), item('Customize', 'customize'), '<div class="sep"></div>', fileAccessButton(), '<button type="button" data-command="install" disabled>Install Pinta</button>', '<div class="sep"></div>', item('Import Config', 'import-config'), item('Export Config', 'export-config'), '<div class="sep"></div>', '<button type="button" class="menu-danger" data-command="restore-defaults">Restore to default</button>'].join('');
 }
 
 type InstallEvent = Event & { prompt: () => Promise<void> };
@@ -683,6 +687,7 @@ function wire(editor: Editor, tools: ToolController): void {
   $<HTMLInputElement>('file-input').addEventListener('change', () => void takeFile(editor, 'file-input', false));
   $<HTMLInputElement>('layer-input').addEventListener('change', () => void takeFile(editor, 'layer-input', true));
   $<HTMLInputElement>('palette-input').addEventListener('change', () => void takePalette(editor));
+  $<HTMLInputElement>('config-input').addEventListener('change', () => void takeConfig(editor));
   document.addEventListener('paste', event => {
     if (editing()) return;
     const file = [...(event.clipboardData?.files ?? [])].find(item => item.type.startsWith('image/'));
@@ -942,6 +947,9 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   else if (command === 'save-as') await save(editor, true);
   else if (command === 'save-all') await saveAll(editor);
   else if (command === 'file-access') await giveFileAccess(editor);
+  else if (command === 'import-config') $<HTMLInputElement>('config-input').click();
+  else if (command === 'export-config') await exportConfig(editor);
+  else if (command === 'restore-defaults') await restoreDefaults();
   else if (command === 'open-palette') $<HTMLInputElement>('palette-input').click();
   else if (command === 'save-palette') downloadBlob(new Blob([serializePalette(editor.palette)], { type: 'text/plain' }), 'palette.txt');
   else if (command === 'reset-palette') {
@@ -1362,6 +1370,45 @@ async function takePalette(editor: Editor): Promise<void> {
   }
   editor.palette = colors;
   editor.notify();
+}
+
+async function takeConfig(editor: Editor): Promise<void> {
+  const input = $<HTMLInputElement>('config-input');
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  await importConfigFile(editor, file, { applyAppearance });
+}
+
+function applyAppearance(appearance: ConfigAppearance): void {
+  if (appearance.theme === 'dark' || appearance.theme === 'light') {
+    try { localStorage.setItem('pinta-theme', appearance.theme); } catch { /* storage unavailable */ }
+    applyTheme(appearance.theme);
+  } else {
+    try { localStorage.removeItem('pinta-theme'); } catch { /* storage unavailable */ }
+    applyTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  }
+  brushCursor = appearance.brushCursor;
+  try { localStorage.setItem('pinta-brush-cursor', brushCursor ? '1' : '0'); } catch { /* storage unavailable */ }
+  if (!brushCursor) $('dab-cursor').hidden = true;
+  try {
+    if (appearance.fileAccess) localStorage.setItem('pinta-file-access', '1');
+    else localStorage.removeItem('pinta-file-access');
+  } catch { /* storage unavailable */ }
+  const canvas = $<HTMLCanvasElement>('mixer');
+  const ctx = canvas.getContext('2d');
+  try {
+    if (appearance.mixer) localStorage.setItem('pinta-mixer', appearance.mixer);
+    else localStorage.removeItem('pinta-mixer');
+  } catch { /* storage unavailable */ }
+  if (!ctx) return;
+  if (!appearance.mixer) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  const image = new Image();
+  image.onload = () => ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  image.src = appearance.mixer;
 }
 
 async function screenshot(editor: Editor): Promise<void> {

@@ -140,6 +140,7 @@ button:disabled { opacity: 0.45; cursor: default; transform: none; }
 }
 
 .menu-panel .sep { height: 1px; margin: 4px 6px; background: var(--line); }
+.menu-panel button.menu-danger, .menu-sub button.menu-danger { color: var(--danger); }
 
 .menu-sub { padding-left: 8px; }
 
@@ -766,7 +767,15 @@ dialog .check { justify-content: flex-start; }
 .brush-tabs { display: flex; gap: 4px; }
 .brush-tabs button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 #brush-list button, #brush-edit button, #brush-edit select, #brush-edit input { max-width: 100%; }
-.brush-list-bar { display: flex; justify-content: flex-end; gap: 2px; position: sticky; top: 0; z-index: 1; background: var(--chrome); }
+.brush-list-bar { display: flex; align-items: center; justify-content: flex-end; gap: 2px; position: sticky; top: 0; z-index: 1; background: var(--chrome); }
+#brush-search {
+  flex: 1; min-width: 0; height: 28px; margin-right: 4px; padding: 0 8px;
+  font: inherit; color: var(--ink); background: var(--field); border: 1px solid var(--line);
+}
+#brush-search:hover { border-color: var(--muted); }
+#brush-search:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.brush-section { margin: 8px 2px 2px; color: var(--muted); font-size: 12px; }
+.brush-empty { margin: 8px 2px; color: var(--muted); font-size: 12px; }
 .brush-list-bar button, .brush-icon {
   width: 28px; height: 28px; max-width: 28px; padding: 0; display: grid; place-items: center;
 }
@@ -781,12 +790,14 @@ dialog .check { justify-content: flex-start; }
 .brush-category-head { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; color: var(--ink); }
 .brush-chevron { width: 14px; height: 14px; transition: transform 120ms ease; }
 .brush-category-head[aria-expanded="true"] .brush-chevron { transform: rotate(90deg); }
-#brush-category-menu {
+#brush-category-menu, #brush-menu {
   position: fixed; z-index: 40; min-width: 188px; padding: 4px;
   background: var(--chrome); color: var(--ink); border: 1px solid var(--line); box-shadow: var(--shadow);
 }
-#brush-category-menu button {
+#brush-category-menu button, #brush-menu button {
   display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px;
   padding: 5px 8px; color: inherit; text-align: left;
 }
+#brush-category-menu button:hover, #brush-menu button:hover,
+#brush-category-menu button:focus-visible, #brush-menu button:focus-visible { background: var(--field); }
 #brush-library canvas { display: block; }
