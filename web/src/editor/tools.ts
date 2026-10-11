@@ -1,6 +1,7 @@
 import type { Editor } from './document.ts';
 import { rgba } from '../wasm/engine.ts';
 import { paintSoft, projectPoint, snapPoint, softRegion } from './adjust.ts';
+import { activePreset, adjustPointer, beginStrokeUI, clearAdjust, closeBrushPanel, endStrokeUI, legacyPencil, paintPresetStroke, planStroke, rememberStroke, type StrokeSample } from './brushes.ts';
 import { boundsOf, modeFromPointer, shiftMask, type Bounds, type Point, type SelectMode, type SmoothTool, type ToolId } from './types.ts';
 
 function transformAround(ctx: CanvasRenderingContext2D, gesture: 'scale' | 'uniform' | 'rotate' | 'rotate-step', start: Point, point: Point, bounds: Bounds): void {
@@ -143,6 +144,11 @@ function paintStyle(ctx: CanvasRenderingContext2D, style: Editor['shape'], fill:
   };
   if (style !== 'outline') paint('fill', fill);
   if (style !== 'fill') paint('stroke', stroke);
+}
+
+function usesEngine(editor: Editor, tool: ToolId): boolean {
+  if (tool === 'brush' || tool === 'eraser' || tool === 'pen') return true;
+  return tool === 'pencil' && !legacyPencil(editor);
 }
 
 function brushSize(editor: Editor): number {
@@ -735,9 +741,17 @@ export class ToolController {
     const rawPoint = editor.imagePoint(event);
     if (!rawPoint) return;
     const point = this.adjustPoint(rawPoint, event, 'down');
+    if (editor.strokeHandles) {
+      if (adjustPointer(editor, point, 'down')) {
+        capturePointer(editor.paper, event.pointerId);
+        return;
+      }
+      clearAdjust(editor);
+    }
     if (editor.assistantPlace) {
       this.placing = true;
       this.drawing = true;
+      closeBrushPanel();
       this.start = point;
       this.last = point;
       capturePointer(editor.paper, event.pointerId);
@@ -791,6 +805,8 @@ export class ToolController {
       return;
     }
     this.drawing = true;
+    closeBrushPanel();
+    beginStrokeUI(editor);
     editor.beginSurface();
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
     capturePointer(editor.paper, event.pointerId);
@@ -807,20 +823,16 @@ export class ToolController {
         this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
         this.replayCurve('recolor');
       } else this.recolor(point);
-    } else if (editor.tool === 'pencil') {
+    } else if (editor.tool === 'pencil' && !usesEngine(editor, 'pencil')) {
       this.pencilPath = [];
       this.curvePath = [];
       if (this.curves('pencil', event.shiftKey)) {
         this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
         this.replayCurve('pencil');
       } else this.pencil(point, event.shiftKey);
-    } else if (editor.tool === 'brush' || editor.tool === 'eraser') {
-      this.resetStroke(point);
-      this.curvePath = [];
-      if (this.curves(editor.tool, event.shiftKey)) {
-        this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
-        this.replayCurve(editor.tool);
-      } else this.brush(point, point);
+    } else if (usesEngine(editor, editor.tool)) {
+      this.curvePath = [{ x: point.x, y: point.y, t: event.timeStamp }];
+      this.replayCurve(editor.tool as SmoothTool, event.shiftKey, false);
     } else if (editor.tool === 'pen') {
       this.resetStroke(point);
       this.penWidth = brushSize(editor);
@@ -848,6 +860,7 @@ export class ToolController {
     const editor = this.editor;
     const rawPoint = editor.imagePoint(event);
     const point = rawPoint ? this.adjustPoint(rawPoint, event, 'move') : null;
+    if (point && adjustPointer(editor, point, 'move')) return;
     if (this.placing) {
       const editorGuide = editor.assistantPlace;
       if (point && this.start && editorGuide) {
@@ -874,13 +887,12 @@ export class ToolController {
     const lock = event.shiftKey && (tool === 'pencil' || tool === 'brush' || tool === 'line');
     const aimed = lock && this.start ? snap45(this.start, point) : point;
     const sample = (tool === 'brush' || tool === 'eraser' || tool === 'pen') && !(lock && tool === 'brush') ? this.smoothToward(point) : aimed;
+    const engine = usesEngine(editor, tool);
     const curve = this.curveKind(tool, lock);
-    if (curve) {
+    if (engine || curve) {
       this.pushCurve(aimed, event.timeStamp);
-      this.replayCurve(curve);
-    } else if (tool === 'brush' || tool === 'eraser') this.brush(this.last, sample);
-    else if (tool === 'pen') this.pen(this.last, sample, event.timeStamp, false, this.lastRaw, point);
-    else if (tool === 'pencil') this.pencil(aimed, event.shiftKey);
+      this.replayCurve((engine ? tool : curve) as SmoothTool, lock, false);
+    } else if (tool === 'pencil') this.pencil(aimed, event.shiftKey);
     else if (tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'random') this.tone(this.last, point);
     else if (tool === 'recolor' && !editor.recolorGlobal) this.recolor(point);
     else if (tool === 'move-pixels' && editor.float) this.paintFloat(point, event.shiftKey);
@@ -947,6 +959,8 @@ export class ToolController {
 
   up(event: PointerEvent): void {
     const editor = this.editor;
+    const adjusted = editor.imagePoint(event);
+    if (adjusted && adjustPointer(editor, adjusted, 'up')) return;
     if (this.panning) {
       this.panning = false;
       return;
@@ -976,11 +990,16 @@ export class ToolController {
     const point = (rawPoint ? this.adjustPoint(rawPoint, event, 'up') : null) ?? this.last ?? this.start;
     const tool = editor.tool;
     clearPreview(editor);
-    const curve = this.curvePath.length ? this.curveKind(tool, event.shiftKey) : null;
-    if (curve) {
-      this.pushCurve(point, event.timeStamp);
-      this.replayCurve(curve);
+    const lock = event.shiftKey && (tool === 'pencil' || tool === 'brush' || tool === 'line');
+    const engine = usesEngine(editor, tool);
+    const curve = this.curvePath.length ? this.curveKind(tool, lock) : null;
+    if (engine || curve) {
+      const aimed = lock && this.start ? snap45(this.start, point) : point;
+      this.pushCurve(aimed, event.timeStamp);
+      this.replayCurve((engine ? tool : curve) as SmoothTool, lock, true);
     } else if (tool === 'brush' || tool === 'eraser' || tool === 'pen') this.catchUp(point, tool, event.timeStamp);
+    if (engine && this.before && this.curvePath.length) rememberStroke(editor, this.before, this.curvePath.map(sample => ({ ...sample })), tool, this.button);
+    endStrokeUI();
     this.curvePath = [];
     if (tool === 'brush' || tool === 'eraser' || tool === 'pencil' || tool === 'pen' || tool === 'lighten' || tool === 'darken' || tool === 'dither' || tool === 'recolor' || tool === 'random') {
       if (this.before) {
@@ -1255,47 +1274,37 @@ export class ToolController {
     this.curvePath.push({ x: point.x, y: point.y, t: time });
   }
 
-  private replayCurve(tool: SmoothTool): void {
+  private replayCurve(tool: SmoothTool, lock = false, release = false): void {
     const editor = this.editor;
     const layer = editor.layer;
     const doc = editor.doc;
     if (!layer || !doc || !this.before || !this.curvePath.length) return;
     layer.ctx.putImageData(this.before, 0, 0);
-    const samples = blendSamples(this.curvePath, Math.max(1, editor.size / 4), editor.smoothing[tool]);
+    const brush = activePreset(tool);
+    const smoothing = !lock && editor.unserrate[tool] ? editor.smoothing[tool] : 0;
+    const lag = !lock && editor.unserrate[tool] ? brush.stabilizer : 0;
+    const spacing = Math.max(1, (editor.size * brush.spacing) / 100);
+    const samples = planStroke(this.curvePath as StrokeSample[], { smoothing, lag, catchUp: release, spacing });
     if (!samples.length) return;
-    if (tool === 'pencil') {
+    const size = Math.max(1, editor.size | 0);
+    if (tool === 'pencil' && size === 1 && brush.hardness >= 100) {
       const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
-      const size = Math.max(1, editor.size | 0);
       const ink = editor.ink(this.button);
-      if (size === 1) {
-        const path = samples.map(sample => ({ x: Math.round(sample.x), y: Math.round(sample.y) }));
-        for (const pixel of pixelPerfect(rasterize(path))) {
-          for (const spot of mirrorPoints(editor, pixel)) blendPixel(image, spot.x, spot.y, ink);
-        }
-      } else {
-        const stamp = (from: Point, to: Point) => {
-          for (const [start, end] of mirroredSegments(editor, from, to)) {
-            editor.engine.stamp(image, start.x | 0, start.y | 0, end.x | 0, end.y | 0, size, ink, false);
-          }
-        };
-        if (samples.length === 1) stamp(samples[0], samples[0]);
-        for (let index = 1; index < samples.length; index++) stamp(samples[index - 1], samples[index]);
+      const path = samples.map(sample => ({ x: Math.round(sample.x), y: Math.round(sample.y) }));
+      for (const pixel of pixelPerfect(rasterize(path))) {
+        for (const spot of mirrorPoints(editor, pixel)) blendPixel(image, spot.x, spot.y, ink);
       }
       editor.lockAlpha(image, this.before);
       layer.ctx.putImageData(image, 0, 0);
-    } else if (tool === 'pen') {
-      this.penWidth = 0;
-      this.strokeClock = samples[0].t;
-      if (samples.length === 1) this.pen(samples[0], samples[0], samples[0].t, false, null, null, true);
-      for (let index = 1; index < samples.length; index++) this.pen(samples[index - 1], samples[index], samples[index].t, false, samples[index - 1], samples[index], true);
+    } else if (tool === 'pencil' || tool === 'pen' || tool === 'brush' || tool === 'eraser') {
+      paintPresetStroke(editor, this.before, samples, brush, tool, this.button);
     } else if (tool === 'recolor') {
       if (samples.length === 1) this.recolor(samples[0]);
       else for (const sample of samples) this.recolor(sample);
     } else if (tool === 'dither' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
       if (samples.length === 1) this.tone(samples[0], samples[0]);
       else for (let index = 1; index < samples.length; index++) this.tone(samples[index - 1], samples[index]);
-    } else if (samples.length === 1) this.brush(samples[0], samples[0], true);
-    else for (let index = 1; index < samples.length; index++) this.brush(samples[index - 1], samples[index], true);
+    }
     editor.renderScene();
   }
 

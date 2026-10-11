@@ -32,7 +32,7 @@ self.addEventListener('install', event => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
     await Promise.all(FILES.map(async url => {
-      const response = await fetch(url);
+      const response = await fetch(url, { cache: 'reload' });
       if (!response.ok || response.type !== 'basic') throw new Error(url);
       await cache.put(url, await usable(response));
     }));
@@ -43,9 +43,11 @@ self.addEventListener('install', event => {
 });
 
 self.addEventListener('activate', event => {
-  event.waitUntil(caches.keys()
-    .then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key))))
-    .then(() => self.clients.claim()));
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)));
+    await self.clients.claim();
+  })());
 });
 
 self.addEventListener('fetch', event => {
@@ -53,19 +55,29 @@ self.addEventListener('fetch', event => {
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
-  const key = request.mode === 'navigate' ? '/index.html' : request;
+  const navigation = request.mode === 'navigate';
+  const key = navigation ? '/index.html' : request;
+  const fresh = navigation || request.cache === 'reload' || request.cache === 'no-store';
   event.respondWith((async () => {
-    const cached = await caches.match(key);
-    if (cached) return usable(cached);
-    const response = await fetch(request);
-    const cacheable = response.ok && response.type === 'basic';
-    const clean = await usable(response);
-    if (cacheable) {
-      const cache = await caches.open(CACHE);
-      await cache.put(key, clean.clone());
-      if (request.mode === 'navigate') await cache.put('/', clean.clone());
+    if (!fresh) {
+      const cached = await caches.match(key);
+      if (cached) return cached;
     }
-    return clean;
+    try {
+      const response = await fetch(request);
+      const cacheable = response.ok && response.type === 'basic';
+      const clean = await usable(response);
+      if (cacheable) {
+        const cache = await caches.open(CACHE);
+        await cache.put(key, clean.clone());
+        if (navigation) await cache.put('/', clean.clone());
+      }
+      return clean;
+    } catch (error) {
+      const cached = await caches.match(key);
+      if (cached) return cached;
+      throw error;
+    }
   })());
 });
 `;

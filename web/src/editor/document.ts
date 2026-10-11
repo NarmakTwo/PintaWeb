@@ -1,5 +1,5 @@
 import { PixelEngine, rgba, type Rgba } from '../wasm/engine.ts';
-import { canvasToPng, clearSession, downloadBlob, encodeBmp, loadSession, saveSession, type SessionRecord } from './storage.ts';
+import { canvasToPng, clearFileHandles, clearSession, downloadBlob, encodeBmp, forgetFileHandle, loadFileHandles, loadSession, saveSession, type SessionRecord } from './storage.ts';
 import { zipStore } from './zip.ts';
 import type { Guide } from './adjust.ts';
 import {
@@ -94,6 +94,7 @@ interface Snapshot {
 }
 
 export interface Doc {
+  id: string;
   name: string;
   width: number;
   height: number;
@@ -108,6 +109,7 @@ export interface Doc {
   savedCursor: number;
   fileBase: string;
   fileMime: string | null;
+  fileHandle: FileSystemFileHandle | null;
 }
 
 export interface FloatState {
@@ -147,6 +149,7 @@ export class Editor {
   opacity = 100;
   tolerance = 0;
   brush: BrushId = 'plain';
+  strokeHandles: Point[] | null = null;
   shape: ShapeStyle = 'outline';
   selectionMode: SelectMode = 'replace';
   antialias = true;
@@ -178,9 +181,9 @@ export class Editor {
     darken: false,
   };
   smoothing: Record<SmoothTool, number> = {
-    brush: 70,
-    eraser: 70,
-    pen: 70,
+    brush: 100,
+    eraser: 100,
+    pen: 100,
     pencil: 0,
     dither: 0,
     recolor: 0,
@@ -427,6 +430,14 @@ export class Editor {
     this.notify();
   }
 
+  rewriteCheckpoint(): void {
+    const doc = this.doc;
+    if (!doc || doc.cursor < 0) return;
+    this.endSurface();
+    doc.snapshots[doc.cursor] = this.capture();
+    this.scheduleSave();
+  }
+
   undo(): void {
     const doc = this.doc;
     if (!doc || doc.cursor <= 0) return;
@@ -459,6 +470,7 @@ export class Editor {
 
   private blank(width: number, height: number, name: string): Doc {
     return {
+      id: crypto.randomUUID(),
       name,
       width,
       height,
@@ -473,6 +485,7 @@ export class Editor {
       savedCursor: 0,
       fileBase: name.replace(/\.[^.]+$/, '') || 'pinta-image',
       fileMime: null,
+      fileHandle: null,
     };
   }
 
@@ -540,11 +553,13 @@ export class Editor {
 
   close(index = this.index): void {
     if (index < 0 || index >= this.docs.length) return;
+    const leaving = this.docs[index];
     this.cancelFloat();
     this.docs.splice(index, 1);
     if (!this.docs.length) this.index = -1;
     else if (this.index >= this.docs.length) this.index = this.docs.length - 1;
     else if (index < this.index) this.index--;
+    if (leaving) void forgetFileHandle(leaving.id);
     this.syncSize();
     this.rebuildEdges();
     this.renderScene();
@@ -568,6 +583,7 @@ export class Editor {
     this.float = null;
     window.clearTimeout(this.saveTimer);
     await clearSession();
+    await clearFileHandles();
     this.syncSize();
     this.renderScene();
     this.onSave?.('Local session cleared');
@@ -798,6 +814,16 @@ export class Editor {
     };
     if (this.edges) paintEdges(this.edges);
     if (this.draftEdges) paintEdges(this.draftEdges);
+    if (this.strokeHandles) {
+      ctx.save();
+      ctx.fillStyle = '#1c71d8';
+      for (const handle of this.strokeHandles) {
+        ctx.beginPath();
+        ctx.arc(handle.x, handle.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
   }
 
   renameDocument(name: string): void {
@@ -1801,7 +1827,7 @@ export class Editor {
     return canvas;
   }
 
-  async exportImage(mime: string, filename: string): Promise<void> {
+  async exportImage(mime: string, filename: string, handle: FileSystemFileHandle | null = null): Promise<void> {
     const doc = this.doc;
     if (!doc) return;
     this.cancelFloat();
@@ -1812,12 +1838,18 @@ export class Editor {
       : await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(value => (value ? resolve(value) : reject(new Error('Export failed.'))), mime, mime === 'image/png' ? undefined : 0.92);
       });
-    const link = document.createElement('a');
-    const url = URL.createObjectURL(blob);
-    link.href = url;
-    link.download = filename;
-    link.click();
-    URL.revokeObjectURL(url);
+    if (handle) {
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+    } else {
+      const link = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    }
     doc.fileBase = filename.replace(/\.[^.]+$/, '') || doc.fileBase;
     doc.fileMime = mime;
     doc.name = filename;
@@ -1825,7 +1857,7 @@ export class Editor {
     this.notify();
   }
 
-  async exportPinta(filename: string): Promise<void> {
+  async exportPinta(filename: string, handle: FileSystemFileHandle | null = null): Promise<void> {
     const doc = this.doc;
     if (!doc) return;
     this.cancelFloat();
@@ -1919,7 +1951,12 @@ export class Editor {
       history: { cursor: doc.cursor, steps: history },
     };
     files.unshift({ name: 'manifest.json', data: new TextEncoder().encode(JSON.stringify(manifest)) });
-    downloadBlob(zipStore(files), filename);
+    const archive = zipStore(files);
+    if (handle) {
+      const writable = await handle.createWritable();
+      await writable.write(archive);
+      await writable.close();
+    } else downloadBlob(archive, filename);
     doc.fileBase = filename.replace(/\.[^.]+$/, '') || doc.fileBase;
     doc.fileMime = 'application/pinta';
     doc.name = filename;
@@ -1958,6 +1995,7 @@ export class Editor {
           });
         }
         documents.push({
+          id: doc.id,
           name: doc.name,
           width: doc.width,
           height: doc.height,
@@ -1999,6 +2037,7 @@ export class Editor {
       this.docs = [];
       for (const stored of session.documents) {
         const doc = this.blank(stored.width, stored.height, stored.name);
+        doc.id = stored.id || doc.id;
         this.docs.push(doc);
         this.index = this.docs.length - 1;
         doc.zoom = stored.zoom || 1;
@@ -2036,6 +2075,8 @@ export class Editor {
         doc.labels = ['Restored'];
         doc.cursor = 0;
       }
+      const handles = await loadFileHandles();
+      for (const doc of this.docs) doc.fileHandle = handles[doc.id] ?? null;
       this.index = Math.max(0, Math.min(session.active, this.docs.length - 1));
       this.syncSize();
       this.rebuildEdges();

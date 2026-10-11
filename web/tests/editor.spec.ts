@@ -780,8 +780,8 @@ test('tool options give focus back so undo still works', async ({ page }) => {
   await page.locator('#primary-input').fill('#000000');
   await drag(page, 0.2, 0.2, 0.6, 0.6);
   expect((await pixel(page, 0.4, 0.4))[0]).toBeLessThan(40);
-  await page.locator('#brush-select').selectOption('squares');
-  await expect(page.locator('#brush-select')).not.toBeFocused();
+  await page.locator('#symmetry-select').selectOption('vertical');
+  await expect(page.locator('#symmetry-select')).not.toBeFocused();
   await page.keyboard.press('Control+z');
   expect((await pixel(page, 0.4, 0.4))[0]).toBeGreaterThan(200);
 });
@@ -1141,7 +1141,7 @@ test('hidden controls for selection, paint, text, and layers', async ({ page }) 
   expect((await pixel(page, 40.5 / 64, 48.5 / 64))[1]).toBeGreaterThan(200);
 
   await page.locator('[data-tool="brush"]').click();
-  await expect(page.locator('#brush-select option[value="smudge"]')).toHaveCount(1);
+  await expect(page.locator('#brush-select')).toHaveCount(0);
   await page.locator('#primary-input').fill('#0000ff');
   await page.locator('#size-slider').fill('4');
   const brushFrom = await paperPoint(page, 12.5 / 64, 8.5 / 64);
@@ -1156,9 +1156,14 @@ test('hidden controls for selection, paint, text, and layers', async ({ page }) 
   expect((await pixel(page, 32.5 / 64, 8.5 / 64))[0]).toBeLessThan(40);
   expect((await pixel(page, 32.5 / 64, 18.5 / 64))[0]).toBeGreaterThan(200);
   await page.locator('[data-tool="eraser"]').click();
-  await expect(page.locator('#brush-select option[value="smudge"]')).toHaveCount(0);
+  await page.locator('#brush-library').click();
+  await expect(page.locator('[data-brush-tab="erase"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-preset-use="factory-smudge"]')).toHaveCount(0);
+  await page.locator('#brush-library').click();
   await page.locator('[data-tool="brush"]').click();
-  await page.locator('#brush-select').selectOption('smudge');
+  await page.locator('#brush-library').click();
+  await page.locator('[data-brush-tab="smudge"]').click();
+  await page.locator('[data-preset-use="factory-smudge"]').click();
   await page.locator('#primary-input').fill('#0000ff');
   await page.locator('#size-slider').fill('8');
   const smearFrom = await paperPoint(page, 32 / 64, 32 / 64);
@@ -1662,15 +1667,61 @@ test('keeps Install Pinta in the Window menu until the browser offers it', async
   await expect(item).toBeDisabled();
 });
 
+test('saves an opened file in place after Give File Access', async ({ page }) => {
+  await ready(page);
+  await page.evaluate(() => {
+    const written: Blob[] = [];
+    (window as unknown as { __pintaWrites: Blob[] }).__pintaWrites = written;
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='), char => char.charCodeAt(0));
+    const stream = {
+      write: async (data: Blob) => { written.push(data); },
+      close: async () => {},
+    };
+    const saveHandle = {
+      name: 'granted.png',
+      queryPermission: async () => 'granted',
+      requestPermission: async () => 'granted',
+      createWritable: async () => stream,
+    };
+    const openHandle = {
+      name: 'dot.png',
+      getFile: async () => new File([png], 'dot.png', { type: 'image/png' }),
+      queryPermission: async () => 'granted',
+      requestPermission: async () => 'granted',
+      createWritable: async () => stream,
+    };
+    window.showSaveFilePicker = async () => saveHandle as unknown as FileSystemFileHandle;
+    window.showOpenFilePicker = async () => [openHandle as unknown as FileSystemFileHandle];
+  });
+  await page.locator('#menu-window').click();
+  const access = page.locator('[data-command="file-access"]');
+  await expect(access).toHaveText(/Give File Access/);
+  await expect(access).toBeEnabled();
+  await access.click();
+  await expect(page.locator('#toast')).toHaveText('Save writes to granted.png.');
+  await expect(page.locator('#file-access-mark')).toHaveText('On');
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="open"]').click();
+  await expect(page.locator('#image-dimensions')).toHaveText('1 × 1');
+  let downloaded = false;
+  page.on('download', () => { downloaded = true; });
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="save"]').click();
+  await expect(page.locator('#toast')).toHaveText('Saved dot.png.');
+  const writes = await page.evaluate(() => (window as unknown as { __pintaWrites: Blob[] }).__pintaWrites.length);
+  expect(writes).toBe(1);
+  expect(downloaded).toBe(false);
+});
+
 test('keeps the smoothing number when Unserrate is turned off', async ({ page }) => {
   await ready(page);
   await newCanvas(page);
   await page.locator('[data-tool="brush"]').click();
-  await expect(page.locator('#smooth-slider')).toHaveValue('70');
+  await expect(page.locator('#smooth-slider')).toHaveValue('100');
   await expect(page.locator('#unserrate')).toBeChecked();
-  await expect(page.locator('#status-note')).toHaveText('Smoothing rounds a fast stroke');
+  await expect(page.locator('#status-note')).toHaveText('');
   await page.locator('#unserrate').uncheck();
-  await expect(page.locator('#smooth-slider')).toHaveValue('70');
+  await expect(page.locator('#smooth-slider')).toHaveValue('100');
   await expect(page.locator('#status-note')).toHaveText('');
   await page.locator('[data-tool="pencil"]').click();
   await expect(page.locator('#smooth-slider')).toHaveValue('0');
@@ -1834,6 +1885,226 @@ test('long-presses an eye, paints a mask, and picks from the mixer without undo'
   await expect(page.locator('#mixer-panel')).toBeVisible();
   await page.locator('#mixer').click();
   await expect(page.locator('#history-list .history-item')).toHaveCount(steps);
+});
+
+test('customize removes a tool without its shortcut, and the brush panel edits the preset', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="customize"]').click();
+  await expect(page.locator('#customize-dialog')).toBeVisible();
+  await page.locator('#customize-tools [data-id="pencil"] [data-move="remove"]').click();
+  await expect(page.locator('#tool-list [data-tool="pencil"]')).toHaveCount(0);
+  await page.locator('#customize-close').click();
+  await page.keyboard.press('p');
+  await expect(page.locator('#unserrate')).toBeVisible();
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="customize"]').click();
+  await page.locator('#customize-reset').click();
+  await page.locator('#confirm-ok').click();
+  await expect(page.locator('#tool-list [data-tool="pencil"]')).toHaveCount(1);
+  await page.locator('#customize-close').click();
+  await page.locator('#brush-library').click();
+  await expect(page.locator('[data-brush-tab="paint"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-preset-use="factory-plain"]')).toBeVisible();
+  await expect(page.locator('#brush-select')).toHaveCount(0);
+  await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
+  const lag = page.locator('#brush-lag');
+  await expect(lag).toHaveValue('0');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#brush-panel')).toBeHidden();
+});
+
+test('imports Procreate brushes and a Photoshop brush set', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/Hard Airbrush.brush');
+  const hardSet = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Hard Airbrush$/ }) });
+  const hard = hardSet.locator('.brush-row', { hasText: 'Hard Airbrush' });
+  await expect(hard).toHaveCount(1);
+  await expect(page.locator('[data-preset-use="factory-plain"]')).toHaveCount(1);
+  await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
+  await expect(page.locator('#brush-rotation')).toHaveValue('jitter');
+  await expect(page.locator('#brush-spacing')).toHaveValue('1');
+  await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await page.locator('#brush-edit-back').click();
+
+  await page.locator('#brush-import-file').setInputFiles('../proc/Earth.brushset');
+  const palm = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Earth$/ }) }).locator('.brush-row', { hasText: 'Palm Husk' });
+  await expect(palm).toHaveCount(1);
+  await palm.locator('[data-preset-use]').click();
+  await page.locator('#brush-library').click();
+  await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
+  await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await expect(page.locator('#brush-spacing')).toHaveValue('26');
+  await expect(page.locator('#brush-scatter')).toHaveValue('1');
+  await expect(page.locator('#brush-grain-lock')).toBeVisible();
+  await page.locator('#brush-grain-clear').click();
+  await page.locator('#brush-carry').fill('0');
+  await page.locator('#brush-scatter').fill('0');
+  await page.locator('#brush-spacing').fill('8');
+  await page.keyboard.press('Escape');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('24');
+  await page.locator('#primary-input').fill('#ff0000');
+  await drag(page, 0.2, 0.5, 0.8, 0.5);
+  const reddest = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let best = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index] > data[index + 1] && data[index] > best) best = data[index];
+    }
+    return best;
+  });
+  expect(reddest).toBeGreaterThan(150);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/Default HD Brushes.abr');
+  const hd = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Default HD Brushes$/ }) });
+  await expect(hd.locator('.brush-row', { hasText: 'Hard Round 5 pixels' })).toHaveCount(1, { timeout: 60_000 });
+  await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
+  await expect(page.locator('#brush-spacing')).toHaveValue('25');
+  await expect(page.locator('#brush-tip')).toHaveValue('plain');
+  await page.locator('#brush-edit-back').click();
+  await page.locator('[data-preset-use]', { hasText: /^Hard Round 100$/ }).click();
+  await page.locator('#brush-library').click();
+  await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
+  await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#brush-panel')).toBeHidden();
+});
+
+test('luminance brushes add light and shift their color', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/P5_Luminance.brushset');
+  const leak = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^P5_Luminance$/ }) }).locator('.brush-row', { hasText: 'Lightleak' });
+  await expect(leak).toHaveCount(1);
+  await leak.locator('[data-preset-edit]').click();
+  await expect(page.locator('#brush-blend')).toHaveValue('add');
+  await expect(page.locator('#brush-hue')).toHaveValue('45');
+  await expect(page.locator('#brush-buildup')).toBeChecked();
+  if (await page.locator('#brush-grain-clear').count()) await page.locator('#brush-grain-clear').click();
+  await page.locator('#brush-carry').fill('0');
+  await page.locator('#brush-hue').fill('100');
+  await page.keyboard.press('Escape');
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="bucket"]').click();
+  const origin = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(origin.x, origin.y);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(10);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('28');
+  await drag(page, 0.15, 0.5, 0.85, 0.5);
+  const varied = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let warm = 0;
+    let shifted = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const red = data[index];
+      const green = data[index + 1];
+      const blue = data[index + 2];
+      if (red > 40) warm += 1;
+      if ((green > 40 || blue > 40) && red + green + blue > 80) shifted += 1;
+    }
+    return { warm, shifted };
+  });
+  expect(varied.warm).toBeGreaterThan(0);
+  expect(varied.shifted).toBeGreaterThan(0);
+});
+
+test('a soft airbrush builds a glazed stroke', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/P5_Airbrushing.brushset');
+  const soft = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^P5_Airbrushing$/ }) }).locator('.brush-row', { hasText: 'Soft Airbrush' });
+  await expect(soft).toHaveCount(1);
+  await soft.locator('[data-preset-edit]').click();
+  await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await expect(page.locator('#brush-buildup')).toBeChecked();
+  await expect(page.locator('#brush-spacing')).toHaveValue('4');
+  if (await page.locator('#brush-grain-clear').count()) await page.locator('#brush-grain-clear').click();
+  await page.locator('#brush-carry').fill('0');
+  await page.locator('#brush-hue').fill('0');
+  await page.keyboard.press('Escape');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('28');
+  await drag(page, 0.15, 0.5, 0.85, 0.5);
+  const partial = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let count = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const green = data[index + 1];
+      if (data[index] > 200 && green > 40 && green < 220) count += 1;
+    }
+    return count;
+  });
+  expect(partial).toBeGreaterThan(200);
+});
+
+test('selects, reorders, and groups brushes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#brush-library').click();
+  await expect(page.locator('.brush-row[aria-pressed="true"]')).toContainText('Plain');
+  await expect(page.locator('.brush-row[data-preset="factory-plain"] [data-preset-delete]')).toHaveCount(0);
+  await expect(page.locator('#brush-import, #brush-edit-open')).toHaveCount(0);
+  await page.locator('.brush-row', { hasText: 'Grid' }).dragTo(page.locator('[data-preset-use="factory-plain"]'));
+  const order = await page.locator('.brush-loose [data-preset-use]').allTextContents();
+  expect(order.indexOf('Grid')).toBeLessThan(order.indexOf('Plain'));
+
+  await page.locator('#brush-add').click();
+  await expect(page.locator('#brush-name')).toHaveValue('New brush');
+  await page.locator('#brush-edit-back').click();
+  await expect(page.locator('.brush-row[aria-pressed="true"]')).toContainText('New brush');
+
+  await page.locator('.brush-list-bar').click({ button: 'right' });
+  page.once('dialog', dialog => dialog.accept('Inks'));
+  await page.locator('[data-category-new]').click();
+  await expect(page.locator('.brush-category-head')).toContainText('Inks');
+  await page.locator('.brush-row', { hasText: 'New brush' }).dragTo(page.locator('.brush-category-head', { hasText: 'Inks' }));
+  await expect(page.locator('.brush-category-body .brush-row', { hasText: 'New brush' })).toBeVisible();
+  await page.locator('.brush-category-body .brush-row', { hasText: 'New brush' }).dragTo(page.locator('[data-preset-use="factory-plain"]'));
+  await expect(page.locator('.brush-loose .brush-row', { hasText: 'New brush' })).toBeVisible();
+  await page.locator('.brush-loose .brush-row', { hasText: 'New brush' }).dragTo(page.locator('.brush-category-head', { hasText: 'Inks' }));
+  await expect(page.locator('.brush-category-body .brush-row', { hasText: 'New brush' })).toBeVisible();
+
+  await page.locator('.brush-category-head', { hasText: 'Inks' }).click();
+  await expect(page.locator('.brush-category-body')).toBeHidden();
+  await page.locator('.brush-category-head', { hasText: 'Inks' }).click();
+  await expect(page.locator('.brush-category-body')).toBeVisible();
+
+  await page.locator('.brush-category-head', { hasText: 'Inks' }).click({ button: 'right' });
+  await expect(page.locator('[data-category-default] .menu-mark')).toHaveClass(/on/);
+  await page.locator('[data-category-default]').click();
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-library').click();
+  await expect(page.locator('.brush-category-body')).toBeHidden();
+
+  await page.locator('.brush-category-head', { hasText: 'Inks' }).click({ button: 'right' });
+  await page.locator('[data-category-delete]').click();
+  await expect(page.locator('#confirm-body')).toHaveText('Delete this category?');
+  await page.locator('#confirm-ok').click();
+  await expect(page.locator('#confirm-body')).toHaveText('Delete every brush in this category too?');
+  await page.locator('#confirm-ok').click();
+  await expect(page.locator('.brush-category-head')).toHaveCount(0);
+  await expect(page.locator('.brush-row', { hasText: 'New brush' })).toHaveCount(0);
+
+  await page.locator('#brush-add').click();
+  await page.locator('#brush-edit-back').click();
+  await page.locator('.brush-row', { hasText: 'New brush' }).locator('[data-preset-delete]').click();
+  await expect(page.locator('#confirm-body')).toHaveText('Delete this brush?');
+  await page.locator('#confirm-ok').click();
+  await expect(page.locator('#confirm-dialog')).toBeHidden();
+  await expect(page.locator('.brush-row', { hasText: 'New brush' })).toHaveCount(0);
 });
 
 test.describe('touchscreen', () => {

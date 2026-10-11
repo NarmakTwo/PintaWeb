@@ -26,6 +26,7 @@ export interface StoredGroup {
 }
 
 export interface StoredDocument {
+  id?: string;
   name: string;
   width: number;
   height: number;
@@ -48,14 +49,41 @@ export interface SessionRecord {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(DB_NAME, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      if (!db.objectStoreNames.contains('brushes')) db.createObjectStore('brushes');
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+}
+
+export async function loadBrushRecord(): Promise<unknown> {
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction('brushes').objectStore('brushes').get('library');
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function saveBrushRecord(record: unknown): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = db.transaction('brushes', 'readwrite').objectStore('brushes').put(record, 'library');
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
 }
 
 export async function loadSession(): Promise<SessionRecord | null> {
@@ -76,6 +104,63 @@ export async function saveSession(record: SessionRecord): Promise<void> {
   try {
     await new Promise<void>((resolve, reject) => {
       const request = db.transaction(STORE, 'readwrite').objectStore(STORE).put(record, 'current');
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+const HANDLE_KEY = 'handles';
+
+export async function loadFileHandles(): Promise<Record<string, FileSystemFileHandle>> {
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(STORE).objectStore(STORE).get(HANDLE_KEY);
+      request.onsuccess = () => {
+        const value = request.result;
+        resolve(value && typeof value === 'object' ? value as Record<string, FileSystemFileHandle> : {});
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function storeFileHandles(handles: Record<string, FileSystemFileHandle>): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = db.transaction(STORE, 'readwrite').objectStore(STORE).put(handles, HANDLE_KEY);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function saveFileHandle(id: string, handle: FileSystemFileHandle): Promise<void> {
+  const handles = await loadFileHandles();
+  handles[id] = handle;
+  await storeFileHandles(handles);
+}
+
+export async function forgetFileHandle(id: string): Promise<void> {
+  const handles = await loadFileHandles();
+  if (!handles[id]) return;
+  delete handles[id];
+  await storeFileHandles(handles);
+}
+
+export async function clearFileHandles(): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(HANDLE_KEY);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });

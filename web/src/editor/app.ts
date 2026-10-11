@@ -5,10 +5,15 @@ import {
   createIcons,
 } from 'lucide';
 import { ADJUSTMENTS, ALL_EFFECTS, EFFECTS, performEffect, valuesFrom, type AdjustValues, type Field } from './commands.ts';
+import { mountCustomize, openCustomize } from './customize.ts';
 import { BLEND_MODES, DEFAULT_TAG, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
-import { canvasToPng, downloadBlob, parsePalette, serializePalette } from './storage.ts';
+import { activePreset, clearAdjust, closeBrushPanel, hasLastStroke, loadBrushes, mountBrushes, paintBrushMark, refreshBrushPreview, startAdjust, strokeSerial } from './brushes.ts';
+import {
+  effectiveShortcut, getLayout, loadLayout, matchShortcut, MENU_IDS, menuEntries, menuIsCustom, onLayout, setDocks, shortcutLabel, type MenuId,
+} from './layout.ts';
+import { canvasToPng, downloadBlob, parsePalette, saveFileHandle, serializePalette } from './storage.ts';
 import { ToolController } from './tools.ts';
-import { boundsOf, DEFAULT_PALETTE, TOOLS, toolFromShortcut, type ToolId, type Unit } from './types.ts';
+import { boundsOf, DEFAULT_PALETTE, TOOLS, type ToolId, type Unit } from './types.ts';
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
@@ -45,6 +50,7 @@ function ask(id: string): Promise<string> {
 }
 
 export async function start(): Promise<void> {
+  loadLayout();
   const editor = new Editor();
   const tools = new ToolController(editor);
   buildChrome(editor, tools);
@@ -67,6 +73,23 @@ export async function start(): Promise<void> {
     app.dataset.saveSerial = String(editor.saveSerial);
   };
   wire(editor, tools);
+  applyDocks();
+  refillMenus();
+  mountCustomize(name => {
+    if (name !== 'pixel') return;
+    editor.show.grid = true;
+    editor.paintOverlay();
+    editor.notify();
+  });
+  mountBrushes(editor);
+  onLayout(() => {
+    renderToolbox(editor, tools);
+    applyDocks();
+    refillMenus();
+    paintBrushMark(editor);
+    editor.notify();
+  });
+  void loadBrushes().then(() => paintBrushMark(editor));
   try {
     await editor.init();
     const fresh = new URLSearchParams(location.search).has('fresh');
@@ -112,24 +135,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
     bar.append(wrap);
   }
   syncInstallItem();
-  const list = $('tool-list');
-  for (const tool of TOOLS) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'tool-button';
-    button.dataset.tool = tool.id;
-    button.title = `${tool.label} (${tool.shortcut})`;
-    button.setAttribute('aria-label', tool.label);
-    button.setAttribute('aria-pressed', String(tool.id === editor.tool));
-    button.innerHTML = CUSTOM_ICONS[tool.icon] ?? `<i data-lucide="${tool.icon}"></i>`;
-    button.addEventListener('click', () => {
-      tools.commitText();
-      if (tool.id === 'picker') editor.rememberTool();
-      editor.tool = tool.id;
-      editor.notify();
-    });
-    list.append(button);
-  }
+  renderToolbox(editor, tools);
   const shortcuts = $('shortcuts-list');
   const rows = [
     ['New', 'Ctrl+N'], ['Open', 'Ctrl+O'], ['Save', 'Ctrl+S'], ['Save As', 'Ctrl+Shift+S'], ['Close', 'Ctrl+W'],
@@ -160,7 +166,7 @@ function buildChrome(editor: Editor, tools: ToolController): void {
 }
 
 function item(label: string, command: string, shortcut = ''): string {
-  return `<button type="button" data-command="${command}">${label}${shortcut ? `<span class="shortcut">${shortcut}</span>` : ''}</button>`;
+  return `<button type="button" data-command="${command}">${label}${shortcut ? `<span class="shortcut" data-keys="${command}">${shortcut}</span>` : ''}</button>`;
 }
 
 function fileMenu(): string {
@@ -180,7 +186,8 @@ function editMenu(): string {
     item('Cut', 'cut', 'Ctrl+X'), item('Copy', 'copy', 'Ctrl+C'), item('Copy Merged', 'copy-merged', 'Ctrl+Shift+C'),
     item('Paste', 'paste', 'Ctrl+V'), item('Paste Into New Layer', 'paste-layer', 'Ctrl+Shift+V'), item('Paste Into New Image', 'paste-image'), '<div class="sep"></div>',
     item('Erase Selection', 'erase-selection'), item('Fill Selection', 'fill-selection'), item('Invert Selection', 'invert-selection'), item('Offset Selection…', 'offset-selection'), '<div class="sep"></div>',
-    item('Select All', 'select-all', 'Ctrl+A'), item('Deselect', 'deselect', 'Ctrl+D'),
+    item('Select All', 'select-all', 'Ctrl+A'), item('Deselect', 'deselect', 'Ctrl+D'), '<div class="sep"></div>',
+    item('Adjust Last Stroke', 'adjust-stroke'),
   ].join('');
 }
 
@@ -223,8 +230,113 @@ function layerMenu(): string {
   ].join('');
 }
 
+function renderToolbox(editor: Editor, tools: ToolController): void {
+  const list = $('tool-list');
+  list.replaceChildren();
+  for (const id of getLayout().tools) {
+    const tool = TOOLS.find(item => item.id === id);
+    if (!tool) continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tool-button';
+    button.dataset.tool = tool.id;
+    button.title = `${tool.label} (${shortcutLabel(effectiveShortcut(tool.id)) || tool.shortcut})`;
+    button.setAttribute('aria-label', tool.label);
+    button.setAttribute('aria-pressed', String(tool.id === editor.tool));
+    button.innerHTML = CUSTOM_ICONS[tool.icon] ?? `<i data-lucide="${tool.icon}"></i>`;
+    button.addEventListener('click', () => {
+      tools.commitText();
+      if (tool.id === 'picker') editor.rememberTool();
+      editor.tool = tool.id;
+      editor.notify();
+    });
+    list.append(button);
+  }
+}
+
+function applyDocks(): void {
+  const layout = getLayout();
+  const workspace = document.querySelector('.workspace') as HTMLElement | null;
+  if (workspace) workspace.dataset.side = layout.toolboxSide;
+  const toolbox = $('toolbox');
+  const docks = $('docks');
+  const tools = $('tool-list');
+  for (const entry of layout.docks) {
+    const node = document.getElementById(`dock-${entry.id}`);
+    if (!node) continue;
+    node.classList.toggle('collapsed', entry.collapsed);
+    (entry.side === 'toolbox' ? toolbox : docks).append(node);
+  }
+  toolbox.prepend(tools);
+  const side = layout.docks.filter(entry => entry.side === 'docks');
+  docks.classList.toggle('all-collapsed', side.length > 0 && side.every(entry => entry.collapsed));
+}
+
+function customMenu(id: MenuId): string {
+  return menuEntries(id).map(entry => {
+    if (entry === 'sep') return '<div class="sep"></div>';
+    if (entry.startsWith('effect:')) {
+      const spec = ALL_EFFECTS.find(effect => effect.id === entry.slice(7));
+      return spec ? `<button type="button" data-effect="${spec.id}" data-dialog="${spec.fields ? '1' : '0'}">${spec.label}</button>` : '';
+    }
+    if (entry === 'toggle-snap') return '<button type="button" data-command="toggle-snap">Snap to Grid<span class="shortcut" id="snap-mark">Off</span></button>';
+    if (entry === 'toggle-cursor') return '<button type="button" data-command="toggle-cursor">Tool cursor<span class="shortcut" id="cursor-mark">On</span></button>';
+    if (entry === 'theme-dark') return '<button type="button" data-command="theme-dark">Dark theme<span class="shortcut" id="theme-mark">Off</span></button>';
+    if (entry === 'install') return '<button type="button" data-command="install" disabled>Install Pinta</button>';
+    if (entry === 'file-access') return fileAccessButton();
+    return item(commandText(entry), entry, shortcutLabel(effectiveShortcut(entry)));
+  }).join('');
+}
+
+function commandText(id: string): string {
+  const labels: Record<string, string> = {
+    new: 'New…', open: 'Open…', close: 'Close', 'close-all': 'Close All', save: 'Save', 'save-as': 'Save As…', 'save-all': 'Save All',
+    'import-layer': 'Import as Layer…', 'open-palette': 'Open Palette…', 'save-palette': 'Save Palette', 'reset-palette': 'Reset Palette',
+    screenshot: 'Take Screenshot…', quit: 'Quit', undo: 'Undo', redo: 'Redo', cut: 'Cut', copy: 'Copy', 'copy-merged': 'Copy Merged',
+    paste: 'Paste', 'paste-layer': 'Paste Into New Layer', 'paste-image': 'Paste Into New Image', 'erase-selection': 'Erase Selection',
+    'fill-selection': 'Fill Selection', 'invert-selection': 'Invert Selection', 'offset-selection': 'Offset Selection…', 'select-all': 'Select All',
+    deselect: 'Deselect', 'adjust-stroke': 'Adjust Last Stroke', 'zoom-in': 'Zoom In', 'zoom-out': 'Zoom Out', 'zoom-100': 'Normal Size',
+    'zoom-fit': 'Best Fit', 'zoom-selection': 'Zoom to Selection', 'toggle-rulers': 'Rulers', 'toggle-status': 'Status Bar', 'toggle-tools': 'Tool Box',
+    'toggle-toolbar': 'Tool Options', 'toggle-docks': 'Layers and History', 'toggle-tabs': 'Image Tabs', 'toggle-grid': 'Pixel Grid',
+    'toggle-selection': 'Selection Outline', 'toggle-assistant': 'Assistant', 'canvas-size': 'Resize Canvas…', 'image-size': 'Resize Image…',
+    'crop-canvas': 'Crop to Selection', flatten: 'Flatten', rotate: 'Rotate 90° Clockwise', 'flip-horizontal': 'Flip Horizontal', 'flip-vertical': 'Flip Vertical',
+    'layer-add': 'Add Layer', 'layer-delete': 'Delete Layer', 'layer-duplicate': 'Duplicate Layer', 'layer-merge': 'Merge Down', 'layer-import': 'Import from File…',
+    'layer-flip-h': 'Flip Horizontal', 'layer-flip-v': 'Flip Vertical', 'layer-rotate-cw': 'Rotate 90° Clockwise', 'layer-rotate-ccw': 'Rotate 90° Counterclockwise',
+    'layer-offset': 'Offset Layer…', 'layer-properties': 'Layer Properties…', customize: 'Customize', 'file-access': 'Give File Access', 'toggle-fullscreen': 'Fullscreen',
+    shortcuts: 'Keyboard Shortcuts', about: 'About',
+  };
+  return labels[id] ?? id;
+}
+
+function refillMenus(): void {
+  const markup: Record<MenuId, string> = {
+    file: fileMenu(), edit: editMenu(), view: viewMenu(), image: imageMenu(), layers: layerMenu(),
+    adjustments: effectButtons(ADJUSTMENTS), effects: effectGroups(), window: windowMenu(), help: helpMenu(),
+  };
+  for (const id of MENU_IDS) {
+    const panel = document.getElementById(`panel-${id}`);
+    if (!panel) continue;
+    panel.innerHTML = menuIsCustom(id) ? customMenu(id) : markup[id];
+  }
+  syncInstallItem();
+  document.querySelectorAll<HTMLButtonElement>('[data-category-toggle]').forEach(button => {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      const sub = button.nextElementSibling as HTMLElement | null;
+      if (!sub) return;
+      sub.hidden = !sub.hidden;
+      button.classList.toggle('open', !sub.hidden);
+      button.setAttribute('aria-expanded', String(!sub.hidden));
+    });
+  });
+}
+
+function fileAccessButton(): string {
+  return '<button type="button" data-command="file-access">Give File Access<span class="shortcut" id="file-access-mark">Off</span></button>';
+}
+
 function windowMenu(): string {
-  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), '<div class="sep"></div>', '<button type="button" data-command="install" disabled>Install Pinta</button>'].join('');
+  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), item('Customize', 'customize'), '<div class="sep"></div>', fileAccessButton(), '<button type="button" data-command="install" disabled>Install Pinta</button>'].join('');
 }
 
 type InstallEvent = Event & { prompt: () => Promise<void> };
@@ -312,6 +424,11 @@ function effectGroups(): string {
 }
 
 function wire(editor: Editor, tools: ToolController): void {
+  document.body.addEventListener('click', event => {
+    const id = (event.target as HTMLElement).closest<HTMLElement>('[data-dock-expand]')?.dataset.dockExpand;
+    if (!id) return;
+    setDocks(getLayout().docks.map(dock => dock.id === id ? { ...dock, collapsed: false } : dock));
+  });
   $('document-name').addEventListener('dblclick', () => {
     const doc = editor.doc;
     const host = $('document-name');
@@ -788,6 +905,16 @@ function wire(editor: Editor, tools: ToolController): void {
 }
 
 async function run(editor: Editor, tools: ToolController, command: string): Promise<void> {
+  if (command === 'customize') {
+    openCustomize();
+    return;
+  }
+  if (command === 'adjust-stroke') {
+    startAdjust(editor);
+    editor.paintOverlay();
+    editor.notify();
+    return;
+  }
   const doc = editor.doc;
   if (command === 'new') {
     const answer = await ask('new-dialog');
@@ -797,7 +924,13 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
     editor.newDocument(width, height, $<HTMLSelectElement>('new-background').value);
     return;
   }
-  if (command === 'open') $<HTMLInputElement>('file-input').click();
+  if (command === 'open') {
+    if (fileAccessOn() && pickerAvailable()) {
+      const opened = await openWithAccess(editor);
+      if (opened) return;
+    }
+    $<HTMLInputElement>('file-input').click();
+  }
   else if (command === 'import-layer') $<HTMLInputElement>('layer-input').click();
   else if (command === 'close') await closeAt(editor, editor.index);
   else if (command === 'close-all') {
@@ -808,6 +941,7 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   } else if (command === 'save') await save(editor, false);
   else if (command === 'save-as') await save(editor, true);
   else if (command === 'save-all') await saveAll(editor);
+  else if (command === 'file-access') await giveFileAccess(editor);
   else if (command === 'open-palette') $<HTMLInputElement>('palette-input').click();
   else if (command === 'save-palette') downloadBlob(new Blob([serializePalette(editor.palette)], { type: 'text/plain' }), 'palette.txt');
   else if (command === 'reset-palette') {
@@ -960,9 +1094,176 @@ function swapColors(editor: Editor): void {
   editor.notify();
 }
 
+interface FileAccessHandle extends FileSystemFileHandle {
+  queryPermission(descriptor: { mode: 'readwrite' }): Promise<PermissionState>;
+  requestPermission(descriptor: { mode: 'readwrite' }): Promise<PermissionState>;
+}
+
+interface FilePickerType {
+  description: string;
+  accept: Record<string, string[]>;
+}
+
+interface FilePickerHost {
+  showOpenFilePicker?: (options: { id?: string; multiple?: boolean; types?: FilePickerType[] }) => Promise<FileAccessHandle[]>;
+  showSaveFilePicker?: (options: { id?: string; suggestedName?: string; types?: FilePickerType[] }) => Promise<FileAccessHandle>;
+}
+
+const IMAGE_TYPES: FilePickerType[] = [
+  { description: 'PNG', accept: { 'image/png': ['.png'] } },
+  { description: 'JPEG', accept: { 'image/jpeg': ['.jpg', '.jpeg'] } },
+  { description: 'WebP', accept: { 'image/webp': ['.webp'] } },
+  { description: 'BMP', accept: { 'image/bmp': ['.bmp'] } },
+];
+
+const SAVE_TYPES: FilePickerType[] = [
+  ...IMAGE_TYPES,
+  { description: 'Pinta', accept: { 'application/octet-stream': ['.pinta'] } },
+];
+
+function fileHost(): FilePickerHost {
+  return window as unknown as FilePickerHost;
+}
+
+function fileAccessOn(): boolean {
+  try { return localStorage.getItem('pinta-file-access') === '1'; } catch { return false; }
+}
+
+function pickerAvailable(): boolean {
+  const host = fileHost();
+  return typeof host.showOpenFilePicker === 'function' && typeof host.showSaveFilePicker === 'function';
+}
+
+function mimeFromName(name: string): string | null {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.bmp')) return 'image/bmp';
+  if (lower.endsWith('.pinta')) return 'application/pinta';
+  return null;
+}
+
+async function permit(handle: FileSystemFileHandle): Promise<boolean> {
+  const access = handle as FileAccessHandle;
+  const mode = { mode: 'readwrite' as const };
+  if (await access.queryPermission(mode) === 'granted') return true;
+  return await access.requestPermission(mode) === 'granted';
+}
+
+async function pickSave(name: string): Promise<FileSystemFileHandle | null> {
+  const pick = fileHost().showSaveFilePicker;
+  if (!pick) return null;
+  try {
+    return await pick({ id: 'pinta-image', suggestedName: name, types: SAVE_TYPES });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return null;
+    throw error;
+  }
+}
+
+async function rememberHandle(editor: Editor, handle: FileSystemFileHandle): Promise<void> {
+  const doc = editor.doc;
+  if (!doc) return;
+  doc.fileHandle = handle;
+  const mime = mimeFromName(handle.name);
+  if (mime) doc.fileMime = mime;
+  doc.name = handle.name;
+  doc.fileBase = handle.name.replace(/\.[^.]+$/, '') || doc.fileBase;
+  try { await saveFileHandle(doc.id, handle); } catch { /* the handle still works for this visit */ }
+  editor.notify();
+}
+
+async function giveFileAccess(editor: Editor): Promise<void> {
+  if (!pickerAvailable()) {
+    editor.toast('This browser cannot save directly to a file.');
+    return;
+  }
+  try { localStorage.setItem('pinta-file-access', '1'); } catch { /* preference stays off */ }
+  const doc = editor.doc;
+  if (!doc) {
+    editor.toast('File access is on. Open or save an image to choose its file.');
+    return;
+  }
+  if (doc.fileHandle) {
+    const allowed = await permit(doc.fileHandle);
+    editor.toast(allowed ? `Save writes to ${doc.fileHandle.name}.` : 'File access was not granted.');
+    editor.notify();
+    return;
+  }
+  const mime = doc.fileMime ?? 'image/png';
+  const filename = doc.name.includes('.') ? doc.name : `${doc.fileBase}${EXT[mime] ?? '.png'}`;
+  let handle: FileSystemFileHandle | null;
+  try { handle = await pickSave(filename); } catch {
+    editor.toast('Could not open the file picker.');
+    return;
+  }
+  if (!handle) return;
+  if (!await permit(handle)) {
+    editor.toast('File access was not granted.');
+    return;
+  }
+  await rememberHandle(editor, handle);
+  editor.toast(`Save writes to ${handle.name}.`);
+}
+
+async function openWithAccess(editor: Editor): Promise<boolean> {
+  try {
+    const pick = fileHost().showOpenFilePicker;
+    if (!pick) return false;
+    const [handle] = await pick({ id: 'pinta-image', multiple: false, types: IMAGE_TYPES });
+    const file = await handle.getFile();
+    const before = editor.docs.length;
+    await editor.openFile(file, false);
+    if (editor.docs.length === before || !editor.doc) return true;
+    const mime = mimeFromName(file.name) ?? (file.type.startsWith('image/') ? file.type : null);
+    if (mime) editor.doc.fileMime = mime;
+    await rememberHandle(editor, handle);
+    return true;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return true;
+    if (error instanceof DOMException) return false;
+    editor.toast('This file could not be opened.');
+    return true;
+  }
+}
+
+async function saveToHandle(editor: Editor, saveAs: boolean): Promise<boolean> {
+  const doc = editor.doc;
+  if (!doc) return false;
+  let mime = doc.fileMime ?? 'image/png';
+  let filename = doc.name.includes('.') ? doc.name : `${doc.fileBase}${EXT[mime] ?? '.png'}`;
+  let handle = saveAs ? null : doc.fileHandle;
+  if (!handle) {
+    try { handle = await pickSave(filename); } catch {
+      editor.toast('Could not open the file picker.');
+      return false;
+    }
+    if (!handle) return false;
+  }
+  if (!await permit(handle)) {
+    editor.toast('File access was denied.');
+    return false;
+  }
+  const picked = mimeFromName(handle.name);
+  if (picked) mime = picked;
+  filename = handle.name;
+  try {
+    if (mime === 'application/pinta') await editor.exportPinta(filename, handle);
+    else await editor.exportImage(mime, filename, handle);
+  } catch {
+    editor.toast('Could not save the file.');
+    return false;
+  }
+  await rememberHandle(editor, handle);
+  editor.toast(`Saved ${filename}.`);
+  return true;
+}
+
 async function save(editor: Editor, saveAs: boolean): Promise<boolean> {
   const doc = editor.doc;
   if (!doc) return false;
+  if (fileAccessOn() && pickerAvailable()) return saveToHandle(editor, saveAs);
   let mime = doc.fileMime ?? 'image/png';
   let filename = doc.name.includes('.') ? doc.name : `${doc.fileBase}${EXT[mime]}`;
   if (saveAs || !doc.fileMime) {
@@ -1125,8 +1426,6 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   if (ctrl && !event.shiftKey && key === 'd') {
     event.preventDefault();
     event.stopPropagation();
-    if (!editing()) editor.deselect();
-    return;
   }
   if (event.key === ' ' && !editing()) {
     editor.space = true;
@@ -1143,26 +1442,48 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   }
   if (event.key === 'Alt') event.preventDefault();
   if (event.target instanceof HTMLSelectElement && !ctrl && event.key !== 'Escape') return;
-  if (ctrl && key === 'n') { event.preventDefault(); void run(editor, tools, 'new'); }
-  else if (ctrl && key === 'o') { event.preventDefault(); void run(editor, tools, 'open'); }
-  else if (ctrl && event.shiftKey && key === 's') { event.preventDefault(); void run(editor, tools, 'save-as'); }
-  else if (ctrl && key === 's') { event.preventDefault(); void run(editor, tools, 'save'); }
-  else if (ctrl && key === 'w') { event.preventDefault(); void run(editor, tools, 'close'); }
-  else if (ctrl && !event.shiftKey && key === 'z') { event.preventDefault(); editor.undo(); }
-  else if (ctrl && (key === 'y' || (event.shiftKey && key === 'z'))) { event.preventDefault(); editor.redo(); }
-  else if (ctrl && key === 'x') { event.preventDefault(); cut(editor); }
-  else if (ctrl && event.shiftKey && key === 'c') { event.preventDefault(); void copy(editor, true); }
-  else if (ctrl && key === 'c') { event.preventDefault(); void copy(editor, false); }
-  else if (ctrl && key === 'a') { event.preventDefault(); editor.selectAll(); }
-  else if (ctrl && event.shiftKey && key === 'n') { event.preventDefault(); editor.addLayer(); }
-  else if (ctrl && event.shiftKey && key === 'd') { event.preventDefault(); editor.duplicateLayer(); }
-  else if (ctrl && event.shiftKey && key === 'delete') { event.preventDefault(); editor.deleteLayer(); }
-  else if (ctrl && key === 'm') { event.preventDefault(); editor.mergeDown(); }
-  else if (ctrl && key === 'f') { event.preventDefault(); editor.flip(true, 'layer'); }
-  else if (!ctrl && event.shiftKey && key === 'f') { event.preventDefault(); editor.flip(false, 'layer'); }
-  else if (event.key === 'F4') { event.preventDefault(); void run(editor, tools, 'layer-properties'); }
-  else if (event.key === 'Escape') {
+  if (ctrl && event.shiftKey && key === 'z') {
+    event.preventDefault();
+    editor.redo();
+    return;
+  }
+  const hit = matchShortcut(event, editor.tool);
+  if (hit?.command?.startsWith('effect:')) {
+    event.preventDefault();
+    const spec = ALL_EFFECTS.find(effect => `effect:${effect.id}` === hit.command);
+    if (spec) void performEffect(editor, spec, askAdjust);
+    return;
+  }
+  if (hit?.tool) {
+    event.preventDefault();
+    tools.commitText();
+    if (hit.tool === 'picker') editor.rememberTool();
+    editor.tool = hit.tool;
+    editor.notify();
+    return;
+  }
+  if (hit?.command) {
+    event.preventDefault();
+    void run(editor, tools, hit.command);
+    return;
+  }
+  if (event.key === 'Escape') {
     if (document.activeElement?.classList.contains('document-rename')) return;
+    const customize = document.getElementById('customize-dialog') as HTMLDialogElement | null;
+    if (customize?.open) {
+      if (event.key === 'Escape' && (event.target as HTMLElement).dataset?.shortcut) event.preventDefault();
+      return;
+    }
+    const panel = document.getElementById('brush-panel');
+    if (panel && !panel.hidden) {
+      closeBrushPanel();
+      return;
+    }
+    if (editor.strokeHandles) {
+      clearAdjust(editor);
+      editor.paintOverlay();
+      return;
+    }
     if (!$('color-picker').hidden) closeColorPicker(editor);
     else if (!$('context-menu').hidden) closeContext();
     else if (editor.float) editor.cancelFloat();
@@ -1171,20 +1492,12 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
   else if (event.key === '[') { editor.size = Math.max(1, editor.size - 1); showDabCenter(editor); }
   else if (event.key === ']') { editor.size = Math.min(200, editor.size + 1); showDabCenter(editor); }
   else if (!ctrl && !event.altKey && key === 'x') swapColors(editor);
-  else if (!ctrl && !event.altKey && key.length === 1) {
-    const next = toolFromShortcut(key, editor.tool);
-    if (!next) return;
-    event.preventDefault();
-    tools.commitText();
-    if (next === 'picker') editor.rememberTool();
-    editor.tool = next;
-    editor.notify();
-  }
   if (event.key === '[' || event.key === ']' || key === 'x') editor.notify();
 }
 
 let optionTool: ToolId | null = null;
 let optionFloat = false;
+let optionStroke = -1;
 
 interface ContextEntry {
   label?: string;
@@ -1521,12 +1834,16 @@ function sync(editor: Editor): void {
     $('size-value').textContent = String(editor.size);
   }
   const floating = editor.tool === 'move-pixels' && !!editor.float;
-  if (optionTool !== editor.tool || optionFloat !== floating) {
+  const strokeMark = strokeSerial();
+  if (optionTool !== editor.tool || optionFloat !== floating || optionStroke !== strokeMark) {
     optionTool = editor.tool;
     optionFloat = floating;
+    optionStroke = strokeMark;
     $('tool-extra').innerHTML = extraOptions(editor);
     bindExtra(editor);
   }
+  paintBrushMark(editor);
+  refreshBrushPreview(editor);
   const smoothValue = document.getElementById('smooth-value');
   const smoothSlider = document.getElementById('smooth-slider') as HTMLInputElement | null;
   if (smoothValue && smoothSlider && document.activeElement !== smoothSlider) {
@@ -1543,6 +1860,8 @@ function sync(editor: Editor): void {
   }
   const snapMark = document.getElementById('snap-mark');
   if (snapMark) snapMark.textContent = editor.snap ? 'On' : 'Off';
+  const accessMark = document.getElementById('file-access-mark');
+  if (accessMark) accessMark.textContent = editor.doc?.fileHandle ? 'On' : 'Off';
   const angleLabel = document.getElementById('view-angle');
   if (angleLabel) angleLabel.textContent = `${Math.round(editor.viewAngle * 180 / Math.PI)}°`;
   const note = document.getElementById('status-note');
@@ -1572,15 +1891,10 @@ function extraOptions(editor: Editor): string {
   if (drawing || tool === 'bucket' || tool === 'gradient') {
     parts.push(`<label class="option">Opacity <input id="opacity-slider" type="range" min="1" max="100" value="${editor.opacity}" /></label>`);
   }
-  if (tool === 'brush' || tool === 'eraser') {
-    const brushes = tool === 'brush' ? ['plain', 'circle', 'squares', 'splatter', 'slash', 'grid', 'smudge'] : ['plain', 'circle', 'squares', 'splatter', 'slash', 'grid'];
-    parts.push(`<label class="option">Brush <select id="brush-select">${brushes.map(id => `<option value="${id}" ${id === editor.brush ? 'selected' : ''}>${id === 'smudge' ? 'Smudge' : id}</option>`).join('')}</select></label>`);
-  }
   if (tool === 'brush' || tool === 'pen' || tool === 'pencil') {
     const symmetryLabels = { off: 'Off', vertical: 'Vertical', horizontal: 'Horizontal', orthogonal: 'Orthogonal' } as const;
     parts.push(`<label class="option">Symmetry <select id="symmetry-select">${(['off', 'vertical', 'horizontal', 'orthogonal'] as const).map(id => `<option value="${id}" ${id === editor.symmetry ? 'selected' : ''}>${symmetryLabels[id]}</option>`).join('')}</select></label>`);
   }
-  if (tool === 'eraser') parts.push(`<label class="option">Edge <select id="eraser-select"><option value="hard">Hard</option><option value="soft" ${editor.eraser === 'soft' ? 'selected' : ''}>Soft</option></select></label>`);
   if (tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') {
     parts.push(`<label class="option">Smoothing <input id="smooth-slider" type="range" min="0" max="100" value="${editor.smoothing[tool]}" /><output id="smooth-value">${editor.smoothing[tool]}</output></label>`);
     parts.push(`<label class="check"><input id="unserrate" type="checkbox" ${editor.unserrate[tool] ? 'checked' : ''}/> Unserrate</label>`);
@@ -1624,6 +1938,9 @@ function extraOptions(editor: Editor): string {
   if (tool === 'rect-select' || tool === 'ellipse-select' || tool === 'lasso' || tool === 'wand') {
     parts.push(`<label class="option">Mode <select id="select-mode">${['replace', 'union', 'exclude', 'xor', 'intersect'].map(id => `<option value="${id}" ${id === editor.selectionMode ? 'selected' : ''}>${id}</option>`).join('')}</select></label>`);
   }
+  if (hasLastStroke() && ['brush', 'eraser', 'pen', 'pencil', 'dither', 'recolor', 'random', 'lighten', 'darken'].includes(tool)) {
+    parts.push('<button type="button" id="adjust-stroke">Adjust</button>');
+  }
   return parts.join('');
 }
 
@@ -1633,12 +1950,15 @@ function bindExtra(editor: Editor): void {
     document.getElementById(id)?.addEventListener('change', event => apply((event.target as HTMLInputElement).value));
   };
   listen('opacity-slider', value => { editor.opacity = Number(value); });
-  listen('brush-select', value => { editor.brush = value as Editor['brush']; });
+  document.getElementById('adjust-stroke')?.addEventListener('click', () => {
+    startAdjust(editor);
+    editor.paintOverlay();
+    editor.notify();
+  });
   listen('symmetry-select', value => { editor.symmetry = value === 'vertical' || value === 'horizontal' || value === 'orthogonal' ? value : 'off'; });
   listen('sample-size', value => { editor.sampleSize = Math.max(1, Math.min(200, Number(value) || 1)); });
   listen('stroke-width', value => { editor.strokeWidth = Math.max(1, Math.min(64, Number(value) || 1)); });
   listen('text-style', value => { editor.textStyle = value === 'stroke' || value === 'both' ? value : 'fill'; });
-  listen('eraser-select', value => { editor.eraser = value === 'soft' ? 'soft' : 'hard'; });
   listen('tolerance-slider', value => { editor.tolerance = Number(value); });
   listen('shape-select', value => { editor.shape = value as Editor['shape']; });
   listen('corner-slider', value => { editor.corner = Number(value); });
@@ -1740,7 +2060,8 @@ function statusNote(editor: Editor): string {
   if (editor.paintingMask) return 'Painting the mask';
   if (editor.float && editor.tool === 'move-pixels') return 'Arrow keys nudge. Shift moves ten.';
   const tool = editor.tool;
-  if ((tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken') && editor.unserrate[tool] && editor.smoothing[tool] > 0) return 'Smoothing rounds a fast stroke';
+  const drawing = tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken';
+  if (drawing && editor.unserrate[tool] && activePreset(tool).stabilizer > 0) return 'Lag is on. The stroke catches up when you let go.';
   if ((tool === 'bucket' || tool === 'wand') && editor.smoothEdges) return 'Fills the soft edge.';
   if (editor.assistant) return editor.assistant.kind === 'parallel' ? 'Parallel lines' : editor.assistant.kind === 'ellipse' ? 'Ellipse guide' : 'Vanishing point';
   if (editor.assistantPlace) return 'Drag to place the guide.';

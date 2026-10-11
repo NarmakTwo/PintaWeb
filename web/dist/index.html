@@ -16,8 +16,8 @@
         document.querySelector('meta[name="theme-color"]').setAttribute('content', darkTheme ? '#242424' : '#fafafa');
       } catch (error) {}
     </script>
-    <script type="module" crossorigin src="/assets/index-B1v6RHTE.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DWBpiX8x.css">
+    <script type="module" crossorigin src="/assets/index-DAmFrvx2.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Bn7TyA5A.css">
   </head>
   <body>
     <div id="app">
@@ -44,7 +44,8 @@
       <div class="workspace">
         <aside id="toolbox" class="toolbox" aria-label="Toolbox">
           <div id="tool-list" class="tool-list" role="toolbar"></div>
-          <div class="colors">
+          <div id="dock-color" class="colors dock">
+            <button type="button" class="dock-strip" data-dock-expand="color">Color</button>
             <div class="swatches">
               <label class="color-field primary">
                 <span id="primary-swatch" class="swatch-face"></span>
@@ -92,7 +93,8 @@
         </div>
 
         <aside id="docks" class="docks">
-          <section class="dock" aria-labelledby="layers-heading">
+          <section id="dock-layers" class="dock" aria-labelledby="layers-heading">
+            <button type="button" class="dock-strip" data-dock-expand="layers">Layers</button>
             <header class="dock-head">
               <h2 id="layers-heading">Layers</h2>
               <div class="dock-actions">
@@ -102,7 +104,8 @@
             </header>
             <ol id="layer-list"></ol>
           </section>
-          <section class="dock" aria-labelledby="history-heading">
+          <section id="dock-history" class="dock" aria-labelledby="history-heading">
+            <button type="button" class="dock-strip" data-dock-expand="history">History</button>
             <header class="dock-head"><h2 id="history-heading">History</h2></header>
             <ol id="history-list"></ol>
           </section>
@@ -300,6 +303,6 @@
         <div class="dialog-actions"><button type="submit" value="ok">Close</button></div>
       </form>
     </dialog>
-
+
   </body>
 </html>
