@@ -2123,6 +2123,27 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await newCanvas(page, 64, 64);
   await page.locator('#brush-library').click();
   await expect(page.locator('.brush-row[aria-pressed="true"]')).toContainText('Plain');
+  await expect.poll(async () => page.locator('#brush-panel').evaluate(panel => panel.getBoundingClientRect().width)).toBeGreaterThan(300);
+  await expect.poll(async () => page.locator('.brush-swatch').first().evaluate(node => {
+    const canvas = node as HTMLCanvasElement;
+    const data = canvas.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height).data;
+    if (!data) return false;
+    let white = 0;
+    let black = 0;
+    let edge = 0;
+    let mid = 0;
+    const width = canvas.width;
+    for (let index = 0; index < data.length; index += 4) {
+      const x = (index / 4) % width;
+      const bright = data[index] > 200 && data[index + 1] > 200 && data[index + 2] > 200;
+      if (bright) {
+        white += 1;
+        if (x < width * 0.06) edge += 1;
+        if (x > width * 0.4 && x < width * 0.6) mid += 1;
+      } else if (data[index] < 24 && data[index + 1] < 24 && data[index + 2] < 24) black += 1;
+    }
+    return white > 30 && black > 30 && mid > 40 && edge < 24;
+  })).toBe(true);
   await expect(page.locator('.brush-row[data-preset="factory-plain"] [data-preset-delete]')).toHaveCount(0);
   await expect(page.locator('#brush-search')).toBeFocused();
   await page.locator('#brush-search').fill('grid');

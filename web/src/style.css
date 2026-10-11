@@ -760,10 +760,10 @@ dialog .check { justify-content: flex-start; }
 .shortcut-fields { display: grid; gap: 4px; max-height: 50vh; overflow: auto; }
 .shortcut-conflict { margin: 0; min-height: 1em; color: var(--muted); font-size: 12px; }
 #brush-panel {
-  position: fixed; z-index: 30; width: 240px; max-height: min(70vh, 560px); overflow: auto;
+  position: fixed; z-index: 30; width: 420px; max-height: min(70vh, 560px); overflow: auto;
   background: var(--chrome); border: 1px solid var(--line); box-shadow: var(--shadow); padding: 8px;
 }
-#brush-preview { width: 100%; height: 72px; background: repeating-conic-gradient(var(--field) 0% 25%, transparent 0% 50%) 0 0 / 12px 12px; }
+#brush-preview { width: 100%; height: 72px; background: #000000; }
 .brush-tabs { display: flex; gap: 4px; }
 .brush-tabs button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 #brush-list button, #brush-edit button, #brush-edit select, #brush-edit input { max-width: 100%; }
@@ -780,10 +780,21 @@ dialog .check { justify-content: flex-start; }
   width: 28px; height: 28px; max-width: 28px; padding: 0; display: grid; place-items: center;
 }
 .brush-list-bar svg, .brush-icon svg { width: 16px; height: 16px; }
-.brush-row { display: flex; align-items: center; gap: 2px; border-radius: 6px; }
+.brush-row { display: flex; align-items: center; gap: 2px; min-height: 64px; border-radius: 6px; }
 .brush-row[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 .brush-row [data-preset-use] {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; color: inherit;
+  flex: 1; min-width: 0; display: flex; flex-direction: row; align-items: center; gap: 8px;
+  padding: 6px 4px; text-align: left; color: inherit;
+}
+.brush-swatch {
+  width: 156px; height: 56px; flex: 0 0 auto; background: #000000; border-radius: 8px;
+}
+.brush-tip {
+  width: 26px; height: 26px; flex: 0 0 auto; border-radius: 50%; background: #141414;
+}
+.brush-name {
+  flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  line-height: 1.2; text-align: left;
 }
 .brush-delete, .brush-row[aria-pressed="true"] .brush-delete { color: var(--danger); }
 .brush-row.drag-over, .brush-category-head.drag-over, .brush-loose.drag-over, .brush-category-body.drag-over { outline: 1px solid var(--accent); }

@@ -1103,13 +1103,97 @@ async function scaleFile(file: File): Promise<string | null> {
   }
 }
 
-function previewCurve(): StrokeSample[] {
+function strokeCurve(width: number, height: number, inset: number, bow: number): StrokeSample[] {
   const points: StrokeSample[] = [];
-  for (let step = 0; step <= 16; step++) {
-    const amount = step / 16;
-    points.push({ x: 12 + amount * 196, y: 36 + Math.sin(amount * Math.PI) * 22, t: step * 16 });
+  for (let step = 0; step <= 20; step++) {
+    const amount = step / 20;
+    points.push({
+      x: width * inset + amount * width * (1 - inset * 2),
+      y: height * 0.54 - Math.sin(amount * Math.PI) * height * bow,
+      t: step * 14,
+    });
   }
   return points;
+}
+
+function previewRandom(id: string): () => number {
+  let seed = 2166136261;
+  for (let index = 0; index < id.length; index++) {
+    seed ^= id.charCodeAt(index);
+    seed = Math.imul(seed, 16777619);
+  }
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let value = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function previewSamples(brush: BrushPreset, curve: StrokeSample[], size: number): StrokeSample[] {
+  const stamps = Math.max(1, Math.min(16, brush.stamps || 1));
+  const spacing = Math.max(1, brush.spacing || 1);
+  const gap = Math.max(size * 0.08, (size * spacing) / 100);
+  const samples = resample(curve, gap);
+  const limit = Math.max(14, Math.floor(80 / stamps));
+  if (samples.length <= limit) return samples;
+  return resample(curve, gap * (samples.length / limit));
+}
+
+function paintPreviewStroke(ctx: CanvasRenderingContext2D, brush: BrushPreset, samples: StrokeSample[], size: number, pinch: boolean): void {
+  const rand = previewRandom(brush.id);
+  const length = pathLength(samples);
+  let traveled = 0;
+  let grainRoll = brush.grainJitter ? rand() * 512 : 0;
+  for (let index = 0; index < samples.length; index++) {
+    const point = samples[index];
+    const previous = samples[Math.max(0, index - 1)];
+    const step = Math.hypot(point.x - previous.x, point.y - previous.y);
+    traveled += step;
+    grainRoll += step * ((brush.grainMove ?? 100) / 100);
+    const along = length > 0 ? traveled / length : 0.5;
+    const body = pinch ? Math.sin(Math.max(0, Math.min(1, along)) * Math.PI) : 1;
+    let scale = body;
+    const head = length * brush.taperIn / 100;
+    const tail = length * brush.taperOut / 100;
+    if (brush.taperSize && head > 0 && traveled < head) scale *= smoothstep(traveled / head);
+    if (brush.taperSize && tail > 0 && traveled > length - tail) scale *= smoothstep((length - traveled) / tail);
+    if (scale < 0.045) continue;
+    const angle = Math.atan2(point.y - previous.y, point.x - previous.x);
+    const baseRotation = brush.rotation === 'follow' ? angle : brush.rotation === 'jitter' ? rand() * Math.PI * 2 : (brush.angle * Math.PI) / 180;
+    const reach = Math.min(size * ((brush.scatter || 0) / 100), size * 0.55) * Math.max(0.2, body);
+    const side = brush.scatter > 0 ? (rand() * 2 - 1) * reach : 0;
+    const ox = point.x + Math.cos(angle + Math.PI / 2) * side;
+    const oy = point.y + Math.sin(angle + Math.PI / 2) * side;
+    let flow = brush.flow / 100;
+    if (brush.opacityJitter > 0) flow *= 1 - rand() * (brush.opacityJitter / 100);
+    flow = Math.max((brush.minOpacity || 0) / 100, Math.min((brush.maxOpacity ?? 100) / 100, flow));
+    flow = Math.max(0.22, dabFlow(brush, flow));
+    const count = Math.max(1, Math.min(16, brush.stamps || 1));
+    for (let stamp = 0; stamp < count; stamp++) {
+      const spread = Math.max(0.2, body);
+      const alongJ = stamp === 0 ? 0 : (rand() * 2 - 1) * size * (0.28 + (brush.scatter || 0) / 260) * spread;
+      const across = stamp === 0 ? 0 : (rand() * 2 - 1) * size * 0.22 * spread;
+      const jx = ox + Math.cos(angle) * alongJ + Math.cos(angle + Math.PI / 2) * across;
+      const jy = oy + Math.sin(angle) * alongJ + Math.sin(angle + Math.PI / 2) * across;
+      const swing = brush.sizeJitter > 0 ? Math.max(0.15, 1 + (rand() * 2 - 1) * (brush.sizeJitter / 100)) : 1;
+      const radius = Math.max(0.6, (size * scale * swing) / 2);
+      let rotation = brush.rotation === 'jitter' ? rand() * Math.PI * 2 : baseRotation;
+      if ((brush.twist ?? 0) > 0) rotation += (rand() * 2 - 1) * Math.PI * ((brush.twist ?? 0) / 100);
+      const flipH = !!brush.flipX && rand() < 0.5;
+      const flipV = !!brush.flipY && rand() < 0.5;
+      stampDab(ctx, brush, jx, jy, radius, rotation, '#ffffff', flow, false, flipH, flipV, grainRoll);
+    }
+  }
+  const wet = brush.wetEdge ?? 0;
+  if (wet <= 0) return;
+  const copy = document.createElement('canvas');
+  copy.width = ctx.canvas.width;
+  copy.height = ctx.canvas.height;
+  copy.getContext('2d')?.drawImage(ctx.canvas, 0, 0);
+  ctx.filter = `blur(${Math.max(0.4, wet / 40)}px)`;
+  ctx.drawImage(copy, 0, 0);
+  ctx.filter = 'none';
 }
 
 export function refreshBrushPreview(editor: Editor): void {
@@ -1118,23 +1202,156 @@ export function refreshBrushPreview(editor: Editor): void {
   if (!canvas || !panel || panel.hidden) return;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
   const brush = currentPreset();
-  const samples = previewCurve();
-  const size = Math.max(2, Math.min(28, editor.size));
-  let traveled = 0;
-  const length = pathLength(samples);
-  for (let index = 0; index < samples.length; index++) {
-    const point = samples[index];
-    const previous = samples[Math.max(0, index - 1)];
-    traveled += Math.hypot(point.x - previous.x, point.y - previous.y);
-    const head = length * brush.taperIn / 100;
-    let scale = brush.taperSize && head > 0 && traveled < head ? smoothstep(traveled / head) : 1;
-    const radius = Math.max(0.8, (size * scale) / 2);
-    const angle = Math.atan2(point.y - previous.y, point.x - previous.x);
-    const rotation = brush.rotation === 'follow' ? angle : (brush.angle * Math.PI) / 180;
-    stampDab(ctx, brush, point.x, point.y, radius, rotation, editor.primary, brush.flow / 100, brush.tab === 'erase');
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const size = canvas.height * 0.62;
+  paintPreviewStroke(ctx, brush, previewSamples(brush, strokeCurve(canvas.width, canvas.height, 0.04, 0.2), size), size, false);
+  noteSwatches(editor);
+}
+
+const SWATCH_W = 312;
+const SWATCH_H = 112;
+let swatchEditor: Editor | null = null;
+let swatchKey = '';
+let swatchObserver: IntersectionObserver | null = null;
+let swatchPump = 0;
+const swatchCache = new Map<string, HTMLCanvasElement>();
+const tipCache = new Map<string, HTMLCanvasElement>();
+const swatchQueue: HTMLCanvasElement[] = [];
+const swatchQueued = new Set<HTMLCanvasElement>();
+
+function swatchSignature(): string {
+  return String(serial);
+}
+
+function paintSwatchPlate(brush: BrushPreset): HTMLCanvasElement {
+  const plate = document.createElement('canvas');
+  plate.width = SWATCH_W;
+  plate.height = SWATCH_H;
+  const ctx = plate.getContext('2d');
+  if (!ctx) return plate;
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, plate.width, plate.height);
+  const size = SWATCH_H * 0.72;
+  paintPreviewStroke(ctx, brush, previewSamples(brush, strokeCurve(SWATCH_W, SWATCH_H, 0.08, 0.12), size), size, true);
+  return plate;
+}
+
+function paintTipPlate(brush: BrushPreset): HTMLCanvasElement {
+  const plate = document.createElement('canvas');
+  plate.width = 48;
+  plate.height = 48;
+  const ctx = plate.getContext('2d');
+  if (!ctx) return plate;
+  ctx.clearRect(0, 0, 48, 48);
+  ctx.fillStyle = '#141414';
+  ctx.beginPath();
+  ctx.arc(24, 24, 23, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(24, 24, 19, 0, Math.PI * 2);
+  ctx.clip();
+  const angle = brush.rotation === 'fixed' ? (brush.angle * Math.PI) / 180 : 0;
+  stampDab(ctx, brush, 24, 24, 15, angle, '#ffffff', 1, false);
+  ctx.restore();
+  return plate;
+}
+
+function enqueueSwatch(canvas: HTMLCanvasElement): void {
+  if (swatchQueued.has(canvas) || canvas.dataset.ready === swatchKey) return;
+  swatchQueued.add(canvas);
+  swatchQueue.push(canvas);
+  if (!swatchPump) swatchPump = requestAnimationFrame(pumpSwatches);
+}
+
+function pumpSwatches(): void {
+  swatchPump = 0;
+  const editor = swatchEditor;
+  let budget = 3;
+  while (budget > 0 && swatchQueue.length && editor) {
+    const canvas = swatchQueue.shift();
+    if (!canvas) break;
+    swatchQueued.delete(canvas);
+    if (!canvas.isConnected || canvas.dataset.ready === swatchKey) continue;
+    const id = canvas.dataset.swatch ?? '';
+    const brush = presets.find(item => item.id === id);
+    const ctx = canvas.getContext('2d');
+    if (!brush || !ctx) continue;
+    let plate = swatchCache.get(id);
+    if (!plate) {
+      plate = paintSwatchPlate(brush);
+      swatchCache.set(id, plate);
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(plate, 0, 0);
+    canvas.dataset.ready = swatchKey;
+    const tip = canvas.closest('.brush-row')?.querySelector<HTMLCanvasElement>('.brush-tip');
+    if (tip && tip.dataset.ready !== swatchKey) {
+      let badge = tipCache.get(id);
+      if (!badge) {
+        badge = paintTipPlate(brush);
+        tipCache.set(id, badge);
+      }
+      const tipCtx = tip.getContext('2d');
+      tipCtx?.clearRect(0, 0, tip.width, tip.height);
+      tipCtx?.drawImage(badge, 0, 0);
+      tip.dataset.ready = swatchKey;
+    }
+    budget -= 1;
   }
+  if (swatchQueue.length) swatchPump = requestAnimationFrame(pumpSwatches);
+}
+
+function enqueueVisible(panel: HTMLElement): void {
+  const root = panel.getBoundingClientRect();
+  panel.querySelectorAll<HTMLCanvasElement>('.brush-swatch').forEach(canvas => {
+    if (canvas.dataset.ready === swatchKey) return;
+    const box = canvas.getBoundingClientRect();
+    if (box.width <= 0 || box.bottom < root.top - 120 || box.top > root.bottom + 120) return;
+    enqueueSwatch(canvas);
+  });
+}
+
+function noteSwatches(editor: Editor | null): void {
+  if (!editor) return;
+  swatchEditor = editor;
+  const panel = document.getElementById('brush-panel');
+  if (!panel || panel.hidden || editing) return;
+  const key = swatchSignature();
+  const changed = key !== swatchKey;
+  if (changed) {
+    swatchKey = key;
+    swatchCache.clear();
+    tipCache.clear();
+    swatchQueue.length = 0;
+    swatchQueued.clear();
+    panel.querySelectorAll<HTMLCanvasElement>('.brush-swatch, .brush-tip').forEach(canvas => { delete canvas.dataset.ready; });
+  }
+  const canvases = [...panel.querySelectorAll<HTMLCanvasElement>('.brush-swatch')];
+  if (!swatchObserver || canvases.some(canvas => canvas.dataset.watched !== '1')) {
+    swatchObserver?.disconnect();
+    swatchObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        const canvas = entry.target as HTMLCanvasElement;
+        if (!entry.isIntersecting) {
+          const index = swatchQueue.indexOf(canvas);
+          if (index >= 0) swatchQueue.splice(index, 1);
+          swatchQueued.delete(canvas);
+          continue;
+        }
+        enqueueSwatch(canvas);
+      }
+    }, { root: panel, rootMargin: '120px 0px' });
+    canvases.forEach(canvas => {
+      canvas.dataset.watched = '1';
+      swatchObserver?.observe(canvas);
+    });
+    enqueueVisible(panel);
+    return;
+  }
+  if (changed) enqueueVisible(panel);
 }
 
 const PENCIL = '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M11.4 3.1 14.9 6.6 6.7 14.8 3 15.2 3.4 11.5Z"/><path d="M10 4.5 13.5 8"/></svg>';
@@ -1178,12 +1395,26 @@ function focusBrushSearch(): void {
   field.select();
 }
 
+function fitBrushNames(root: ParentNode): void {
+  root.querySelectorAll<HTMLElement>('.brush-name').forEach(name => {
+    name.style.fontSize = '';
+    if (name.clientWidth < 8) return;
+    let size = 13;
+    name.style.fontSize = `${size}px`;
+    while (size > 9 && name.scrollWidth > name.clientWidth + 1) {
+      size -= 0.5;
+      name.style.fontSize = `${size}px`;
+    }
+  });
+}
+
 function brushRow(item: BrushPreset, currentId: string, shortcut = false): string {
   const missing = item.tip === 'image' && (item.tipMissing || (item.tipImage ? imageCache.get(item.tipImage) === 'missing' : false));
   const remove = factoryBrush(item) ? '' : `<button type="button" class="brush-icon brush-delete" data-preset-delete="${item.id}" aria-label="Delete brush">${TRASH}</button>`;
   const pressed = !shortcut && item.id === currentId;
   const drop = shortcut ? '' : ` data-drop-category="${escapeHtml(categoryOf(item) ?? '')}"`;
-  return `<div class="brush-row${shortcut ? ' brush-shortcut' : ''}" data-preset="${item.id}"${drop} aria-pressed="${pressed}"><button type="button" data-preset-use="${item.id}">${escapeHtml(item.name)}${missing ? ' Missing' : ''}</button><button type="button" class="brush-icon" data-preset-edit="${item.id}" aria-label="Edit brush">${PENCIL}</button>${remove}</div>`;
+  const name = `${escapeHtml(item.name)}${missing ? ' Missing' : ''}`;
+  return `<div class="brush-row${shortcut ? ' brush-shortcut' : ''}" data-preset="${item.id}"${drop} aria-pressed="${pressed}"><button type="button" data-preset-use="${item.id}"><canvas class="brush-swatch" width="312" height="112" data-swatch="${escapeHtml(item.id)}" aria-hidden="true"></canvas><span class="brush-name">${name}</span><canvas class="brush-tip" width="48" height="48" data-tip="${escapeHtml(item.id)}" aria-hidden="true"></canvas></button><button type="button" class="brush-icon" data-preset-edit="${item.id}" aria-label="Edit brush">${PENCIL}</button>${remove}</div>`;
 }
 
 function renderPanel(): void {
@@ -1215,6 +1446,8 @@ function renderPanel(): void {
     const recentBlock = lately ? `<div class="brush-section">Recent</div><div class="brush-recent">${lately}</div>` : '';
     const empty = query && !loose && !blocks ? '<p class="brush-empty">No matching brushes.</p>' : '';
     list.innerHTML = `${pinBlock}${recentBlock}${empty}<div class="brush-loose" data-drop-category="">${loose}</div>${blocks}`;
+    fitBrushNames(list);
+    noteSwatches(swatchEditor);
     return;
   }
   const hideWet = tab === 'erase';
@@ -1430,6 +1663,7 @@ function placePanel(): void {
 }
 
 export function mountBrushes(editor: Editor): void {
+  swatchEditor = editor;
   const actions = document.querySelector('.window-actions');
   if (!actions || document.getElementById('brush-library')) return;
   const button = document.createElement('button');
@@ -1449,7 +1683,7 @@ export function mountBrushes(editor: Editor): void {
       <button type="button" data-brush-tab="smudge" aria-pressed="false">Smudge</button>
       <button type="button" data-brush-tab="erase" aria-pressed="false">Erase</button>
     </div>
-    <canvas id="brush-preview" width="220" height="72" aria-hidden="true"></canvas>
+    <canvas id="brush-preview" width="800" height="144" aria-hidden="true"></canvas>
     <div class="brush-list-bar"><input id="brush-search" type="search" placeholder="Search brushes" autocomplete="off" spellcheck="false" aria-label="Search brushes" /><button type="button" id="brush-add" aria-label="New brush">${PLUS}</button><button type="button" id="brush-upload" aria-label="Import brushes">${UPLOAD}</button></div>
     <div id="brush-list"></div>
     <div id="brush-edit" hidden></div>
@@ -1466,6 +1700,8 @@ export function mountBrushes(editor: Editor): void {
     panel.querySelector<HTMLElement>('#brush-list [data-preset-use]')?.click();
   });
   onImageReady = () => {
+    swatchKey = '';
+    swatchCache.clear();
     refreshBrushPreview(editor);
     paintBrushMark(editor);
   };
