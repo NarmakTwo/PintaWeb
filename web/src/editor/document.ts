@@ -63,7 +63,15 @@ export interface LayerGroup {
   parent: number | null;
 }
 
-interface SnapshotGroup {
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface GroupSnap {
+  ref: LayerGroup;
   name: string;
   visible: boolean;
   collapsed: boolean;
@@ -71,7 +79,55 @@ interface SnapshotGroup {
   parent: number | null;
 }
 
-interface SnapshotLayer {
+interface LayerSnap {
+  ref: Layer;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blend: BlendMode;
+  clip: boolean;
+  tag: string | null;
+  parent: number | null;
+  alphaLock: boolean;
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  mask?: HTMLCanvasElement;
+  maskCtx?: CanvasRenderingContext2D;
+  pixels?: ImageData;
+  maskPixels?: ImageData | null;
+}
+
+interface StructureSnap {
+  width: number;
+  height: number;
+  active: number;
+  selection: Uint8Array | null;
+  groups: GroupSnap[];
+  layers: LayerSnap[];
+}
+
+interface PixelPatch {
+  kind: 'pixels';
+  layerId: number;
+  rect: Rect;
+  before: ImageData;
+  after: ImageData;
+  target: 'pixels' | 'mask';
+  selectionBefore: Uint8Array | null;
+  selectionAfter: Uint8Array | null;
+  activeBefore: number;
+  activeAfter: number;
+}
+
+interface StructuralChange {
+  kind: 'structure';
+  before: StructureSnap;
+  after: StructureSnap;
+  patch: PixelPatch | null;
+}
+
+interface CanvasLayer {
+  id: number;
   name: string;
   visible: boolean;
   opacity: number;
@@ -84,13 +140,46 @@ interface SnapshotLayer {
   mask: ImageData | null;
 }
 
-interface Snapshot {
+interface CanvasState {
   width: number;
   height: number;
   active: number;
   selection: Uint8Array | null;
-  groups: SnapshotGroup[];
-  layers: SnapshotLayer[];
+  groups: Array<Omit<GroupSnap, 'ref'> & { id: number }>;
+  layers: CanvasLayer[];
+}
+
+interface CanvasChange {
+  kind: 'canvas';
+  before: CanvasState;
+  after: CanvasState;
+}
+
+type HistoryEntry = { kind: 'origin' } | PixelPatch | StructuralChange | CanvasChange;
+
+const HISTORY_BUDGET = 512 * 1024 * 1024;
+
+function copySelection(selection: Uint8Array | null): Uint8Array | null {
+  return selection ? new Uint8Array(selection) : null;
+}
+
+function sameSelection(a: Uint8Array | null, b: Uint8Array | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return !a && !b;
+  for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return false;
+  return true;
+}
+
+function blitBefore(dest: ImageData, originX: number, originY: number, src: ImageData): void {
+  for (let y = 0; y < src.height; y++) {
+    const from = y * src.width * 4;
+    const to = ((y + originY) * dest.width + originX) * 4;
+    dest.data.set(src.data.subarray(from, from + src.width * 4), to);
+  }
+}
+
+function imageBytes(image: ImageData | null | undefined): number {
+  return image ? image.data.byteLength : 0;
 }
 
 export interface Doc {
@@ -103,8 +192,9 @@ export interface Doc {
   active: number;
   selection: Uint8Array | null;
   zoom: number;
-  snapshots: Snapshot[];
+  snapshots: HistoryEntry[];
   labels: string[];
+  base: StructureSnap | null;
   cursor: number;
   savedCursor: number;
   fileBase: string;
@@ -152,6 +242,17 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[]): T | nul
 async function bitmapFromPng(bytes: Uint8Array): Promise<ImageBitmap> {
   const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   return createImageBitmap(new Blob([copy], { type: 'image/png' }));
+}
+
+async function imageFromPng(bytes: Uint8Array): Promise<ImageData> {
+  const bitmap = await bitmapFromPng(bytes);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = context2d(canvas);
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
 
 export class Editor {
@@ -251,6 +352,21 @@ export class Editor {
   private saveQueue: Promise<void> = Promise.resolve();
   private layerSerial = 1;
   private restoring = false;
+  private dirtyRect: {
+    layerId: number;
+    target: 'pixels' | 'mask';
+    rect: Rect;
+    before: ImageData;
+    selectionBefore: Uint8Array | null;
+    activeBefore: number;
+  } | null = null;
+  private strokeHold: {
+    layerId: number;
+    target: 'pixels' | 'mask';
+    image: ImageData;
+    selectionBefore: Uint8Array | null;
+    activeBefore: number;
+  } | null = null;
 
   get doc(): Doc | null {
     return this.docs[this.index] ?? null;
@@ -355,92 +471,424 @@ export class Editor {
     return { id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: DEFAULT_TAG, parent: null, alphaLock: false, canvas, ctx };
   }
 
-  private capture(): Snapshot {
+  private paintTarget(): 'pixels' | 'mask' {
+    return this.swappedCtx || this.paintingMask ? 'mask' : 'pixels';
+  }
+
+  private surface(layer: Layer, target: 'pixels' | 'mask'): CanvasRenderingContext2D | null {
+    return target === 'mask' ? layer.maskCtx ?? null : layer.ctx;
+  }
+
+  cover(x: number, y: number, w: number, h: number, layer: Layer | null = this.layer, pad = 2): void {
     const doc = this.doc;
-    if (!doc) throw new Error('No image is open.');
+    if (!doc || !layer) return;
+    const target = this.paintTarget();
+    const ctx = this.surface(layer, target);
+    if (!ctx) return;
+    let left = Math.floor(Math.min(x, x + w)) - pad;
+    let top = Math.floor(Math.min(y, y + h)) - pad;
+    let right = Math.ceil(Math.max(x, x + w)) + pad;
+    let bottom = Math.ceil(Math.max(y, y + h)) + pad;
+    left = Math.max(0, left);
+    top = Math.max(0, top);
+    right = Math.min(doc.width, right);
+    bottom = Math.min(doc.height, bottom);
+    const width = right - left;
+    const height = bottom - top;
+    if (width < 1 || height < 1) return;
+    const rect = { x: left, y: top, w: width, h: height };
+    if (!this.dirtyRect || this.dirtyRect.layerId !== layer.id || this.dirtyRect.target !== target) {
+      this.dirtyRect = {
+        layerId: layer.id,
+        target,
+        rect,
+        before: ctx.getImageData(left, top, width, height),
+        selectionBefore: copySelection(doc.selection),
+        activeBefore: doc.active,
+      };
+      return;
+    }
+    const previous = this.dirtyRect.rect;
+    const union = {
+      x: Math.min(previous.x, rect.x),
+      y: Math.min(previous.y, rect.y),
+      w: Math.max(previous.x + previous.w, rect.x + rect.w),
+      h: Math.max(previous.y + previous.h, rect.y + rect.h),
+    };
+    union.w -= union.x;
+    union.h -= union.y;
+    if (union.x === previous.x && union.y === previous.y && union.w === previous.w && union.h === previous.h) return;
+    const next = ctx.getImageData(union.x, union.y, union.w, union.h);
+    blitBefore(next, previous.x - union.x, previous.y - union.y, this.dirtyRect.before);
+    this.dirtyRect.rect = union;
+    this.dirtyRect.before = next;
+  }
+
+  seedWatch(layer: Layer, image: ImageData, target: 'pixels' | 'mask' = this.paintTarget()): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.dirtyRect = {
+      layerId: layer.id,
+      target,
+      rect: { x: 0, y: 0, w: image.width, h: image.height },
+      before: image,
+      selectionBefore: copySelection(doc.selection),
+      activeBefore: doc.active,
+    };
+  }
+
+  holdStroke(image: ImageData | null): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    if (!doc || !layer || !image) {
+      this.strokeHold = null;
+      return;
+    }
+    this.strokeHold = {
+      layerId: layer.id,
+      target: this.paintTarget(),
+      image,
+      selectionBefore: copySelection(doc.selection),
+      activeBefore: doc.active,
+    };
+  }
+
+  discardWatch(): void {
+    this.dirtyRect = null;
+    this.strokeHold = null;
+  }
+
+  private takeBase(): StructureSnap | null {
+    const doc = this.doc;
+    if (!doc) return null;
     return {
       width: doc.width,
       height: doc.height,
       active: doc.active,
-      selection: doc.selection ? new Uint8Array(doc.selection) : null,
+      selection: copySelection(doc.selection),
       groups: doc.groups.map(group => ({
+        ref: group,
         name: group.name,
         visible: group.visible,
         collapsed: group.collapsed,
         tag: group.tag,
-        parent: group.parent == null ? null : doc.groups.findIndex(item => item.id === group.parent),
+        parent: group.parent,
       })),
       layers: doc.layers.map(layer => ({
+        ref: layer,
         name: layer.name,
         visible: layer.visible,
         opacity: layer.opacity,
         blend: layer.blend,
         clip: layer.clip,
         tag: layer.tag,
-        parent: layer.parent == null ? null : doc.groups.findIndex(group => group.id === layer.parent),
+        parent: layer.parent,
         alphaLock: layer.alphaLock,
-        data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
-        mask: layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null,
+        canvas: layer.canvas,
+        ctx: layer.ctx,
+        mask: layer.mask,
+        maskCtx: layer.maskCtx,
       })),
     };
   }
 
-  private restoreSnapshot(snapshot: Snapshot): void {
+  private structureChanged(before: StructureSnap, after: StructureSnap): boolean {
+    if (before.width !== after.width || before.height !== after.height || before.active !== after.active) return true;
+    if (!sameSelection(before.selection, after.selection)) return true;
+    if (before.groups.length !== after.groups.length || before.layers.length !== after.layers.length) return true;
+    for (let index = 0; index < before.layers.length; index++) {
+      const left = before.layers[index];
+      const right = after.layers[index];
+      if (left.ref !== right.ref || left.canvas !== right.canvas || left.mask !== right.mask) return true;
+      if (left.name !== right.name || left.visible !== right.visible || left.opacity !== right.opacity || left.blend !== right.blend) return true;
+      if (left.clip !== right.clip || left.tag !== right.tag || left.parent !== right.parent || left.alphaLock !== right.alphaLock) return true;
+    }
+    for (let index = 0; index < before.groups.length; index++) {
+      const left = before.groups[index];
+      const right = after.groups[index];
+      if (left.ref !== right.ref || left.name !== right.name || left.visible !== right.visible) return true;
+      if (left.collapsed !== right.collapsed || left.tag !== right.tag || left.parent !== right.parent) return true;
+    }
+    return false;
+  }
+
+  private finishPatch(): PixelPatch | null {
+    const doc = this.doc;
+    const watch = this.dirtyRect ?? (this.strokeHold ? {
+      layerId: this.strokeHold.layerId,
+      target: this.strokeHold.target,
+      rect: { x: 0, y: 0, w: this.strokeHold.image.width, h: this.strokeHold.image.height },
+      before: this.strokeHold.image,
+      selectionBefore: this.strokeHold.selectionBefore,
+      activeBefore: this.strokeHold.activeBefore,
+    } : null);
+    this.dirtyRect = null;
+    this.strokeHold = null;
+    if (!doc || !watch) return null;
+    const layer = doc.layers.find(item => item.id === watch.layerId);
+    const ctx = layer ? this.surface(layer, watch.target) : null;
+    if (!layer || !ctx) return null;
+    const rect = watch.rect;
+    if (rect.w < 1 || rect.h < 1) return null;
+    return {
+      kind: 'pixels',
+      layerId: watch.layerId,
+      rect,
+      before: watch.before,
+      after: ctx.getImageData(rect.x, rect.y, rect.w, rect.h),
+      target: watch.target,
+      selectionBefore: watch.selectionBefore,
+      selectionAfter: copySelection(doc.selection),
+      activeBefore: watch.activeBefore,
+      activeAfter: doc.active,
+    };
+  }
+
+  private freeze(snap: StructureSnap): CanvasState {
+    return {
+      width: snap.width,
+      height: snap.height,
+      active: snap.active,
+      selection: copySelection(snap.selection),
+      groups: snap.groups.map(group => ({
+        id: group.ref.id,
+        name: group.name,
+        visible: group.visible,
+        collapsed: group.collapsed,
+        tag: group.tag,
+        parent: group.parent,
+      })),
+      layers: snap.layers.map(layer => ({
+        id: layer.ref.id,
+        name: layer.name,
+        visible: layer.visible,
+        opacity: layer.opacity,
+        blend: layer.blend,
+        clip: layer.clip,
+        tag: layer.tag,
+        parent: layer.parent,
+        alphaLock: layer.alphaLock,
+        data: layer.ctx.getImageData(0, 0, layer.canvas.width, layer.canvas.height),
+        mask: layer.mask && layer.maskCtx ? layer.maskCtx.getImageData(0, 0, layer.mask.width, layer.mask.height) : null,
+      })),
+    };
+  }
+
+  private retainPixels(snap: StructureSnap, other: StructureSnap): void {
+    for (const layer of snap.layers) {
+      const twin = other.layers.find(item => item.ref.id === layer.ref.id);
+      if (twin && twin.canvas === layer.canvas && twin.mask === layer.mask) continue;
+      layer.pixels = layer.ctx.getImageData(0, 0, layer.canvas.width, layer.canvas.height);
+      layer.maskPixels = layer.mask && layer.maskCtx ? layer.maskCtx.getImageData(0, 0, layer.mask.width, layer.mask.height) : null;
+    }
+  }
+
+  private entryBytes(entry: HistoryEntry): number {
+    if (entry.kind === 'origin') return 0;
+    if (entry.kind === 'pixels') return imageBytes(entry.before) + imageBytes(entry.after);
+    if (entry.kind === 'structure') {
+      const snapBytes = (snap: StructureSnap) => snap.layers.reduce((total, layer) => total + imageBytes(layer.pixels) + imageBytes(layer.maskPixels), 0);
+      return snapBytes(entry.before) + snapBytes(entry.after) + (entry.patch ? this.entryBytes(entry.patch) : 0);
+    }
+    const stateBytes = (state: CanvasState) => state.layers.reduce((total, layer) => total + imageBytes(layer.data) + imageBytes(layer.mask), 0);
+    return stateBytes(entry.before) + stateBytes(entry.after);
+  }
+
+  private trimHistory(doc: Doc): void {
+    let total = doc.snapshots.reduce((sum, entry) => sum + this.entryBytes(entry), 0);
+    while (total > HISTORY_BUDGET && doc.snapshots.length > 1 && doc.cursor > 0) {
+      total -= this.entryBytes(doc.snapshots[0]);
+      doc.snapshots.shift();
+      doc.labels.shift();
+      doc.cursor--;
+      if (doc.savedCursor > 0) doc.savedCursor--;
+      else doc.savedCursor = -1;
+    }
+  }
+
+  private rememberBase(doc: Doc): void {
+    doc.base = this.takeBase();
+  }
+
+  private applyPatch(patch: PixelPatch, side: 'before' | 'after'): void {
     const doc = this.doc;
     if (!doc) return;
-    this.float = null;
-    doc.width = snapshot.width;
-    doc.height = snapshot.height;
-    doc.active = Math.max(0, Math.min(snapshot.active, snapshot.layers.length - 1));
-    doc.selection = snapshot.selection ? new Uint8Array(snapshot.selection) : null;
-    doc.groups = (snapshot.groups ?? []).map(group => ({
-      id: this.layerSerial++,
-      name: group.name,
-      visible: group.visible,
-      collapsed: group.collapsed,
-      tag: group.tag,
-      parent: null,
-    }));
-    snapshot.groups?.forEach((group, index) => {
-      doc.groups[index].parent = group.parent == null ? null : doc.groups[group.parent]?.id ?? null;
-    });
-    doc.layers = snapshot.layers.map(layer => {
-      const created = this.makeLayer(layer.name, layer.visible, layer.opacity, layer.data);
-      created.blend = layer.blend ?? 'normal';
-      created.clip = !!layer.clip;
-      created.tag = layer.tag ?? null;
-      created.parent = layer.parent == null ? null : doc.groups[layer.parent]?.id ?? null;
-      created.alphaLock = !!layer.alphaLock;
-      if (layer.mask) {
-        const mask = document.createElement('canvas');
-        mask.width = snapshot.width;
-        mask.height = snapshot.height;
-        const maskCtx = context2d(mask);
-        maskCtx.putImageData(layer.mask, 0, 0);
-        created.mask = mask;
-        created.maskCtx = maskCtx;
+    const layer = doc.layers.find(item => item.id === patch.layerId);
+    const image = side === 'before' ? patch.before : patch.after;
+    const ctx = layer ? this.surface(layer, patch.target) : null;
+    if (ctx && image.width === patch.rect.w && image.height === patch.rect.h) ctx.putImageData(image, patch.rect.x, patch.rect.y);
+    doc.selection = copySelection(side === 'before' ? patch.selectionBefore : patch.selectionAfter);
+    const active = side === 'before' ? patch.activeBefore : patch.activeAfter;
+    if (active >= 0 && active < doc.layers.length) doc.active = active;
+  }
+
+  private applyStructure(snap: StructureSnap): void {
+    const doc = this.doc;
+    if (!doc) return;
+    for (const group of snap.groups) {
+      group.ref.name = group.name;
+      group.ref.visible = group.visible;
+      group.ref.collapsed = group.collapsed;
+      group.ref.tag = group.tag;
+      group.ref.parent = group.parent;
+    }
+    doc.groups = snap.groups.map(group => group.ref);
+    for (const layer of snap.layers) {
+      layer.ref.name = layer.name;
+      layer.ref.visible = layer.visible;
+      layer.ref.opacity = layer.opacity;
+      layer.ref.blend = layer.blend;
+      layer.ref.clip = layer.clip;
+      layer.ref.tag = layer.tag;
+      layer.ref.parent = layer.parent;
+      layer.ref.alphaLock = layer.alphaLock;
+      if (layer.pixels) {
+        if (layer.ref.canvas.width !== layer.pixels.width || layer.ref.canvas.height !== layer.pixels.height) {
+          layer.ref.canvas.width = layer.pixels.width;
+          layer.ref.canvas.height = layer.pixels.height;
+          layer.ref.ctx = context2d(layer.ref.canvas);
+        }
+        layer.ref.ctx.putImageData(layer.pixels, 0, 0);
+        if (layer.maskPixels && layer.ref.mask && layer.ref.maskCtx) {
+          if (layer.ref.mask.width !== layer.maskPixels.width || layer.ref.mask.height !== layer.maskPixels.height) {
+            layer.ref.mask.width = layer.maskPixels.width;
+            layer.ref.mask.height = layer.maskPixels.height;
+            layer.ref.maskCtx = context2d(layer.ref.mask);
+          }
+          layer.ref.maskCtx.putImageData(layer.maskPixels, 0, 0);
+        }
+      } else {
+        layer.ref.canvas = layer.canvas;
+        layer.ref.ctx = layer.ctx;
+        layer.ref.mask = layer.mask;
+        layer.ref.maskCtx = layer.maskCtx;
       }
-      return created;
-    });
+    }
+    doc.layers = snap.layers.map(layer => layer.ref);
+    doc.active = Math.max(0, Math.min(snap.active, Math.max(0, doc.layers.length - 1)));
+    doc.selection = copySelection(snap.selection);
+  }
+
+  private applyCanvas(state: CanvasState): void {
+    const doc = this.doc;
+    if (!doc) return;
+    doc.width = state.width;
+    doc.height = state.height;
+    const ordered: Layer[] = [];
+    for (const item of state.layers) {
+      let layer = doc.layers.find(entry => entry.id === item.id);
+      if (!layer) {
+        layer = this.makeLayer(item.name, item.visible, item.opacity);
+        layer.id = item.id;
+        if (item.id >= this.layerSerial) this.layerSerial = item.id + 1;
+      }
+      layer.name = item.name;
+      layer.visible = item.visible;
+      layer.opacity = item.opacity;
+      layer.blend = item.blend;
+      layer.clip = item.clip;
+      layer.tag = item.tag;
+      layer.parent = item.parent;
+      layer.alphaLock = item.alphaLock;
+      if (layer.canvas.width !== item.data.width || layer.canvas.height !== item.data.height) {
+        layer.canvas.width = item.data.width;
+        layer.canvas.height = item.data.height;
+        layer.ctx = context2d(layer.canvas);
+      }
+      layer.ctx.putImageData(item.data, 0, 0);
+      if (item.mask) {
+        if (!layer.mask || layer.mask.width !== item.mask.width || layer.mask.height !== item.mask.height) {
+          const mask = layer.mask ?? document.createElement('canvas');
+          mask.width = item.mask.width;
+          mask.height = item.mask.height;
+          layer.mask = mask;
+          layer.maskCtx = context2d(mask);
+        }
+        layer.maskCtx?.putImageData(item.mask, 0, 0);
+      } else {
+        layer.mask = undefined;
+        layer.maskCtx = undefined;
+      }
+      ordered.push(layer);
+    }
+    doc.layers = ordered.length ? ordered : doc.layers;
+    for (const group of state.groups) {
+      const found = doc.groups.find(entry => entry.id === group.id);
+      if (!found) continue;
+      found.name = group.name;
+      found.visible = group.visible;
+      found.collapsed = group.collapsed;
+      found.tag = group.tag;
+      found.parent = group.parent;
+    }
+    doc.active = Math.max(0, Math.min(state.active, doc.layers.length - 1));
+    doc.selection = copySelection(state.selection);
     this.syncSize();
+  }
+
+  private forward(entry: HistoryEntry): void {
+    if (entry.kind === 'pixels') this.applyPatch(entry, 'after');
+    else if (entry.kind === 'structure') {
+      if (entry.patch) this.applyPatch(entry.patch, 'after');
+      this.applyStructure(entry.after);
+    } else if (entry.kind === 'canvas') this.applyCanvas(entry.after);
+  }
+
+  private backward(entry: HistoryEntry): void {
+    if (entry.kind === 'pixels') this.applyPatch(entry, 'before');
+    else if (entry.kind === 'structure') {
+      this.applyStructure(entry.before);
+      if (entry.patch) this.applyPatch(entry.patch, 'before');
+    } else if (entry.kind === 'canvas') this.applyCanvas(entry.before);
+  }
+
+  private revertLiveStroke(): void {
+    const doc = this.doc;
+    const hold = this.strokeHold;
+    if (doc && hold) {
+      const layer = doc.layers.find(item => item.id === hold.layerId);
+      const ctx = layer ? this.surface(layer, hold.target) : null;
+      if (ctx) ctx.putImageData(hold.image, 0, 0);
+    }
+    this.discardWatch();
+  }
+
+  private presentHistory(): void {
     this.rebuildEdges();
     this.renderScene();
+    this.scheduleSave();
+    this.notify();
   }
 
   checkpoint(label: string): void {
     const doc = this.doc;
-    if (!doc) return;
+    if (!doc || !doc.base) return;
     this.endSurface();
+    const before = doc.base;
+    const after = this.takeBase();
+    if (!after) return;
+    const patch = this.finishPatch();
+    let entry: HistoryEntry;
+    if (before.width !== after.width || before.height !== after.height) entry = { kind: 'canvas', before: this.freeze(before), after: this.freeze(after) };
+    else if (this.structureChanged(before, after)) {
+      this.retainPixels(before, after);
+      this.retainPixels(after, before);
+      entry = { kind: 'structure', before, after, patch };
+    }
+    else if (patch) entry = patch;
+    else {
+      this.rememberBase(doc);
+      this.renderScene();
+      this.notify();
+      return;
+    }
     doc.snapshots.length = doc.cursor + 1;
     doc.labels.length = doc.cursor + 1;
-    doc.snapshots.push(this.capture());
+    doc.snapshots.push(entry);
     doc.labels.push(label);
     doc.cursor++;
-    while (doc.snapshots.length > 21) {
-      doc.snapshots.shift();
-      doc.labels.shift();
-      doc.cursor--;
-    }
+    this.rememberBase(doc);
+    this.trimHistory(doc);
     this.renderScene();
     this.scheduleSave();
     this.notify();
@@ -450,38 +898,71 @@ export class Editor {
     const doc = this.doc;
     if (!doc || doc.cursor < 0) return;
     this.endSurface();
-    doc.snapshots[doc.cursor] = this.capture();
+    const entry = doc.snapshots[doc.cursor];
+    const patch = this.finishPatch();
+    if (entry?.kind === 'pixels' && patch && patch.layerId === entry.layerId && patch.target === entry.target) {
+      entry.rect = patch.rect;
+      entry.before = patch.before;
+      entry.after = patch.after;
+      entry.selectionBefore = patch.selectionBefore;
+      entry.selectionAfter = patch.selectionAfter;
+      entry.activeBefore = patch.activeBefore;
+      entry.activeAfter = patch.activeAfter;
+    } else if (entry?.kind === 'pixels') {
+      const layer = doc.layers.find(item => item.id === entry.layerId);
+      const ctx = layer ? this.surface(layer, entry.target) : null;
+      if (ctx) entry.after = ctx.getImageData(entry.rect.x, entry.rect.y, entry.rect.w, entry.rect.h);
+      entry.selectionAfter = copySelection(doc.selection);
+      entry.activeAfter = doc.active;
+    } else if (patch && entry?.kind === 'structure') entry.patch = patch;
+    this.rememberBase(doc);
     this.scheduleSave();
   }
 
   undo(): void {
     const doc = this.doc;
     if (!doc || doc.cursor <= 0) return;
+    const floating = !!this.float;
     this.cancelFloat();
+    if (!floating) this.revertLiveStroke();
+    const entry = doc.snapshots[doc.cursor];
     doc.cursor--;
-    this.restoreSnapshot(doc.snapshots[doc.cursor]);
-    this.scheduleSave();
-    this.notify();
+    if (entry) this.backward(entry);
+    this.rememberBase(doc);
+    this.presentHistory();
   }
 
   redo(): void {
     const doc = this.doc;
     if (!doc || doc.cursor >= doc.snapshots.length - 1) return;
+    const floating = !!this.float;
     this.cancelFloat();
+    if (!floating) this.revertLiveStroke();
     doc.cursor++;
-    this.restoreSnapshot(doc.snapshots[doc.cursor]);
-    this.scheduleSave();
-    this.notify();
+    const entry = doc.snapshots[doc.cursor];
+    if (entry) this.forward(entry);
+    this.rememberBase(doc);
+    this.presentHistory();
   }
 
   jump(cursor: number): void {
     const doc = this.doc;
     if (!doc || cursor < 0 || cursor >= doc.snapshots.length || cursor === doc.cursor) return;
+    const floating = !!this.float;
     this.cancelFloat();
-    doc.cursor = cursor;
-    this.restoreSnapshot(doc.snapshots[cursor]);
-    this.scheduleSave();
-    this.notify();
+    if (!floating) this.revertLiveStroke();
+    while (doc.cursor > cursor) {
+      const entry = doc.snapshots[doc.cursor];
+      doc.cursor--;
+      if (entry) this.backward(entry);
+    }
+    while (doc.cursor < cursor) {
+      doc.cursor++;
+      const entry = doc.snapshots[doc.cursor];
+      if (entry) this.forward(entry);
+    }
+    this.rememberBase(doc);
+    this.presentHistory();
   }
 
   private blank(width: number, height: number, name: string): Doc {
@@ -497,6 +978,7 @@ export class Editor {
       zoom: 1,
       snapshots: [],
       labels: [],
+      base: null,
       cursor: 0,
       savedCursor: 0,
       fileBase: name.replace(/\.[^.]+$/, '') || 'pinta-image',
@@ -509,7 +991,8 @@ export class Editor {
     this.docs.push(doc);
     this.index = this.docs.length - 1;
     this.syncSize();
-    doc.snapshots = [this.capture()];
+    this.rememberBase(doc);
+    doc.snapshots = [{ kind: 'origin' }];
     doc.labels = [label];
     doc.cursor = 0;
     this.rebuildEdges();
@@ -540,6 +1023,19 @@ export class Editor {
   }
 
   async openFile(file: File, asLayer: boolean): Promise<void> {
+    if (!asLayer && (file.name.toLowerCase().endsWith('.pinta') || file.type === 'application/pinta')) {
+      const opened = await this.readPinta(new Uint8Array(await file.arrayBuffer()));
+      if (!opened) {
+        this.toast('This file could not be opened.');
+        return;
+      }
+      this.syncSize();
+      this.rebuildEdges();
+      this.renderScene();
+      this.scheduleSave();
+      this.notify();
+      return;
+    }
     const bitmap = await createImageBitmap(file);
     try {
       if (!bitmap.width || !bitmap.height || bitmap.width * bitmap.height > MAX_PIXELS) {
@@ -932,6 +1428,7 @@ export class Editor {
     const doc = this.doc;
     if (!layer || !doc) return;
     const before = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    this.seedWatch(layer, before);
     const copy = new ImageData(new Uint8ClampedArray(before.data), doc.width, doc.height);
     this.engine.setColor(this.primary);
     mutate(copy);
@@ -1006,6 +1503,8 @@ export class Editor {
   }
 
   commitPreview(label: string): void {
+    const layer = this.layer;
+    if (layer && this.previewBase) this.seedWatch(layer, this.previewBase);
     this.previewBase = null;
     this.checkpoint(label);
   }
@@ -1019,6 +1518,7 @@ export class Editor {
     layer.ctx.putImageData(this.float.before, 0, 0);
     if (this.doc) this.doc.selection = this.float.mask ? new Uint8Array(this.float.mask) : null;
     this.float = null;
+    this.discardWatch();
     this.rebuildEdges();
     this.renderScene();
   }
@@ -1043,6 +1543,7 @@ export class Editor {
     let minY = doc.height;
     let maxX = -1;
     let maxY = -1;
+    this.cover(0, 0, doc.width, doc.height, layer, 0);
     const pixels = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     for (let y = 0; y < doc.height; y++) {
       for (let x = 0; x < doc.width; x++) {
@@ -1354,6 +1855,7 @@ export class Editor {
     }
     const upper = doc.layers[doc.active];
     const lower = doc.layers[doc.active - 1];
+    this.cover(0, 0, doc.width, doc.height, lower, 0);
     lower.ctx.save();
     lower.ctx.globalAlpha = upper.opacity / 100;
     lower.ctx.globalCompositeOperation = COMPOSITE[upper.blend];
@@ -1653,6 +2155,7 @@ export class Editor {
     const doc = this.doc;
     const layer = doc?.layers[index];
     if (!doc || !layer) return;
+    this.cover(0, 0, doc.width, doc.height, layer, 0);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     for (let i = 0; i < image.data.length; i += 4) {
       if (image.data[i + 3] === 0) continue;
@@ -1668,6 +2171,7 @@ export class Editor {
     const doc = this.doc;
     const layer = doc?.layers[index];
     if (!doc || !layer) return;
+    this.cover(0, 0, doc.width, doc.height, layer, 0);
     layer.ctx.clearRect(0, 0, doc.width, doc.height);
     this.checkpoint('Clear Layer');
   }
@@ -1705,6 +2209,7 @@ export class Editor {
     const doc = this.doc;
     const layer = this.layer;
     if (!doc || !layer) return;
+    this.cover(0, 0, doc.width, doc.height, layer, 0);
     if (!doc.selection) {
       layer.ctx.clearRect(0, 0, doc.width, doc.height);
     } else {
@@ -1723,6 +2228,7 @@ export class Editor {
       this.toast('Select an area to fill.');
       return;
     }
+    this.cover(0, 0, doc.width, doc.height, layer, 0);
     const color = rgba(this.primary, 255);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     const before = new ImageData(new Uint8ClampedArray(image.data), doc.width, doc.height);
@@ -1803,6 +2309,7 @@ export class Editor {
     if (destination === 'new-layer') this.addLayer();
     const layer = this.layer;
     if (!layer) return;
+    this.cover(x, y, drawWidth, drawHeight, layer, 1);
     layer.ctx.imageSmoothingEnabled = true;
     layer.ctx.drawImage(source, x, y, drawWidth, drawHeight);
     const mask = new Uint8Array(current.width * current.height);
@@ -1889,6 +2396,133 @@ export class Editor {
     this.notify();
   }
 
+  private async imagePng(image: ImageData): Promise<Uint8Array> {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, image.width);
+    canvas.height = Math.max(1, image.height);
+    context2d(canvas).putImageData(image, 0, 0);
+    return new Uint8Array(await (await canvasToPng(canvas)).arrayBuffer());
+  }
+
+  private async historyRecord(doc: Doc, step: number, files: { name: string; data: Uint8Array }[]): Promise<Record<string, unknown>> {
+    const entry = doc.snapshots[step];
+    const label = doc.labels[step] ?? '';
+    if (!entry || entry.kind === 'origin') return { kind: 'origin', label };
+    if (entry.kind === 'pixels') return { kind: 'pixels', label, ...(await this.patchFiles(entry, step, '', files)) };
+    if (entry.kind === 'canvas') {
+      return {
+        kind: 'canvas',
+        label,
+        before: await this.canvasFiles(entry.before, step, 'before', files),
+        after: await this.canvasFiles(entry.after, step, 'after', files),
+      };
+    }
+    return {
+      kind: 'structure',
+      label,
+      before: await this.structureFiles(entry.before, step, 'before', files),
+      after: await this.structureFiles(entry.after, step, 'after', files),
+      patch: entry.patch ? { ...(await this.patchFiles(entry.patch, step, 'patch-', files)) } : null,
+    };
+  }
+
+  private async patchFiles(patch: PixelPatch, step: number, prefix: string, files: { name: string; data: Uint8Array }[]): Promise<Record<string, unknown>> {
+    const before = `history/${step}/${prefix}before.png`;
+    const after = `history/${step}/${prefix}after.png`;
+    files.push({ name: before, data: await this.imagePng(patch.before) });
+    files.push({ name: after, data: await this.imagePng(patch.after) });
+    return {
+      layerId: patch.layerId,
+      target: patch.target,
+      rect: patch.rect,
+      before,
+      after,
+      selectionBefore: patch.selectionBefore ? bytesToBase64(patch.selectionBefore) : null,
+      selectionAfter: patch.selectionAfter ? bytesToBase64(patch.selectionAfter) : null,
+      activeBefore: patch.activeBefore,
+      activeAfter: patch.activeAfter,
+    };
+  }
+
+  private async structureFiles(snap: StructureSnap, step: number, side: string, files: { name: string; data: Uint8Array }[]): Promise<Record<string, unknown>> {
+    const layers = [];
+    for (let index = 0; index < snap.layers.length; index++) {
+      const layer = snap.layers[index];
+      const record: Record<string, unknown> = {
+        id: layer.ref.id,
+        name: layer.name,
+        visible: layer.visible,
+        opacity: layer.opacity,
+        blend: layer.blend,
+        clip: layer.clip,
+        tag: layer.tag,
+        parent: layer.parent,
+        alphaLock: layer.alphaLock,
+      };
+      if (layer.pixels) {
+        const file = `history/${step}/${side}-${index}.png`;
+        files.push({ name: file, data: await this.imagePng(layer.pixels) });
+        record.file = file;
+      }
+      if (layer.maskPixels) {
+        const mask = `history/${step}/${side}-${index}-mask.png`;
+        files.push({ name: mask, data: await this.imagePng(layer.maskPixels) });
+        record.mask = mask;
+      }
+      layers.push(record);
+    }
+    return {
+      width: snap.width,
+      height: snap.height,
+      active: snap.active,
+      selection: snap.selection ? bytesToBase64(snap.selection) : null,
+      groups: snap.groups.map(group => ({
+        id: group.ref.id,
+        name: group.name,
+        visible: group.visible,
+        collapsed: group.collapsed,
+        tag: group.tag,
+        parent: group.parent,
+      })),
+      layers,
+    };
+  }
+
+  private async canvasFiles(state: CanvasState, step: number, side: string, files: { name: string; data: Uint8Array }[]): Promise<Record<string, unknown>> {
+    const layers = [];
+    for (let index = 0; index < state.layers.length; index++) {
+      const layer = state.layers[index];
+      const file = `history/${step}/${side}-${index}.png`;
+      files.push({ name: file, data: await this.imagePng(layer.data) });
+      const record: Record<string, unknown> = {
+        id: layer.id,
+        name: layer.name,
+        visible: layer.visible,
+        opacity: layer.opacity,
+        blend: layer.blend,
+        clip: layer.clip,
+        tag: layer.tag,
+        parent: layer.parent,
+        alphaLock: layer.alphaLock,
+        file,
+      };
+      if (layer.mask) {
+        const mask = `history/${step}/${side}-${index}-mask.png`;
+        files.push({ name: mask, data: await this.imagePng(layer.mask) });
+        record.mask = mask;
+      }
+      layers.push(record);
+    }
+    return {
+      width: state.width,
+      height: state.height,
+      active: state.active,
+      selection: state.selection ? bytesToBase64(state.selection) : null,
+      groups: state.groups,
+      layers,
+    };
+  }
+
   async archiveDocument(index: number): Promise<Blob | null> {
     const doc = this.docs[index];
     if (!doc) return null;
@@ -1919,37 +2553,7 @@ export class Editor {
     }
     const history = [];
     for (let step = 0; step < doc.snapshots.length; step++) {
-      const snapshot = doc.snapshots[step];
-      const layers = [];
-      for (let layerIndex = 0; layerIndex < snapshot.layers.length; layerIndex++) {
-        const layer = snapshot.layers[layerIndex];
-        const file = `history/${step}/${layerIndex}.png`;
-        const canvas = document.createElement('canvas');
-        canvas.width = snapshot.width;
-        canvas.height = snapshot.height;
-        context2d(canvas).putImageData(layer.data, 0, 0);
-        files.push({ name: file, data: new Uint8Array(await (await canvasToPng(canvas)).arrayBuffer()) });
-        layers.push({
-          name: layer.name,
-          visible: layer.visible,
-          opacity: layer.opacity,
-          blend: layer.blend ?? 'normal',
-          clip: !!layer.clip,
-          tag: layer.tag ?? null,
-          parent: layer.parent ?? null,
-          alphaLock: !!layer.alphaLock,
-          file,
-        });
-      }
-      history.push({
-        label: doc.labels[step] ?? '',
-        width: snapshot.width,
-        height: snapshot.height,
-        active: snapshot.active,
-        selection: snapshot.selection ? bytesToBase64(snapshot.selection) : null,
-        groups: snapshot.groups ?? [],
-        layers,
-      });
+      history.push(await this.historyRecord(doc, step, files));
     }
     const manifest = {
       format: 'pinta',
@@ -2103,11 +2707,277 @@ export class Editor {
     this.scheduleSave();
   }
 
+  private selectionText(value: unknown): Uint8Array | null {
+    if (typeof value !== 'string' || !value) return null;
+    try { return base64ToBytes(value); } catch { return null; }
+  }
+
+  private borrowLayer(id: number, name: string, pool: Map<number, Layer>): Layer {
+    const found = pool.get(id);
+    if (found) return found;
+    const layer = this.makeLayer(name, true, 100);
+    layer.id = id;
+    if (id >= this.layerSerial) this.layerSerial = id + 1;
+    pool.set(id, layer);
+    return layer;
+  }
+
+  private borrowGroup(id: number, pool: Map<number, LayerGroup>): LayerGroup {
+    const found = pool.get(id);
+    if (found) return found;
+    const group: LayerGroup = { id, name: 'Group', visible: true, collapsed: false, tag: null, parent: null };
+    if (id >= this.layerSerial) this.layerSerial = id + 1;
+    pool.set(id, group);
+    return group;
+  }
+
+  private async installHistory(doc: Doc, history: { cursor?: number; steps?: unknown[] } | undefined, files: Map<string, Uint8Array>): Promise<void> {
+    const steps = Array.isArray(history?.steps) ? history.steps : [];
+    const entries: HistoryEntry[] = [];
+    const labels: string[] = [];
+    const legacy = steps.length > 0 && steps.every(step => !!step && typeof step === 'object' && !('kind' in step));
+    if (!steps.length) {
+      entries.push({ kind: 'origin' });
+      labels.push('Imported');
+    } else if (legacy) {
+      const states: CanvasState[] = [];
+      for (const step of steps) states.push(await this.legacyCanvas(step, files));
+      entries.push({ kind: 'origin' });
+      labels.push(this.stepLabel(steps[0], 'Open'));
+      for (let index = 1; index < states.length; index++) {
+        entries.push({ kind: 'canvas', before: states[index - 1], after: states[index] });
+        labels.push(this.stepLabel(steps[index], ''));
+      }
+    } else {
+      const layers = new Map<number, Layer>();
+      const groups = new Map<number, LayerGroup>();
+      for (const layer of doc.layers) layers.set(layer.id, layer);
+      for (const group of doc.groups) groups.set(group.id, group);
+      for (const step of steps) {
+        const loaded = await this.storedEntry(step, files, layers, groups);
+        entries.push(loaded.entry);
+        labels.push(loaded.label);
+      }
+      if (entries[0]?.kind !== 'origin') {
+        entries.unshift({ kind: 'origin' });
+        labels.unshift('Imported');
+      }
+    }
+    doc.snapshots = entries;
+    doc.labels = labels;
+    const cursor = Number(history?.cursor);
+    doc.cursor = Number.isFinite(cursor) ? Math.max(0, Math.min(cursor, entries.length - 1)) : 0;
+    doc.savedCursor = doc.cursor;
+    this.rememberBase(doc);
+  }
+
+  private stepLabel(step: unknown, fallback: string): string {
+    if (step && typeof step === 'object' && 'label' in step && typeof step.label === 'string') return step.label;
+    return fallback;
+  }
+
+  private async storedEntry(step: unknown, files: Map<string, Uint8Array>, layers: Map<number, Layer>, groups: Map<number, LayerGroup>): Promise<{ entry: HistoryEntry; label: string }> {
+    const label = this.stepLabel(step, '');
+    const record = step && typeof step === 'object' ? step as Record<string, unknown> : {};
+    if (record.kind === 'pixels') return { label, entry: await this.storedPatch(record, files) };
+    if (record.kind === 'canvas') {
+      return {
+        label,
+        entry: {
+          kind: 'canvas',
+          before: await this.storedCanvas(record.before, files),
+          after: await this.storedCanvas(record.after, files),
+        },
+      };
+    }
+    if (record.kind === 'structure') {
+      return {
+        label,
+        entry: {
+          kind: 'structure',
+          before: await this.storedStructure(record.before, files, layers, groups),
+          after: await this.storedStructure(record.after, files, layers, groups),
+          patch: record.patch && typeof record.patch === 'object' ? await this.storedPatch(record.patch as Record<string, unknown>, files) : null,
+        },
+      };
+    }
+    return { label, entry: { kind: 'origin' } };
+  }
+
+  private async storedPatch(record: Record<string, unknown>, files: Map<string, Uint8Array>): Promise<PixelPatch> {
+    const rect = record.rect && typeof record.rect === 'object' ? record.rect as Rect : { x: 0, y: 0, w: 1, h: 1 };
+    const before = typeof record.before === 'string' ? files.get(record.before) : undefined;
+    const after = typeof record.after === 'string' ? files.get(record.after) : undefined;
+    const blank = new ImageData(Math.max(1, rect.w | 0), Math.max(1, rect.h | 0));
+    return {
+      kind: 'pixels',
+      layerId: Number(record.layerId) || 0,
+      rect: { x: rect.x | 0, y: rect.y | 0, w: rect.w | 0, h: rect.h | 0 },
+      before: before ? await imageFromPng(before) : blank,
+      after: after ? await imageFromPng(after) : blank,
+      target: record.target === 'mask' ? 'mask' : 'pixels',
+      selectionBefore: this.selectionText(record.selectionBefore),
+      selectionAfter: this.selectionText(record.selectionAfter),
+      activeBefore: Number(record.activeBefore) || 0,
+      activeAfter: Number(record.activeAfter) || 0,
+    };
+  }
+
+  private async storedStructure(value: unknown, files: Map<string, Uint8Array>, layers: Map<number, Layer>, groups: Map<number, LayerGroup>): Promise<StructureSnap> {
+    const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const groupRows = Array.isArray(record.groups) ? record.groups : [];
+    const layerRows = Array.isArray(record.layers) ? record.layers : [];
+    const snappedGroups: GroupSnap[] = [];
+    for (const row of groupRows) {
+      if (!row || typeof row !== 'object') continue;
+      const item = row as Record<string, unknown>;
+      const id = Number(item.id) || 0;
+      snappedGroups.push({
+        ref: this.borrowGroup(id, groups),
+        name: typeof item.name === 'string' ? item.name : 'Group',
+        visible: item.visible !== false,
+        collapsed: !!item.collapsed,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent: typeof item.parent === 'number' ? item.parent : null,
+      });
+    }
+    const snappedLayers: LayerSnap[] = [];
+    for (const row of layerRows) {
+      if (!row || typeof row !== 'object') continue;
+      const item = row as Record<string, unknown>;
+      const id = Number(item.id) || 0;
+      const layer = this.borrowLayer(id, typeof item.name === 'string' ? item.name : 'Layer', layers);
+      const file = typeof item.file === 'string' ? files.get(item.file) : undefined;
+      const mask = typeof item.mask === 'string' ? files.get(item.mask) : undefined;
+      snappedLayers.push({
+        ref: layer,
+        name: typeof item.name === 'string' ? item.name : layer.name,
+        visible: item.visible !== false,
+        opacity: Number(item.opacity) || 100,
+        blend: BLEND_MODES.includes(item.blend as BlendMode) ? item.blend as BlendMode : 'normal',
+        clip: !!item.clip,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent: typeof item.parent === 'number' ? item.parent : null,
+        alphaLock: !!item.alphaLock,
+        canvas: layer.canvas,
+        ctx: layer.ctx,
+        mask: layer.mask,
+        maskCtx: layer.maskCtx,
+        pixels: file ? await imageFromPng(file) : undefined,
+        maskPixels: mask ? await imageFromPng(mask) : undefined,
+      });
+    }
+    return {
+      width: Number(record.width) || 1,
+      height: Number(record.height) || 1,
+      active: Number(record.active) || 0,
+      selection: this.selectionText(record.selection),
+      groups: snappedGroups,
+      layers: snappedLayers,
+    };
+  }
+
+  private async storedCanvas(value: unknown, files: Map<string, Uint8Array>): Promise<CanvasState> {
+    const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const groupRows = Array.isArray(record.groups) ? record.groups : [];
+    const layerRows = Array.isArray(record.layers) ? record.layers : [];
+    const groups = groupRows.flatMap(row => {
+      if (!row || typeof row !== 'object') return [];
+      const item = row as Record<string, unknown>;
+      return [{
+        id: Number(item.id) || 0,
+        name: typeof item.name === 'string' ? item.name : 'Group',
+        visible: item.visible !== false,
+        collapsed: !!item.collapsed,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent: typeof item.parent === 'number' ? item.parent : null,
+      }];
+    });
+    const layers: CanvasLayer[] = [];
+    for (const row of layerRows) {
+      if (!row || typeof row !== 'object') continue;
+      const item = row as Record<string, unknown>;
+      const file = typeof item.file === 'string' ? files.get(item.file) : undefined;
+      const mask = typeof item.mask === 'string' ? files.get(item.mask) : undefined;
+      layers.push({
+        id: Number(item.id) || 0,
+        name: typeof item.name === 'string' ? item.name : 'Layer',
+        visible: item.visible !== false,
+        opacity: Number(item.opacity) || 100,
+        blend: BLEND_MODES.includes(item.blend as BlendMode) ? item.blend as BlendMode : 'normal',
+        clip: !!item.clip,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent: typeof item.parent === 'number' ? item.parent : null,
+        alphaLock: !!item.alphaLock,
+        data: file ? await imageFromPng(file) : new ImageData(1, 1),
+        mask: mask ? await imageFromPng(mask) : null,
+      });
+    }
+    return {
+      width: Number(record.width) || 1,
+      height: Number(record.height) || 1,
+      active: Number(record.active) || 0,
+      selection: this.selectionText(record.selection),
+      groups,
+      layers,
+    };
+  }
+
+  private async legacyCanvas(step: unknown, files: Map<string, Uint8Array>): Promise<CanvasState> {
+    const record = step && typeof step === 'object' ? step as Record<string, unknown> : {};
+    const width = Number(record.width) || 1;
+    const height = Number(record.height) || 1;
+    const groupRows = Array.isArray(record.groups) ? record.groups : [];
+    const layerRows = Array.isArray(record.layers) ? record.layers : [];
+    const groups = groupRows.flatMap((row, index) => {
+      if (!row || typeof row !== 'object') return [];
+      const item = row as Record<string, unknown>;
+      const parent = typeof item.parent === 'number' ? item.parent + 1 : null;
+      return [{
+        id: index + 1,
+        name: typeof item.name === 'string' ? item.name : 'Group',
+        visible: item.visible !== false,
+        collapsed: !!item.collapsed,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent,
+      }];
+    });
+    const layers: CanvasLayer[] = [];
+    for (let index = 0; index < layerRows.length; index++) {
+      const row = layerRows[index];
+      if (!row || typeof row !== 'object') continue;
+      const item = row as Record<string, unknown>;
+      const file = typeof item.file === 'string' ? files.get(item.file) : undefined;
+      const parent = typeof item.parent === 'number' ? item.parent + 1 : null;
+      layers.push({
+        id: index + 1,
+        name: typeof item.name === 'string' ? item.name : 'Layer',
+        visible: item.visible !== false,
+        opacity: Number(item.opacity) || 100,
+        blend: BLEND_MODES.includes(item.blend as BlendMode) ? item.blend as BlendMode : 'normal',
+        clip: !!item.clip,
+        tag: typeof item.tag === 'string' ? item.tag : null,
+        parent,
+        alphaLock: !!item.alphaLock,
+        data: file ? await imageFromPng(file) : new ImageData(width, height),
+        mask: null,
+      });
+    }
+    return {
+      width,
+      height,
+      active: Number(record.active) || 0,
+      selection: this.selectionText(record.selection),
+      groups,
+      layers,
+    };
+  }
+
   private async readPinta(bytes: Uint8Array): Promise<boolean> {
     const files = await unzip(bytes);
     const raw = files.get('manifest.json');
     if (!raw) return false;
-    let manifest: { format?: string; document?: { name?: string; width?: number; height?: number; active?: number; zoom?: number; selection?: string | null }; groups?: LayerGroup[]; layers?: Array<Record<string, unknown>> };
+    let manifest: { format?: string; document?: { name?: string; width?: number; height?: number; active?: number; zoom?: number; selection?: string | null }; groups?: LayerGroup[]; layers?: Array<Record<string, unknown>>; history?: { cursor?: number; steps?: unknown[] } };
     try { manifest = JSON.parse(new TextDecoder().decode(raw)); } catch { return false; }
     if (manifest.format !== 'pinta' || !manifest.document) return false;
     const info = manifest.document;
@@ -2138,6 +3008,10 @@ export class Editor {
         if (!file) continue;
         const bitmap = await bitmapFromPng(file);
         const created = this.makeLayer(typeof layer.name === 'string' ? layer.name : 'Layer', layer.visible !== false, Number(layer.opacity) || 100);
+        if (typeof layer.id === 'number' && Number.isFinite(layer.id)) {
+          created.id = layer.id;
+          if (layer.id >= this.layerSerial) this.layerSerial = layer.id + 1;
+        }
         created.blend = BLEND_MODES.includes(layer.blend as BlendMode) ? layer.blend as BlendMode : 'normal';
         created.clip = !!layer.clip;
         created.tag = typeof layer.tag === 'string' ? layer.tag : null;
@@ -2165,10 +3039,7 @@ export class Editor {
       }
       if (!doc.layers.length) doc.layers = [this.makeLayer('Layer 1', true, 100)];
       doc.active = Math.max(0, Math.min(Number(info.active) || 0, doc.layers.length - 1));
-      doc.snapshots = [this.capture()];
-      doc.labels = ['Imported'];
-      doc.cursor = 0;
-      doc.savedCursor = 0;
+      await this.installHistory(doc, manifest.history, files);
       return true;
     } catch {
       this.docs.splice(before);
@@ -2284,7 +3155,8 @@ export class Editor {
           doc.layers.push(created);
         }
         doc.active = Math.max(0, Math.min(stored.active, doc.layers.length - 1));
-        doc.snapshots = [this.capture()];
+        this.rememberBase(doc);
+        doc.snapshots = [{ kind: 'origin' }];
         doc.labels = ['Restored'];
         doc.cursor = 0;
       }

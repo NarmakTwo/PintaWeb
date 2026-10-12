@@ -805,6 +805,10 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
   };
   const vary = !erase && colorVaries(brush);
   const places = ignoreTaper ? [samples[0]] : samples;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
   let grainRoll = brush.grainJitter ? Math.random() * 512 : 0;
   const lightBlend = !erase && (brush.blend === 'add' || brush.blend === 'screen');
   for (let index = 0; index < places.length; index++) {
@@ -890,12 +894,20 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
       const flipV = !!brush.flipY && Math.random() < 0.5;
       buffer.save();
       buffer.globalCompositeOperation = lightBlend ? strokeComposite(brush.blend, false) : 'source-over';
-      for (const spot of mirrorOf(editor, { x: jx, y: jy })) stampDab(buffer, brush, spot.x, spot.y, radius, rotation, color, flow, dabErase, flipH, flipV, grainRoll);
+      for (const spot of mirrorOf(editor, { x: jx, y: jy })) {
+        minX = Math.min(minX, spot.x - radius);
+        minY = Math.min(minY, spot.y - radius);
+        maxX = Math.max(maxX, spot.x + radius);
+        maxY = Math.max(maxY, spot.y + radius);
+        stampDab(buffer, brush, spot.x, spot.y, radius, rotation, color, flow, dabErase, flipH, flipV, grainRoll);
+      }
       buffer.restore();
     }
     if (sampler && readsCanvas) sampler.drawImage(bufferCanvas, 0, 0);
   }
   layer.ctx.putImageData(before, 0, 0);
+  const pad = size * 2 + 8 + size * ((brush.scatter || 0) / 100) + (brush.wetEdge ?? 0);
+  if (Number.isFinite(minX)) editor.cover(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY), layer, pad);
   layer.ctx.save();
   layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
   layer.ctx.globalCompositeOperation = lightBlend ? 'source-over' : strokeComposite(brush.blend, erase || parseColor(baseColor).a <= 0);

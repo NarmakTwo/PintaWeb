@@ -2209,6 +2209,86 @@ test('selects, reorders, and groups brushes', async ({ page }) => {
   await expect(page.locator('.brush-recent [data-preset-use="factory-grid"]')).toBeVisible();
 });
 
+test('undoes fifty strokes on a large canvas', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 960, 640);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('10');
+  for (let index = 0; index < 50; index++) {
+    const x = 0.08 + (index % 10) * 0.08;
+    const y = 0.12 + Math.floor(index / 10) * 0.14;
+    await drag(page, x, y, x, y);
+  }
+  await expect(page.locator('#history-list .history-item')).toHaveCount(51);
+  const drawn = await pixel(page, 0.08, 0.12);
+  expect(drawn[0]).toBeLessThan(40);
+  for (let index = 0; index < 50; index++) await page.locator('#undo').click();
+  const cleared = await pixel(page, 0.08, 0.12);
+  expect(cleared[0]).toBeGreaterThan(240);
+  expect(cleared[4]).toBe(960);
+  await expect(page.locator('#undo')).toBeDisabled();
+});
+
+test('undoes and redoes add layer, reorder, and resize', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('button[aria-label="Add layer"]').click();
+  await expect(page.locator('#layer-list .layer-name').first()).toHaveText('Layer 2');
+  await page.locator('#menu-layers').click();
+  await page.locator('#panel-layers [data-command="layer-down"]').click();
+  await expect(page.locator('#layer-list .layer-name').first()).toHaveText('Layer 1');
+  await page.locator('#menu-image').click();
+  await page.locator('#panel-image [data-command="resize"]').click();
+  await page.locator('#resize-width').fill('48');
+  await page.locator('#resize-height').fill('32');
+  await page.locator('#resize-ok').click();
+  await expect(page.locator('#image-dimensions')).toHaveText('48 × 32');
+
+  await page.locator('#undo').click();
+  await expect(page.locator('#image-dimensions')).toHaveText('64 × 64');
+  await page.locator('#undo').click();
+  await expect(page.locator('#layer-list .layer-name').first()).toHaveText('Layer 2');
+  await page.locator('#undo').click();
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(1);
+
+  await page.locator('#redo').click();
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(2);
+  await expect(page.locator('#layer-list .layer-name').first()).toHaveText('Layer 2');
+  await page.locator('#redo').click();
+  await expect(page.locator('#layer-list .layer-name').first()).toHaveText('Layer 1');
+  await page.locator('#redo').click();
+  await expect(page.locator('#image-dimensions')).toHaveText('48 × 32');
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(2);
+});
+
+test('saves history in a pinta file and undoes after reload', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('12');
+  await drag(page, 0.5, 0.5, 0.5, 0.5);
+  expect((await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="save-as"]').click();
+  await page.locator('#export-name').fill('history');
+  await page.locator('#export-format').selectOption('application/pinta');
+  await page.locator('#confirm-export').click();
+  const download = await downloadPromise;
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  if (!stream) throw new Error('The .pinta download was empty.');
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  const archive = Buffer.concat(chunks);
+  expect(archive.toString('utf8')).toContain('"kind":"pixels"');
+  await page.locator('#undo').click();
+  expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(240);
+  await page.locator('#file-input').setInputFiles({ name: 'history.pinta', mimeType: 'application/pinta', buffer: archive });
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
+  await page.locator('#undo').click();
+  expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(240);
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

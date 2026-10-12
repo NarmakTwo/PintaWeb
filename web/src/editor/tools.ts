@@ -223,6 +223,7 @@ function drawCurve(ctx: CanvasRenderingContext2D, editor: Editor, a: Point, cont
 function stampBrush(ctx: CanvasRenderingContext2D, editor: Editor, x: number, y: number, color: string, erase: boolean): void {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
   const radius = Math.max(0.5, brushSize(editor) / 2);
+  editor.cover(x - radius, y - radius, radius * 2, radius * 2, editor.layer, 4);
   ctx.save();
   if (erase) {
     ctx.globalCompositeOperation = 'destination-out';
@@ -357,6 +358,24 @@ function blendPixel(image: ImageData, x: number, y: number, color: { r: number; 
   data[offset + 1] = Math.floor((color.g * source + Math.floor(data[offset + 1] * dest / 255) * inverse) / out);
   data[offset + 2] = Math.floor((color.b * source + Math.floor(data[offset + 2] * dest / 255) * inverse) / out);
   data[offset + 3] = out;
+}
+
+function coverPoints(editor: Editor, points: Point[], pad: number): void {
+  if (!points.length) return;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const point of points) {
+    for (const spot of mirrorPoints(editor, point)) {
+      minX = Math.min(minX, spot.x);
+      minY = Math.min(minY, spot.y);
+      maxX = Math.max(maxX, spot.x);
+      maxY = Math.max(maxY, spot.y);
+    }
+  }
+  if (!Number.isFinite(minX)) return;
+  editor.cover(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY), editor.layer, pad);
 }
 
 function mirrorPoints(editor: Editor, point: Point): Point[] {
@@ -658,6 +677,7 @@ function commitText(editor: Editor): void {
   const doc = editor.doc;
   if (!layer || !doc || !text) return;
   const before = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+  editor.seedWatch(layer, before);
   layer.ctx.save();
   paintText(layer.ctx, editor, text, x, y);
   layer.ctx.restore();
@@ -809,6 +829,7 @@ export class ToolController {
     beginStrokeUI(editor);
     editor.beginSurface();
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    editor.holdStroke(this.before);
     capturePointer(editor.paper, event.pointerId);
     if (editor.tool === 'lighten' || editor.tool === 'darken' || editor.tool === 'random') this.beginRate();
     if (editor.tool === 'move-pixels') this.startMove(point, event);
@@ -931,7 +952,10 @@ export class ToolController {
     this.drawing = false;
     this.panning = false;
     if (editor.float) editor.cancelFloat();
-    else if (wasDrawing && this.before && editor.layer) editor.layer.ctx.putImageData(this.before, 0, 0);
+    else if (wasDrawing && this.before && editor.layer) {
+      editor.layer.ctx.putImageData(this.before, 0, 0);
+      editor.discardWatch();
+    }
     this.placing = false;
     editor.assistantDraft = null;
     editor.endSurface();
@@ -1023,6 +1047,13 @@ export class ToolController {
       const doc = editor.doc;
       if (layer && doc && this.before) {
         const end = tool === 'line' && event.shiftKey ? snap45(this.start, point) : point;
+        const boxLeft = Math.min(this.start.x, end.x);
+        const boxTop = Math.min(this.start.y, end.y);
+        const boxWidth = Math.abs(end.x - this.start.x);
+        const boxHeight = Math.abs(end.y - this.start.y);
+        if (event.altKey && tool !== 'line') {
+          editor.cover(this.start.x - boxWidth, this.start.y - boxHeight, boxWidth * 2, boxHeight * 2, layer, editor.size + 4);
+        } else editor.cover(boxLeft, boxTop, boxWidth, boxHeight, layer, editor.size + 4);
         if (tool === 'line' && !editor.antialias) {
           const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
           editor.engine.stamp(image, this.start.x | 0, this.start.y | 0, end.x | 0, end.y | 0, editor.size | 0, editor.ink(this.button), false);
@@ -1092,6 +1123,7 @@ export class ToolController {
     }
     if (doc.selection) editor.engine.clip(image, before, doc.selection);
     editor.lockAlpha(image, before);
+    editor.seedWatch(layer, before);
     layer.ctx.putImageData(image, 0, 0);
     editor.checkpoint('Paint Bucket');
   }
@@ -1138,6 +1170,7 @@ export class ToolController {
         if (last.x !== to.x || last.y !== to.y) this.pencilPath.push(to);
       }
       layer.ctx.putImageData(this.before, 0, 0);
+      coverPoints(editor, this.pencilPath, size + 2);
       const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
       const ink = editor.ink(this.button);
       for (const pixel of pixelPerfect(rasterize(this.pencilPath))) {
@@ -1149,6 +1182,7 @@ export class ToolController {
       return;
     }
     const from = this.last ?? to;
+    coverPoints(editor, [from, to], size + 2);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     for (const [start, end] of mirroredSegments(editor, from, to)) {
       editor.engine.stamp(image, start.x | 0, start.y | 0, end.x | 0, end.y | 0, size, editor.ink(this.button), false);
@@ -1163,7 +1197,10 @@ export class ToolController {
     const layer = editor.layer;
     if (!layer) return;
     if (editor.tool === 'brush' && editor.brush === 'smudge') {
-      for (const [start, end] of mirroredSegments(editor, from, to)) smudgeStroke(layer.ctx, start, end, brushSize(editor), editor.opacity);
+      for (const [start, end] of mirroredSegments(editor, from, to)) {
+        coverPoints(editor, [start, end], brushSize(editor) + 4);
+        smudgeStroke(layer.ctx, start, end, brushSize(editor), editor.opacity);
+      }
       if (this.before) editor.guardAlpha(this.before);
       editor.renderScene();
       return;
@@ -1183,6 +1220,7 @@ export class ToolController {
     const layer = editor.layer;
     const target = this.target;
     if (!doc || !layer || !target) return;
+    if (!editor.recolorGlobal) editor.cover(point.x, point.y, 1, 1, layer, Math.max(1, editor.size / 2) + 2);
     const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
     const fill = editor.ink(this.button);
     const tolerance = Math.round(editor.tolerance * 2.55);
@@ -1288,6 +1326,7 @@ export class ToolController {
     if (!samples.length) return;
     const size = Math.max(1, editor.size | 0);
     if (tool === 'pencil' && size === 1 && brush.hardness >= 100) {
+      coverPoints(editor, samples, size + 2);
       const image = layer.ctx.getImageData(0, 0, doc.width, doc.height);
       const ink = editor.ink(this.button);
       const path = samples.map(sample => ({ x: Math.round(sample.x), y: Math.round(sample.y) }));
@@ -1380,6 +1419,7 @@ export class ToolController {
     const doc = editor.doc;
     const layer = editor.layer;
     if (!doc || !layer) return;
+    coverPoints(editor, [from, to], Math.max(1, brushSize(editor) / 2) + 4);
     if (editor.tool === 'random') {
       this.randomBrush(from, to);
       return;
@@ -1516,6 +1556,7 @@ export class ToolController {
     const doc = editor.doc;
     const layer = editor.layer;
     if (!doc || !layer || !this.before) return;
+    editor.seedWatch(layer, this.before);
     const sprite = document.createElement('canvas');
     sprite.width = doc.width;
     sprite.height = doc.height;
@@ -1704,6 +1745,7 @@ export class ToolController {
     const editor = this.editor;
     const layer = editor.layer;
     if (!layer || this.points.length < 2 || !this.before) return;
+    coverPoints(editor, this.points, brushSize(editor) + 4);
     layer.ctx.save();
     const color = editor.color(this.button);
     layer.ctx.lineWidth = brushSize(editor);
@@ -1731,6 +1773,7 @@ export class ToolController {
     editor.engine.gradient(image, this.start.x | 0, this.start.y | 0, point.x | 0, point.y | 0, editor.ink(0), rgba(editor.secondary, Math.round(editor.opacity * 2.55)), kinds[editor.gradient]);
     if (doc.selection) editor.engine.clip(image, this.before, doc.selection);
     editor.lockAlpha(image, this.before);
+    editor.seedWatch(layer, this.before);
     layer.ctx.putImageData(image, 0, 0);
     editor.checkpoint('Gradient');
   }
