@@ -8,6 +8,102 @@ Nothing in this file adds a toolbox icon. The toolbox stays the tools it has. A 
 
 # Plans
 
+## Incremental, non-blocking autosave
+
+Make local session autosave cheap and interruptible. Touch `web/src/editor/document.ts` (`scheduleSave`, `persist`, `restore`) and `web/src/editor/storage.ts`. No new UI. The status strings stay: “Saving locally…”, “Saved locally”, “Could not save locally”, and “Local session cleared”.
+
+### Problem
+
+Today `scheduleSave()` waits 400 ms, then queues `persist()`. That path PNG-encodes every layer and every mask of every open document with `canvas.toBlob` / `canvasToPng`, then writes one IndexedDB record keyed `'current'`. Cost scales with total session size, not with what changed. The save token is only checked before the encode loop and after it finishes, so a stale save keeps encoding everything. Saves stack on `saveQueue`, and the main thread hitch after strokes is the encode loop.
+
+Autosave must not change what comes back after reload: every open document, every layer and mask, layer properties, groups, selection, palette, colors, and tool. It must not change the `.pinta` file format at all—this plan is IndexedDB session storage only.
+
+### Revisions
+
+Give each layer canvas and each mask canvas a revision counter (integers on the `Layer`, or a parallel map keyed by layer id + `'pixels' | 'mask'`). Bump the counter whenever those pixels change: strokes, fills, filters / effects, paste, float commit, undo / redo / jump, resize, crop, flatten, merge, mask paint, add/remove mask when pixels are written. Property-only edits (rename, opacity, blend, visibility, clip, tag, reorder, group) do not bump a pixel revision; they only dirty the session metadata.
+
+Track `lastSavedRevision` per layer pixels and per mask. A surface needs re-encoding only when `revision > lastSavedRevision`. After a successful write of that blob, set `lastSavedRevision = revision` for that surface. A failed write leaves `lastSavedRevision` alone.
+
+New layers and new masks start with revision 1 (or any non-zero) so the first persist encodes them. After restore from storage, set both `revision` and `lastSavedRevision` to the same value so an idle reload does not rewrite every blob.
+
+### Split IndexedDB layout
+
+Bump the IndexedDB version in `storage.ts` and add a `layers` object store. Keys are strings:
+
+- `${docId}:${layerId}:pixels`
+- `${docId}:${layerId}:mask`
+
+Values are the PNG `Blob` (or `ArrayBuffer`) for that surface.
+
+The session record (still one row, e.g. `'current'` in the existing store, or a dedicated `session` store—keep one clear home) holds only metadata:
+
+- `version: 2` (new shape)
+- `active` document index
+- `primary`, `secondary`, `palette`, `tool`
+- `documents[]`: each with `id`, `name`, `width`, `height`, `active`, `zoom`, `selection`, `groups`, and an ordered list of layers as ids plus properties (`name`, `visible`, `opacity`, `blend`, `clip`, `tag`, `parent`, `alphaLock`, and whether a mask exists)—**no embedded PNG fields**
+
+`persist()` always writes the metadata record (it is small). It re-encodes and puts into `layers` only surfaces whose revision is newer than `lastSavedRevision`. Unchanged surfaces are left untouched in IndexedDB.
+
+`restore()` reads the metadata, then fetches each referenced `pixels` / `mask` blob from the `layers` store and rebuilds canvases. Missing blobs for a referenced layer are an error path: skip that document or surface gracefully and still bring the rest back; do not hang the app.
+
+### Cancellation
+
+Carry the save token through the whole persist. Check it:
+
+- before starting
+- after each layer (or mask) encode
+- before each IndexedDB write
+- before advancing any `lastSavedRevision`
+- before flipping the UI to “Saved locally”
+
+If a newer `scheduleSave` has bumped the token, abort the rest of that persist. Do not delete or overwrite blobs you have not finished validating for this token. Do not mark a surface saved if its write did not run. Metadata written under an aborted token should be superseded by the next successful persist; prefer writing metadata after the layer blobs for that pass, or write metadata with a generation number so a late stale write cannot clobber a newer session. The invariant: after the queue drains, IndexedDB matches the latest document state.
+
+Coalesce the queue: at most one persist running and one pending. A new `scheduleSave` while a persist is running only updates the token and ensures one follow-up run—do not let unbounded `saveQueue.then` chains grow.
+
+### Off-main-thread encoding
+
+When `OffscreenCanvas` and `convertToBlob` exist, snapshot the layer with `createImageBitmap` (or transfer an `OffscreenCanvas` copy) and encode inside a Worker. Post the blob back and write it from the main side (or from the worker if the Worker can open IndexedDB—main-side write is enough). When that path is unavailable, fall back to `toBlob` / `canvasToPng`, but encode **one** surface per `requestIdleCallback` turn (`setTimeout(0)` fallback) so pointer moves and paint stay responsive. Never encode every dirty surface in one tight await loop on the main thread the way today’s `persist` does.
+
+### Timing
+
+Keep a short debounce (today’s 400 ms is fine) for metadata-only or idle edits. Do **not** start a persist while a pointer stroke is active (`drawing` / stroke hold / equivalent). If `scheduleSave` fires during a stroke, defer: arm a single save for stroke end (pointer up / checkpoint), then run. Also flush immediately—bypass the debounce—on `visibilitychange` to `hidden` and on `pagehide`, so a tab background or close still lands the latest pixels. Those flush paths still respect cancellation and incremental encodes; they just do not wait 400 ms.
+
+`/?fresh=1` and “Restore to default” / clear-session paths keep clearing storage; after a clear, `lastSavedRevision` state in memory resets with the documents.
+
+### Cleanup
+
+When a layer is deleted, remove `${docId}:${layerId}:pixels` and `${docId}:${layerId}:mask`. When a document is closed or removed from the session, delete every layer key for that `docId`. When a mask is removed from a layer, delete the mask key. On load, after reading metadata, garbage-collect any `layers` store entry whose key is not referenced by the current session metadata (orphans from crashed saves or older builds).
+
+### Migration
+
+If a version-1 single-record session exists (`documents[].layers[].png` / `.mask` blobs inline under `'current'`):
+
+1. Restore into memory with the existing v1 path (or an equivalent one-shot reader).
+2. Write the session out in the v2 split format (metadata + `layers` store).
+3. Delete or replace the old v1 record so the next launch only sees v2.
+
+Do this once on restore. Do not leave the browser with both shapes fighting. A failed migration must not wipe the v1 record until v2 is safely written.
+
+### Errors and status
+
+Keep `onSave` messages exactly as today: “Saving locally…”, “Saved locally”, “Could not save locally”, plus “Local session cleared” when the session is empty. A failed encode or failed put for one layer must not advance that surface’s `lastSavedRevision`. Other layers in the same pass may still save. A hard failure of the metadata write reports “Could not save locally” and does not claim success.
+
+### Must not change
+
+Reload still restores all documents, layers, masks, properties, groups, selection, palette, colors, and tool. The `.pinta` archive format, export, and Give File Access paths are untouched by this work.
+
+### Checks
+
+All existing Playwright tests pass (including the IndexedDB restore test that adds a layer and reloads).
+
+New tests:
+
+1. **Incremental write:** Open three documents, edit one layer, instrument the `layers` store (or a test hook on put keys). Confirm only that layer’s `pixels` (or `mask`) key is rewritten; other documents’ layer keys are not.
+2. **Full restore:** Build a session with masks and groups, reload without `fresh=1`, and assert pixels, masks, group membership, and properties match.
+3. **v1 migration:** Seed IndexedDB with a version-1 `'current'` record (inline PNGs), launch the app, confirm the document restores, then confirm the store is now v2 (metadata without inline PNGs, blobs in `layers`) and the old shape is gone.
+4. **Cleanup:** Delete a layer and close a document; confirm their `layers` keys are removed.
+5. **No stale overwrite:** Fire rapid successive edits so multiple saves are scheduled; after the queue settles, the restored (or read-back) pixels match the **latest** edit, not an older in-flight encode.
+
 ## OpenRaster (.ora) import and export
 
 Add OpenRaster as a first-class document format next to `.pinta` and the existing image exports. Open and Save / Save As / Export can use `.ora`. Give File Access works on an `.ora` handle the same way it works on a `.pinta` handle. No new toolbox icon. The File menu and the export format list gain OpenRaster; that is the only UI.
