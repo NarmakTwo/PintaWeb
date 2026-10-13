@@ -80,6 +80,7 @@ const COMMANDS: { id: string; label: string; shortcut: string; sentence: string 
   { id: 'assist-ellipse', label: 'Ellipse Guide', shortcut: '', sentence: 'Stick strokes to an ellipse.' },
   { id: 'assist-vanish', label: 'Vanishing Point', shortcut: '', sentence: 'Stick strokes to a vanishing point.' },
   { id: 'toggle-cursor', label: 'Brush Cursor', shortcut: '', sentence: 'Show the brush size under the pointer.' },
+  { id: 'live-stroke-render', label: 'Live Stroke Render', shortcut: '', sentence: 'Paint full brush dynamics while dragging. Off keeps a lightweight preview until you release.' },
   { id: 'unit-px', label: 'Pixels', shortcut: '', sentence: 'Show measurements in pixels.' },
   { id: 'unit-in', label: 'Inches', shortcut: '', sentence: 'Show measurements in inches.' },
   { id: 'unit-cm', label: 'Centimeters', shortcut: '', sentence: 'Show measurements in centimeters.' },
@@ -137,7 +138,7 @@ function defaultMenus(): Record<MenuId, string[]> {
   return {
     file: ['new', 'open', 'sep', 'close', 'close-all', 'sep', 'save', 'save-as', 'save-all', 'sep', 'import-layer', 'sep', 'open-palette', 'save-palette', 'reset-palette', 'sep', 'screenshot', 'quit'],
     edit: ['undo', 'redo', 'sep', 'cut', 'copy', 'copy-merged', 'paste', 'paste-layer', 'paste-image', 'sep', 'erase-selection', 'fill-selection', 'invert-selection', 'offset-selection', 'sep', 'select-all', 'deselect', 'sep', 'adjust-stroke'],
-    view: ['zoom-in', 'zoom-out', 'zoom-100', 'zoom-fit', 'zoom-selection', 'sep', 'toggle-rulers', 'toggle-status', 'toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-grid', 'grid-size', 'grid-square', 'grid-iso', 'toggle-snap', 'reset-view', 'assist-none', 'assist-parallel', 'assist-ellipse', 'assist-vanish', 'toggle-cursor', 'sep', 'unit-px', 'unit-in', 'unit-cm', 'sep', 'theme-dark', 'sep', 'fullscreen'],
+    view: ['zoom-in', 'zoom-out', 'zoom-100', 'zoom-fit', 'zoom-selection', 'sep', 'toggle-rulers', 'toggle-status', 'toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-grid', 'grid-size', 'grid-square', 'grid-iso', 'toggle-snap', 'reset-view', 'assist-none', 'assist-parallel', 'assist-ellipse', 'assist-vanish', 'toggle-cursor', 'live-stroke-render', 'sep', 'unit-px', 'unit-in', 'unit-cm', 'sep', 'theme-dark', 'sep', 'fullscreen'],
     image: ['crop', 'auto-crop', 'sep', 'resize', 'canvas-size', 'sep', 'flip-h', 'flip-v', 'sep', 'rotate-cw', 'rotate-ccw', 'rotate-180', 'sep', 'flatten'],
     layers: ['layer-add', 'layer-delete', 'layer-duplicate', 'layer-merge', 'sep', 'layer-up', 'layer-down', 'sep', 'layer-flip-h', 'layer-flip-v', 'layer-rotate', 'sep', 'layer-mask', 'layer-unmask', 'layer-properties', 'import-layer'],
     adjustments: effectTokens(ADJUSTMENTS),

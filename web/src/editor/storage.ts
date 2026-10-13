@@ -2,6 +2,7 @@ import type { ToolId } from './types.ts';
 
 const DB_NAME = 'pinta-web';
 const STORE = 'session';
+const LAYERS_STORE = 'layers';
 
 export interface StoredLayer {
   name: string;
@@ -14,6 +15,19 @@ export interface StoredLayer {
   alphaLock?: boolean;
   png: Blob;
   mask?: Blob;
+}
+
+export interface StoredLayerMeta {
+  id: number;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blend?: string;
+  clip?: boolean;
+  tag?: string | null;
+  parent?: number | null;
+  alphaLock?: boolean;
+  hasMask: boolean;
 }
 
 export interface StoredGroup {
@@ -37,7 +51,20 @@ export interface StoredDocument {
   layers: StoredLayer[];
 }
 
-export interface SessionRecord {
+export interface StoredDocumentMeta {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  active: number;
+  zoom: number;
+  selection: Uint8Array | null;
+  groups?: StoredGroup[];
+  layers: StoredLayerMeta[];
+}
+
+/** Legacy single-record session with inline PNG blobs. */
+export interface SessionRecordV1 {
   version: 1;
   active: number;
   primary: string;
@@ -47,13 +74,36 @@ export interface SessionRecord {
   documents: StoredDocument[];
 }
 
+/** Split session: metadata here, layer pixels in the `layers` store. */
+export interface SessionRecordV2 {
+  version: 2;
+  generation: number;
+  active: number;
+  primary: string;
+  secondary: string;
+  palette: string[];
+  tool: ToolId;
+  documents: StoredDocumentMeta[];
+}
+
+export type SessionRecord = SessionRecordV1 | SessionRecordV2;
+
+export function layerPixelsKey(docId: string, layerId: number): string {
+  return `${docId}:${layerId}:pixels`;
+}
+
+export function layerMaskKey(docId: string, layerId: number): string {
+  return `${docId}:${layerId}:mask`;
+}
+
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
       if (!db.objectStoreNames.contains('brushes')) db.createObjectStore('brushes');
+      if (!db.objectStoreNames.contains(LAYERS_STORE)) db.createObjectStore(LAYERS_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -109,6 +159,87 @@ export async function saveSession(record: SessionRecord): Promise<void> {
     });
   } finally {
     db.close();
+  }
+}
+
+export async function putLayerBlob(key: string, blob: Blob): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = db.transaction(LAYERS_STORE, 'readwrite').objectStore(LAYERS_STORE).put(blob, key);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function getLayerBlob(key: string): Promise<Blob | null> {
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(LAYERS_STORE).objectStore(LAYERS_STORE).get(key);
+      request.onsuccess = () => resolve((request.result as Blob | undefined) ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function deleteLayerBlob(key: string): Promise<void> {
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const request = db.transaction(LAYERS_STORE, 'readwrite').objectStore(LAYERS_STORE).delete(key);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function deleteLayerBlobsForDoc(docId: string): Promise<void> {
+  const db = await openDb();
+  try {
+    const prefix = `${docId}:`;
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(LAYERS_STORE, 'readwrite');
+      const store = tx.objectStore(LAYERS_STORE);
+      const request = store.openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (typeof cursor.key === 'string' && cursor.key.startsWith(prefix)) cursor.delete();
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function listLayerKeys(): Promise<string[]> {
+  const db = await openDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = db.transaction(LAYERS_STORE).objectStore(LAYERS_STORE).getAllKeys();
+      request.onsuccess = () => resolve((request.result as IDBValidKey[]).map(String));
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function garbageCollectLayerKeys(keep: Set<string>): Promise<void> {
+  const keys = await listLayerKeys();
+  for (const key of keys) {
+    if (!keep.has(key)) await deleteLayerBlob(key);
   }
 }
 
@@ -198,9 +329,11 @@ export async function clearSession(): Promise<void> {
   const db = await openDb();
   try {
     await new Promise<void>((resolve, reject) => {
-      const request = db.transaction(STORE, 'readwrite').objectStore(STORE).delete('current');
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      const tx = db.transaction([STORE, LAYERS_STORE], 'readwrite');
+      tx.objectStore(STORE).delete('current');
+      tx.objectStore(LAYERS_STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
   } finally {
     db.close();

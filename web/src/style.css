@@ -601,8 +601,6 @@ kbd, .shortcut {
 
 #view-angle:hover { color: var(--ink); }
 
-#status-note { color: var(--muted); }
-
 #paper canvas {
   position: absolute;
   inset: 0;
@@ -799,6 +797,9 @@ dialog .check { justify-content: flex-start; }
 .brush-delete, .brush-row[aria-pressed="true"] .brush-delete { color: var(--danger); }
 .brush-row.drag-over, .brush-category-head.drag-over, .brush-loose.drag-over, .brush-category-body.drag-over { outline: 1px solid var(--accent); }
 .brush-category-head { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; color: var(--ink); }
+.brush-more { margin: 8px 0; }
+.brush-more > summary { cursor: pointer; color: var(--muted, #666); font-size: 0.92em; }
+.brush-hint { margin: 4px 0 0; color: var(--muted, #666); font-size: 0.85em; }
 .brush-chevron { width: 14px; height: 14px; transition: transform 120ms ease; }
 .brush-category-head[aria-expanded="true"] .brush-chevron { transform: rotate(90deg); }
 #brush-category-menu, #brush-menu {

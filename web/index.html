@@ -116,7 +116,7 @@
         <span id="selection-status">No selection</span>
         <span id="cursor-pos">0, 0</span>
         <span id="image-dimensions"></span>
-        <span id="status-note"></span>
+        <!-- Do not add a second status-line or “help” span here. Context hints belong in tool options, disclosures, or one-time toasts—not persistent status-bar notes. -->
         <button type="button" id="view-angle" title="Reset the view angle">0°</button>
         <button type="button" id="zoom-label" title="Fit the image">100%</button>
       </footer>
@@ -134,7 +134,7 @@
       </label>
       <input id="color-hex" type="text" spellcheck="false" autocomplete="off" maxlength="9" aria-label="Hex color" />
     </div>
-    <input id="file-input" type="file" accept="image/*" hidden />
+    <input id="file-input" type="file" accept="image/*,.pinta,.ora,application/pinta,image/openraster" hidden />
     <input id="layer-input" type="file" accept="image/*" hidden />
     <input id="palette-input" type="file" accept=".txt,text/plain" hidden />
     <input id="config-input" type="file" accept=".pintaconfig" hidden />
@@ -169,6 +169,7 @@
             <option value="image/webp">WebP</option>
             <option value="image/bmp">BMP</option>
             <option value="application/pinta">Pinta (.pinta)</option>
+            <option value="image/openraster">OpenRaster (.ora)</option>
           </select>
         </label>
         <div class="dialog-actions">

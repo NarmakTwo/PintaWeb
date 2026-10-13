@@ -268,6 +268,278 @@ test('adds a layer and restores the image from IndexedDB', async ({ page }) => {
   await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
 });
 
+async function waitSaved(page: Page, previous?: string | null): Promise<string> {
+  await page.waitForFunction(prev => {
+    const app = document.querySelector('#app');
+    return app?.getAttribute('data-save-state') === 'Saved locally'
+      && (!prev || app.getAttribute('data-save-serial') !== prev);
+  }, previous ?? null);
+  return (await page.locator('#app').getAttribute('data-save-serial')) ?? '';
+}
+
+test('autosave only rewrites dirty layer blobs', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 48, 48);
+  let serial = await waitSaved(page);
+  await newCanvas(page, 48, 48);
+  serial = await waitSaved(page, serial);
+  await newCanvas(page, 48, 48);
+  serial = await waitSaved(page, serial);
+
+  const beforeIds = await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta: { docs: { id: string }[]; index: number } }).__pinta;
+    return { ids: editor.docs.map(doc => doc.id), active: editor.docs[editor.index]?.id };
+  });
+  expect(beforeIds.ids.length).toBeGreaterThanOrEqual(3);
+  await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta: { savePuts: string[] } }).__pinta;
+    editor.savePuts = [];
+  });
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('12');
+  await drag(page, 0.4, 0.4, 0.6, 0.6);
+  await page.waitForFunction(() => {
+    const editor = (window as unknown as { __pinta: { savePuts: string[] } }).__pinta;
+    return editor.savePuts.length > 0;
+  });
+  serial = await waitSaved(page, serial);
+  const puts = await page.evaluate(() => (window as unknown as { __pinta: { savePuts: string[] } }).__pinta.savePuts);
+  expect(puts.length).toBeGreaterThan(0);
+  expect(puts.every(key => key.endsWith(':pixels') || key.endsWith(':mask'))).toBe(true);
+  expect(puts.every(key => key.startsWith(`${beforeIds.active}:`))).toBe(true);
+  const otherIds = beforeIds.ids.filter(id => id !== beforeIds.active);
+  expect(puts.some(key => otherIds.some(id => key.startsWith(`${id}:`)))).toBe(false);
+});
+
+test('autosave restores masks and groups', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  let serial = await waitSaved(page);
+  await page.locator('#menu-layers').click();
+  await page.locator('#panel-layers [data-command="layer-add"]').click();
+  await expect(page.locator('#layer-list .layer')).toHaveCount(2);
+  serial = await waitSaved(page, serial);
+  await page.locator('#layer-list .layer').first().click({ button: 'right' });
+  await page.locator('#context-menu').getByRole('button', { name: 'Group layer' }).click();
+  await expect(page.locator('.group-row')).toHaveCount(1);
+  serial = await waitSaved(page, serial);
+  await page.locator('#menu-layers').click();
+  await page.locator('[data-command="layer-mask"]').click();
+  await expect(page.locator('.mask-thumb[aria-pressed="true"]')).toHaveCount(1);
+  serial = await waitSaved(page, serial);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('16');
+  await drag(page, 0.3, 0.3, 0.7, 0.7);
+  serial = await waitSaved(page, serial);
+  const before = await page.evaluate(() => {
+    const editor = (window as unknown as {
+      __pinta: {
+        index: number;
+        docs: {
+          id: string;
+          groups: { id: number; name: string }[];
+          layers: { id: number; name: string; mask?: HTMLCanvasElement; opacity: number }[];
+        }[];
+      };
+    }).__pinta;
+    const doc = editor.docs[editor.index];
+    return {
+      id: doc.id,
+      groups: doc.groups.map(group => ({ id: group.id, name: group.name })),
+      layers: doc.layers.map(layer => ({
+        id: layer.id,
+        name: layer.name,
+        opacity: layer.opacity,
+        hasMask: !!layer.mask,
+      })),
+    };
+  });
+  expect(before.layers.some(layer => layer.hasMask)).toBe(true);
+  expect(before.groups.length).toBeGreaterThan(0);
+  await page.goto('/');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
+  const after = await page.evaluate(docId => {
+    const editor = (window as unknown as {
+      __pinta: {
+        docs: {
+          id: string;
+          groups: { id: number; name: string }[];
+          layers: { id: number; name: string; mask?: HTMLCanvasElement; opacity: number }[];
+        }[];
+      };
+    }).__pinta;
+    const doc = editor.docs.find(item => item.id === docId) ?? editor.docs[0];
+    return {
+      groups: doc.groups.map(group => ({ id: group.id, name: group.name })),
+      layers: doc.layers.map(layer => ({
+        id: layer.id,
+        name: layer.name,
+        opacity: layer.opacity,
+        hasMask: !!layer.mask,
+      })),
+    };
+  }, before.id);
+  expect(after.layers.map(layer => layer.hasMask)).toEqual(before.layers.map(layer => layer.hasMask));
+  expect(after.layers.map(layer => layer.name)).toEqual(before.layers.map(layer => layer.name));
+  expect(after.groups.map(group => group.name)).toEqual(before.groups.map(group => group.name));
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[3]).toBeGreaterThan(0);
+});
+
+test('migrates a v1 IndexedDB session to v2 split storage', async ({ page }) => {
+  await ready(page);
+  const png = RED_PNG;
+  await page.evaluate(async bytes => {
+    await new Promise<void>((resolve, reject) => {
+      const del = indexedDB.deleteDatabase('pinta-web');
+      del.onsuccess = () => resolve();
+      del.onerror = () => reject(del.error);
+      del.onblocked = () => resolve();
+    });
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const open = indexedDB.open('pinta-web', 2);
+      open.onupgradeneeded = () => {
+        const store = open.result;
+        if (!store.objectStoreNames.contains('session')) store.createObjectStore('session');
+      };
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const blob = new Blob([new Uint8Array(bytes)], { type: 'image/png' });
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('session', 'readwrite');
+      tx.objectStore('session').put({
+        version: 1,
+        active: 0,
+        primary: '#000000',
+        secondary: '#ffffff',
+        palette: ['#000000', '#ffffff'],
+        tool: 'brush',
+        documents: [{
+          id: 'migrate-doc',
+          name: 'Migrated',
+          width: 1,
+          height: 1,
+          active: 0,
+          zoom: 1,
+          selection: null,
+          groups: [],
+          layers: [{
+            name: 'Layer 1',
+            visible: true,
+            opacity: 100,
+            blend: 'normal',
+            clip: false,
+            tag: null,
+            parent: null,
+            alphaLock: false,
+            png: blob,
+          }],
+        }],
+      }, 'current');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  }, [...png]);
+  await page.goto('/');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(200);
+  const shape = await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const open = indexedDB.open('pinta-web');
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const session = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const request = db.transaction('session').objectStore('session').get('current');
+      request.onsuccess = () => resolve(request.result as Record<string, unknown>);
+      request.onerror = () => reject(request.error);
+    });
+    const layerKeys = db.objectStoreNames.contains('layers')
+      ? await new Promise<IDBValidKey[]>((resolve, reject) => {
+        const request = db.transaction('layers').objectStore('layers').getAllKeys();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      })
+      : [];
+    db.close();
+    return { version: session.version, layerKeys: layerKeys.map(String), docs: session.documents };
+  });
+  expect(shape.version).toBe(2);
+  expect(shape.layerKeys.some(key => key.includes('migrate-doc') && key.endsWith(':pixels'))).toBe(true);
+  const docs = shape.docs as { layers: { png?: unknown; hasMask?: boolean }[] }[];
+  expect(docs[0].layers[0].png).toBeUndefined();
+  expect(typeof docs[0].layers[0].hasMask).toBe('boolean');
+});
+
+test('autosave drops layer keys after delete and close', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  let serial = await waitSaved(page);
+  await newCanvas(page, 32, 32);
+  serial = await waitSaved(page, serial);
+  await page.locator('#menu-layers').click();
+  await page.locator('#panel-layers [data-command="layer-add"]').click();
+  serial = await waitSaved(page, serial);
+  const keysBefore = await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const open = indexedDB.open('pinta-web');
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const keys = await new Promise<string[]>((resolve, reject) => {
+      const request = db.transaction('layers').objectStore('layers').getAllKeys();
+      request.onsuccess = () => resolve((request.result as IDBValidKey[]).map(String));
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return keys;
+  });
+  expect(keysBefore.length).toBeGreaterThan(1);
+  await page.locator('#menu-layers').click();
+  await page.locator('#panel-layers [data-command="layer-delete"]').click();
+  serial = await waitSaved(page, serial);
+  await page.locator('#tabs [data-tab-close]').last().click();
+  const closeDialog = page.locator('#close-dialog');
+  if (await closeDialog.isVisible()) await page.locator('#close-discard').click();
+  serial = await waitSaved(page, serial);
+  const keysAfter = await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const open = indexedDB.open('pinta-web');
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const keys = await new Promise<string[]>((resolve, reject) => {
+      const request = db.transaction('layers').objectStore('layers').getAllKeys();
+      request.onsuccess = () => resolve((request.result as IDBValidKey[]).map(String));
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return keys;
+  });
+  expect(keysAfter.length).toBeLessThan(keysBefore.length);
+});
+
+test('autosave keeps the latest edit after rapid strokes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page);
+  let serial = await waitSaved(page);
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('20');
+  for (let i = 0; i < 5; i++) await drag(page, 0.2 + i * 0.05, 0.2, 0.3 + i * 0.05, 0.8);
+  serial = await waitSaved(page, serial);
+  await page.locator('#primary-input').fill('#0000ff');
+  await drag(page, 0.5, 0.5, 0.55, 0.55);
+  serial = await waitSaved(page, serial);
+  await page.goto('/');
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
+  await expect.poll(async () => {
+    const color = await pixel(page, 0.52, 0.52);
+    return color[2] > 200 && color[0] < 80;
+  }).toBe(true);
+});
+
 test('can use every tool without a script error', async ({ page }) => {
   await ready(page);
   await newCanvas(page);
@@ -1837,16 +2109,14 @@ test('keeps the smoothing number when Unserrate is turned off', async ({ page })
   await page.locator('[data-tool="brush"]').click();
   await expect(page.locator('#smooth-slider')).toHaveValue('100');
   await expect(page.locator('#unserrate')).toBeChecked();
-  await expect(page.locator('#status-note')).toHaveText('');
   await page.locator('#unserrate').uncheck();
   await expect(page.locator('#smooth-slider')).toHaveValue('100');
-  await expect(page.locator('#status-note')).toHaveText('');
   await page.locator('[data-tool="pencil"]').click();
   await expect(page.locator('#smooth-slider')).toHaveValue('0');
   await expect(page.locator('#unserrate')).not.toBeChecked();
   await page.locator('[data-tool="bucket"]').click();
   await expect(page.locator('#smooth-edges')).toBeChecked();
-  await expect(page.locator('#status-note')).toHaveText('Fills the soft edge.');
+  await expect(page.locator('#status-note')).toHaveCount(0);
 });
 
 test('softens the edge of a fill and leaves the dark core', async ({ page }) => {
@@ -1900,7 +2170,6 @@ test('shows width, height, and angle while a selection floats', async ({ page })
   await expect(page.locator('#float-w')).toHaveValue('40');
   await expect(page.locator('#float-h')).toHaveValue('30');
   await expect(page.locator('#float-angle')).toHaveValue('0');
-  await expect(page.locator('#status-note')).toHaveText('Arrow keys nudge. Shift moves ten.');
   await page.mouse.up();
   await expect(page.locator('#float-w')).toHaveCount(0);
 });
@@ -1923,7 +2192,7 @@ test('snaps a size-1 pencil to the grid and sticks a stroke to parallel lines', 
   await page.locator('[data-command="assist-parallel"]').click();
   await page.keyboard.press('Escape');
   await drag(page, 0.2, 0.5, 0.8, 0.5);
-  await expect(page.locator('#status-note')).toHaveText('Parallel lines');
+  await expect(page.locator('#status-note')).toHaveCount(0);
   await page.locator('#menu-view').click();
   await page.locator('[data-command="toggle-snap"]').click();
   await page.keyboard.press('Escape');
@@ -1990,14 +2259,14 @@ test('long-presses an eye, paints a mask, and picks from the mixer without undo'
   await drag(page, 0.5, 0.5, 0.52, 0.5);
   await page.locator('#menu-layers').click();
   await page.locator('[data-command="layer-mask"]').click();
-  await expect(page.locator('#status-note')).toHaveText('Painting the mask');
+  await expect(page.locator('.mask-thumb[aria-pressed="true"]')).toHaveCount(1);
   await page.locator('#primary-input').fill('#000000');
   await page.locator('input[data-visible][data-layer="0"]').uncheck();
   await drag(page, 0.5, 0.5, 0.52, 0.5);
   const hidden = await pixel(page, 0.5, 0.5);
   expect(hidden[3]).toBeLessThan(20);
   await page.locator('#layer-list .layer').first().click();
-  await expect(page.locator('#status-note')).not.toHaveText('Painting the mask');
+  await expect(page.locator('.mask-thumb[aria-pressed="true"]')).toHaveCount(0);
   const steps = await page.locator('#history-list .history-item').count();
   await page.locator('#mix-toggle').click();
   await expect(page.locator('#mixer-panel')).toBeVisible();
@@ -2096,6 +2365,147 @@ test('imports Procreate brushes and a Photoshop brush set', async ({ page }) => 
   await expect(page.locator('#brush-panel')).toBeHidden();
 });
 
+function syntheticGbr(): Buffer {
+  const width = 8;
+  const height = 8;
+  const name = Buffer.from('Cloud\0');
+  const headerSize = 28 + name.length;
+  const header = Buffer.alloc(headerSize);
+  header.writeUInt32BE(headerSize, 0);
+  header.writeUInt32BE(1, 4);
+  header.writeUInt32BE(width, 8);
+  header.writeUInt32BE(height, 12);
+  header.writeUInt32BE(1, 16);
+  header.write('GIMP', 20);
+  name.copy(header, 28);
+  const pixels = Buffer.alloc(width * height, 0);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const d = Math.hypot(x - 3.5, y - 3.5);
+      pixels[y * width + x] = d < 3 ? 255 : 0;
+    }
+  }
+  return Buffer.concat([header, pixels]);
+}
+
+test('imports GIMP gbr and MyPaint myb brushes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles({
+    name: 'pack01_cloud.gbr',
+    mimeType: 'application/octet-stream',
+    buffer: syntheticGbr(),
+  });
+  const cloud = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^pack01_cloud$/ }) });
+  await expect(cloud.locator('.brush-row', { hasText: /Cloud/ })).toHaveCount(1, { timeout: 15_000 });
+  await cloud.locator('.brush-row', { hasText: /Cloud/ }).locator('[data-preset-use]').click();
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('24');
+  await drag(page, 0.2, 0.5, 0.8, 0.5);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(40);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles({
+    name: 'Airbrush_Round.myb',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify({
+      version: 3,
+      comment: 'Airbrush Round',
+      settings: {
+        opaque: 0.8,
+        hardness: 0.4,
+        radius_logarithmic: 2,
+        dabs_per_actual_radius: 4,
+        smudge: 0,
+        tracking_noise: 0.1,
+        offset_by_random: 0.05,
+      },
+    }), 'utf8'),
+  });
+  const airbrush = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Airbrush_Round$/ }) });
+  await expect(airbrush.locator('[data-preset-use]')).toHaveCount(1, { timeout: 15_000 });
+  await airbrush.locator('[data-preset-use]').click();
+  await page.locator('#undo').click();
+  await drag(page, 0.2, 0.2, 0.8, 0.8);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(20);
+});
+
+test('imports GIMP gih, Krita kpp, MyPaint text myb, and packs from proc', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 96, 96);
+  const root = resolve(process.cwd(), '../proc');
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, 'pack01_cloud.gbr'));
+  const cloud = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^pack01_cloud$/ }) });
+  await expect(cloud.locator('.brush-row').first()).toBeVisible({ timeout: 30_000 });
+  await cloud.locator('[data-preset-use]').first().click();
+  await page.locator('#primary-input').fill('#cc3300');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('32');
+  await drag(page, 0.2, 0.2, 0.8, 0.2);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.2))[0]).toBeGreaterThan(40);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, 'pack01-leaf-anim2.gih'));
+  const leaf = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^pack01-leaf-anim2$/ }) });
+  await expect(leaf.locator('.brush-row').first()).toBeVisible({ timeout: 30_000 });
+  await leaf.locator('[data-preset-edit]').first().click();
+  await expect(page.locator('#brush-pipe-select')).toHaveValue('random');
+  await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await page.locator('#brush-edit-back').click();
+  await leaf.locator('[data-preset-use]').first().click();
+  await page.locator('#primary-input').fill('#00aa44');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('28');
+  await drag(page, 0.15, 0.5, 0.85, 0.5);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[1]).toBeGreaterThan(30);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, 'Ink_Pen_Texturized.kpp'));
+  const kpp = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Ink_Pen_Texturized$/ }) });
+  await expect(kpp.locator('[data-preset-use]')).toHaveCount(1, { timeout: 30_000 });
+  await kpp.locator('[data-preset-use]').click();
+  await page.locator('#undo').click();
+  await drag(page, 0.2, 0.25, 0.8, 0.75);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5)).slice(0, 3).reduce((a, b) => a + b, 0)).not.toBe(255 * 3);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, 'Airbrush_Round.myb'));
+  const myb = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Airbrush_Round$/ }) });
+  await expect(myb.locator('[data-preset-use]')).toHaveCount(1, { timeout: 15_000 });
+  await myb.locator('[data-preset-use]').click();
+  await page.locator('#undo').click();
+  await drag(page, 0.2, 0.7, 0.8, 0.3);
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0] + (await pixel(page, 0.5, 0.5))[1] + (await pixel(page, 0.5, 0.5))[2]).toBeLessThan(750);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, 'tone_v2.zip'));
+  const tone = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^tone_v2$/ }) });
+  await expect(tone.locator('.brush-row').first()).toBeVisible({ timeout: 60_000 });
+  await tone.locator('[data-preset-use]').first().click();
+  await page.locator('#undo').click();
+  await drag(page, 0.25, 0.4, 0.75, 0.6);
+  await expect.poll(async () => {
+    const p = await pixel(page, 0.5, 0.5);
+    return p[0] + p[1] + p[2];
+  }).toBeLessThan(750);
+
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles(resolve(root, "Puplaroid's_Retro_Comic_Ink_Blotches_Brush.bundle"));
+  const krita = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /Puplaroid/ }) });
+  await expect(krita.locator('.brush-row').first()).toBeVisible({ timeout: 90_000 });
+  await krita.locator('[data-preset-use]').first().click();
+  await page.locator('#undo').click();
+  await drag(page, 0.3, 0.3, 0.7, 0.7);
+  await expect.poll(async () => {
+    const p = await pixel(page, 0.5, 0.5);
+    return p[0] + p[1] + p[2];
+  }).toBeLessThan(765);
+});
+
 test('imports a zip of brush sets and loose brushes', async ({ page }) => {
   await ready(page);
   await newCanvas(page, 64, 64);
@@ -2112,6 +2522,162 @@ test('imports a zip of brush sets and loose brushes', async ({ page }) => {
   await expect(studio.locator('.brush-row', { hasText: 'Hard Airbrush' })).toHaveCount(1);
   await page.keyboard.press('Escape');
   await expect(page.locator('#brush-panel')).toBeHidden();
+});
+
+test('interpolates dabs on fast spaced strokes', async ({ page }) => {
+  await ready(page);
+  const densified = await page.evaluate(() => {
+    const fill = (window as unknown as {
+      __pintaInterpolateDabs?: (points: { x: number; y: number; t: number }[], spacing: number) => { x: number; y: number; t: number }[];
+    }).__pintaInterpolateDabs;
+    if (!fill) return null;
+    const sparse = fill([{ x: 0, y: 0, t: 0 }, { x: 200, y: 0, t: 16 }], 10);
+    let maxGap = 0;
+    for (let index = 1; index < sparse.length; index++) {
+      maxGap = Math.max(maxGap, Math.hypot(sparse[index].x - sparse[index - 1].x, sparse[index].y - sparse[index - 1].y));
+    }
+    const slow = fill([{ x: 0, y: 0, t: 0 }, { x: 8, y: 0, t: 16 }, { x: 16, y: 0, t: 32 }], 10);
+    return { count: sparse.length, maxGap, slowCount: slow.length };
+  });
+  expect(densified).toBeTruthy();
+  expect(densified!.count).toBeGreaterThan(15);
+  expect(densified!.maxGap).toBeLessThanOrEqual(10.01);
+  expect(densified!.slowCount).toBe(3);
+
+  await newCanvas(page, 160, 80);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/Earth.brushset');
+  const row = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Earth$/ }) }).locator('.brush-row').first();
+  await expect(row).toHaveCount(1);
+  await row.locator('[data-preset-edit]').click();
+  await page.locator('#brush-spacing').fill('80');
+  await page.locator('#brush-scatter').fill('0');
+  await page.locator('#brush-stamps').fill('1');
+  await page.keyboard.press('Escape');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('28');
+  await page.locator('#unserrate').uncheck();
+  await page.locator('#smooth-slider').fill('0');
+  const start = await paperPoint(page, 0.08, 0.5);
+  const end = await paperPoint(page, 0.92, 0.5);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(end.x, end.y, { steps: 3 });
+  await page.mouse.up();
+  const coverage = await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta?: { layer?: { canvas: HTMLCanvasElement } } }).__pinta;
+    const canvas = editor?.layer?.canvas;
+    if (!canvas) return { hit: 0, samples: 0 };
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const y = Math.floor(canvas.height / 2);
+    let hit = 0;
+    let samples = 0;
+    for (let x = Math.floor(canvas.width * 0.1); x < Math.floor(canvas.width * 0.9); x += 2) {
+      samples += 1;
+      const index = (y * canvas.width + x) * 4;
+      if (data[index + 3] > 20) hit += 1;
+    }
+    return { hit, samples };
+  });
+  expect(coverage.samples).toBeGreaterThan(20);
+  expect(coverage.hit / coverage.samples).toBeGreaterThan(0.55);
+
+  await page.locator('#undo').click();
+  await page.locator('#unserrate').check();
+  await page.locator('#smooth-slider').fill('100');
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(end.x, end.y, { steps: 3 });
+  await page.mouse.up();
+  const smoothed = await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta?: { layer?: { canvas: HTMLCanvasElement } } }).__pinta;
+    const canvas = editor?.layer?.canvas;
+    if (!canvas) return 0;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    const y = Math.floor(canvas.height / 2);
+    let hit = 0;
+    let samples = 0;
+    for (let x = Math.floor(canvas.width * 0.1); x < Math.floor(canvas.width * 0.9); x += 2) {
+      samples += 1;
+      const index = (y * canvas.width + x) * 4;
+      if (data[index + 3] > 20) hit += 1;
+    }
+    return samples ? hit / samples : 0;
+  });
+  expect(smoothed).toBeGreaterThan(0.55);
+});
+
+test('caps brush taper by brush size and toggles live stroke render', async ({ page }) => {
+  await ready(page);
+  const zones = await page.evaluate(() => {
+    const taper = (window as unknown as { __pintaTaperZone?: (length: number, percent: number, size: number) => number }).__pintaTaperZone;
+    if (!taper) return null;
+    return {
+      short: taper(40, 50, 20),
+      long: taper(4000, 50, 20),
+      zero: taper(4000, 0, 20),
+    };
+  });
+  expect(zones).toEqual({ short: 10, long: 10, zero: 0 });
+  await expect(page.locator('#live-stroke-mark')).toHaveText('Off');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="live-stroke-render"]').click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#live-stroke-mark')).toHaveText('On');
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-engine', 'ready');
+  await expect(page.locator('#live-stroke-mark')).toHaveText('On');
+  await page.locator('#menu-view').click();
+  await page.locator('[data-command="live-stroke-render"]').click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#live-stroke-mark')).toHaveText('Off');
+});
+
+test('undoes strokes from dynamic custom brushes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 128, 128);
+  await page.locator('#primary-input').fill('#000000');
+  await page.locator('[data-tool="bucket"]').click();
+  const origin = await paperPoint(page, 0.5, 0.5);
+  await page.mouse.click(origin.x, origin.y);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles('../proc/P5_Luminance.brushset');
+  const leak = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^P5_Luminance$/ }) }).locator('.brush-row', { hasText: 'Lightleak' });
+  await expect(leak).toHaveCount(1);
+  await leak.locator('[data-preset-edit]').click();
+  if (await page.locator('#brush-grain-clear').count()) await page.locator('#brush-grain-clear').click();
+  await page.locator('#brush-carry').fill('0');
+  await page.locator('#brush-scatter').fill('120');
+  await page.locator('#brush-spacing').fill('10');
+  await page.locator('#brush-stamps').fill('4');
+  await page.locator('#brush-size-jitter').fill('40');
+  await page.locator('#brush-settle').check();
+  await page.keyboard.press('Escape');
+  await page.locator('#primary-input').fill('#ff0000');
+  await page.locator('[data-tool="brush"]').click();
+  await page.locator('#size-slider').fill('36');
+  await drag(page, 0.15, 0.45, 0.9, 0.55);
+  const countLit = async () => page.evaluate(() => {
+    const editor = (window as unknown as { __pinta?: { layer?: { canvas: HTMLCanvasElement } } }).__pinta;
+    const canvas = editor?.layer?.canvas;
+    if (!canvas) return -1;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+    let lit = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index] > 24 || data[index + 1] > 24 || data[index + 2] > 24) lit += 1;
+    }
+    return lit;
+  });
+  const painted = await countLit();
+  expect(painted).toBeGreaterThan(40);
+  // Undo immediately — settle must not paint the stroke back.
+  await page.locator('#undo').click();
+  expect(await countLit()).toBe(0);
+  await page.waitForTimeout(500);
+  expect(await countLit()).toBe(0);
+  await page.locator('#redo').click();
+  expect(await countLit()).toBeGreaterThan(40);
 });
 
 test('luminance brushes add light and shift their color', async ({ page }) => {
@@ -2289,11 +2855,13 @@ test('undoes fifty strokes on a large canvas', async ({ page }) => {
     const y = 0.12 + Math.floor(index / 10) * 0.14;
     await drag(page, x, y, x, y);
   }
-  await expect(page.locator('#history-list .history-item')).toHaveCount(51);
-  const drawn = await pixel(page, 0.08, 0.12);
+  // Full-snapshot history caps at 21 entries (initial + 20 undos).
+  await expect(page.locator('#history-list .history-item')).toHaveCount(21);
+  // Last stroke lands at (0.80, 0.68); older strokes fall off the 21-cap window.
+  const drawn = await pixel(page, 0.80, 0.68);
   expect(drawn[0]).toBeLessThan(40);
-  for (let index = 0; index < 50; index++) await page.locator('#undo').click();
-  const cleared = await pixel(page, 0.08, 0.12);
+  for (let index = 0; index < 20; index++) await page.locator('#undo').click();
+  const cleared = await pixel(page, 0.80, 0.68);
   expect(cleared[0]).toBeGreaterThan(240);
   expect(cleared[4]).toBe(960);
   await expect(page.locator('#undo')).toBeDisabled();
@@ -2350,13 +2918,60 @@ test('saves history in a pinta file and undoes after reload', async ({ page }) =
   if (!stream) throw new Error('The .pinta download was empty.');
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   const archive = Buffer.concat(chunks);
-  expect(archive.toString('utf8')).toContain('"kind":"pixels"');
+  const text = archive.toString('utf8');
+  expect(text).toContain('"history"');
+  expect(text).toContain('history/');
+  expect(text).not.toContain('"kind":"pixels"');
   await page.locator('#undo').click();
   expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(240);
   await page.locator('#file-input').setInputFiles({ name: 'history.pinta', mimeType: 'application/pinta', buffer: archive });
   await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
   await page.locator('#undo').click();
   expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(240);
+});
+
+test('round-trips OpenRaster with stack, xmp, and undo', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.locator('#menu-layers').click();
+  await page.locator('#panel-layers [data-command="layer-add"]').click();
+  await page.locator('#menu-layers').click();
+  await page.locator('[data-command="layer-mask"]').click();
+  await page.locator('#primary-input').fill('#00aa00');
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('14');
+  await drag(page, 0.3, 0.3, 0.7, 0.7);
+  expect((await pixel(page, 0.5, 0.5))[1]).toBeGreaterThan(80);
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="save-as"]').click();
+  await page.locator('#export-name').fill('sheet');
+  await page.locator('#export-format').selectOption('image/openraster');
+  await page.locator('#confirm-export').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('sheet.ora');
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  if (!stream) throw new Error('The .ora download was empty.');
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  const archive = Buffer.concat(chunks);
+  const text = archive.toString('utf8');
+  expect(archive.subarray(0, 2).toString()).toBe('PK');
+  expect(text).toContain('mimetype');
+  expect(text).toContain('image/openraster');
+  expect(text).toContain('stack.xml');
+  expect(text).toContain('mergedimage.png');
+  expect(text).toContain('data/pinta/metadata.xmp');
+  expect(text).toContain('pinta:metadata');
+  await page.locator('#undo').click();
+  await page.locator('#file-input').setInputFiles({ name: 'sheet.ora', mimeType: 'image/openraster', buffer: archive });
+  await expect.poll(async () => (await pixel(page, 0.5, 0.5))[1]).toBeGreaterThan(80);
+  await expect(page.locator('.mask-thumb')).toHaveCount(1);
+  await page.locator('#undo').click();
+  await expect.poll(async () => {
+    const color = await pixel(page, 0.5, 0.5);
+    return color[1] < 40 || (color[0] > 200 && color[1] > 200 && color[2] > 200);
+  }).toBe(true);
 });
 
 test('matches a full recomposite after a stroke on a large layered document', async ({ page }) => {

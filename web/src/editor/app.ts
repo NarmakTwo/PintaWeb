@@ -7,7 +7,7 @@ import {
 import { ADJUSTMENTS, ALL_EFFECTS, EFFECTS, performEffect, valuesFrom, type AdjustValues, type Field } from './commands.ts';
 import { mountCustomize, openCustomize } from './customize.ts';
 import { BLEND_MODES, DEFAULT_TAG, Editor, LAYER_TAGS, type BlendMode } from './document.ts';
-import { activePreset, clearAdjust, closeBrushPanel, hasLastStroke, loadBrushes, mountBrushes, paintBrushMark, refreshBrushPreview, startAdjust, strokeSerial } from './brushes.ts';
+import { clearAdjust, clearStrokeMemory, closeBrushPanel, hasLastStroke, interpolateDabs, loadBrushes, mountBrushes, paintBrushMark, refreshBrushPreview, startAdjust, strokeSerial, taperZone } from './brushes.ts';
 import {
   effectiveShortcut, getLayout, loadLayout, matchShortcut, MENU_IDS, menuEntries, menuIsCustom, onLayout, setDocks, shortcutLabel, type MenuId,
 } from './layout.ts';
@@ -28,6 +28,7 @@ const EXT: Record<string, string> = {
   'image/webp': '.webp',
   'image/bmp': '.bmp',
   'application/pinta': '.pinta',
+  'image/openraster': '.ora',
 };
 
 function editing(): boolean {
@@ -53,7 +54,14 @@ function ask(id: string): Promise<string> {
 export async function start(): Promise<void> {
   loadLayout();
   const editor = new Editor();
-  (window as unknown as { __pinta?: Editor }).__pinta = editor;
+  try { editor.liveStrokeRender = localStorage.getItem('pinta-live-stroke-render') === '1'; } catch { /* storage unavailable */ }
+  (window as unknown as {
+    __pinta?: Editor;
+    __pintaTaperZone?: typeof taperZone;
+    __pintaInterpolateDabs?: typeof interpolateDabs;
+  }).__pinta = editor;
+  (window as unknown as { __pintaTaperZone?: typeof taperZone }).__pintaTaperZone = taperZone;
+  (window as unknown as { __pintaInterpolateDabs?: typeof interpolateDabs }).__pintaInterpolateDabs = interpolateDabs;
   const tools = new ToolController(editor);
   buildChrome(editor, tools);
   editor.attach($('image-canvas'), $('preview-canvas'), $('overlay-canvas'), $('paper'), $('stage'));
@@ -74,6 +82,7 @@ export async function start(): Promise<void> {
     app.dataset.saveState = state;
     app.dataset.saveSerial = String(editor.saveSerial);
   };
+  editor.onHistoryNavigate = clearStrokeMemory;
   wire(editor, tools);
   applyDocks();
   refillMenus();
@@ -205,7 +214,9 @@ function viewMenu(): string {
     '<button type="button" data-command="assist-parallel">Parallel Lines</button>',
     '<button type="button" data-command="assist-ellipse">Ellipse Guide</button>',
     '<button type="button" data-command="assist-vanish">Vanishing Point</button>',
-    '<button type="button" data-command="toggle-cursor">Brush Cursor<span class="shortcut" id="cursor-mark">Off</span></button>', '<div class="sep"></div>',
+    '<button type="button" data-command="toggle-cursor">Brush Cursor<span class="shortcut" id="cursor-mark">Off</span></button>',
+    '<button type="button" data-command="live-stroke-render">Live Stroke Render<span class="shortcut" id="live-stroke-mark">Off</span></button>',
+    '<div class="sep"></div>',
     item('Pixels', 'unit-px'), item('Inches', 'unit-in'), item('Centimeters', 'unit-cm'), '<div class="sep"></div>',
     '<button type="button" data-command="theme-dark" aria-checked="false">Dark Mode<span class="shortcut" id="theme-mark">Off</span></button>',
     '<div class="sep"></div>', item('Fullscreen', 'fullscreen'),
@@ -283,6 +294,7 @@ function customMenu(id: MenuId): string {
     }
     if (entry === 'toggle-snap') return '<button type="button" data-command="toggle-snap">Snap to Grid<span class="shortcut" id="snap-mark">Off</span></button>';
     if (entry === 'toggle-cursor') return '<button type="button" data-command="toggle-cursor">Tool cursor<span class="shortcut" id="cursor-mark">On</span></button>';
+    if (entry === 'live-stroke-render') return '<button type="button" data-command="live-stroke-render">Live Stroke Render<span class="shortcut" id="live-stroke-mark">Off</span></button>';
     if (entry === 'theme-dark') return '<button type="button" data-command="theme-dark">Dark theme<span class="shortcut" id="theme-mark">Off</span></button>';
     if (entry === 'install') return '<button type="button" data-command="install" disabled>Install Pinta</button>';
     if (entry === 'file-access') return fileAccessButton();
@@ -992,6 +1004,10 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
     try { localStorage.setItem('pinta-brush-cursor', brushCursor ? '1' : '0'); } catch { /* storage unavailable */ }
     if (!brushCursor) $('dab-cursor').hidden = true;
     editor.notify();
+  } else if (command === 'live-stroke-render') {
+    editor.liveStrokeRender = !editor.liveStrokeRender;
+    try { localStorage.setItem('pinta-live-stroke-render', editor.liveStrokeRender ? '1' : '0'); } catch { /* storage unavailable */ }
+    editor.notify();
   } else if (command === 'install') {
     if (!installEvent) return;
     await installEvent.prompt();
@@ -1128,6 +1144,7 @@ const IMAGE_TYPES: FilePickerType[] = [
 const SAVE_TYPES: FilePickerType[] = [
   ...IMAGE_TYPES,
   { description: 'Pinta', accept: { 'application/octet-stream': ['.pinta'] } },
+  { description: 'OpenRaster', accept: { 'image/openraster': ['.ora'] } },
 ];
 
 function fileHost(): FilePickerHost {
@@ -1150,6 +1167,7 @@ function mimeFromName(name: string): string | null {
   if (lower.endsWith('.webp')) return 'image/webp';
   if (lower.endsWith('.bmp')) return 'image/bmp';
   if (lower.endsWith('.pinta')) return 'application/pinta';
+  if (lower.endsWith('.ora')) return 'image/openraster';
   return null;
 }
 
@@ -1220,7 +1238,15 @@ async function openWithAccess(editor: Editor): Promise<boolean> {
   try {
     const pick = fileHost().showOpenFilePicker;
     if (!pick) return false;
-    const [handle] = await pick({ id: 'pinta-image', multiple: false, types: IMAGE_TYPES });
+    const [handle] = await pick({
+      id: 'pinta-image',
+      multiple: false,
+      types: [
+        ...IMAGE_TYPES,
+        { description: 'Pinta', accept: { 'application/octet-stream': ['.pinta'] } },
+        { description: 'OpenRaster', accept: { 'image/openraster': ['.ora'] } },
+      ],
+    });
     const file = await handle.getFile();
     const before = editor.docs.length;
     await editor.openFile(file, false);
@@ -1259,6 +1285,7 @@ async function saveToHandle(editor: Editor, saveAs: boolean): Promise<boolean> {
   filename = handle.name;
   try {
     if (mime === 'application/pinta') await editor.exportPinta(filename, handle);
+    else if (mime === 'image/openraster') await editor.exportOra(filename, handle);
     else await editor.exportImage(mime, filename, handle);
   } catch {
     editor.toast('Could not save the file.');
@@ -1284,6 +1311,7 @@ async function save(editor: Editor, saveAs: boolean): Promise<boolean> {
     filename = base.toLowerCase().endsWith(EXT[mime]) ? base : `${base}${EXT[mime]}`;
   }
   if (mime === 'application/pinta') await editor.exportPinta(filename);
+  else if (mime === 'image/openraster') await editor.exportOra(filename);
   else await editor.exportImage(mime, filename);
   return true;
 }
@@ -1858,6 +1886,8 @@ function sync(editor: Editor): void {
   if (themeMark) themeMark.textContent = dark ? 'On' : 'Off';
   const cursorMark = document.getElementById('cursor-mark');
   if (cursorMark) cursorMark.textContent = brushCursor ? 'On' : 'Off';
+  const liveStrokeMark = document.getElementById('live-stroke-mark');
+  if (liveStrokeMark) liveStrokeMark.textContent = editor.liveStrokeRender ? 'On' : 'Off';
   app.dataset.rulers = editor.show.rulers ? '1' : '0';
   app.dataset.status = editor.show.status ? '1' : '0';
   app.dataset.tools = editor.show.tools ? '1' : '0';
@@ -1912,8 +1942,6 @@ function sync(editor: Editor): void {
   if (accessMark) accessMark.textContent = editor.doc?.fileHandle ? 'On' : 'Off';
   const angleLabel = document.getElementById('view-angle');
   if (angleLabel) angleLabel.textContent = `${Math.round(editor.viewAngle * 180 / Math.PI)}°`;
-  const note = document.getElementById('status-note');
-  if (note) note.textContent = statusNote(editor);
   paintSwatch('primary-swatch', editor.primary);
   paintSwatch('secondary-swatch', editor.secondary);
   $<HTMLInputElement>('primary-input').value = rgbOf(editor.primary);
@@ -2060,13 +2088,9 @@ function bindExtra(editor: Editor): void {
     editor.smoothing[tool] = Math.max(0, Math.min(100, Number((event.target as HTMLInputElement).value) || 0));
     const readout = document.getElementById('smooth-value');
     if (readout) readout.textContent = String(editor.smoothing[tool]);
-    const note = document.getElementById('status-note');
-    if (note) note.textContent = statusNote(editor);
   });
   document.getElementById('smooth-edges')?.addEventListener('change', event => {
     editor.smoothEdges = (event.target as HTMLInputElement).checked;
-    const note = document.getElementById('status-note');
-    if (note) note.textContent = statusNote(editor);
   });
   const commitFloat = (event: Event) => {
     const float = editor.float;
@@ -2102,18 +2126,6 @@ function bindExtra(editor: Editor): void {
     });
     document.getElementById(id)?.addEventListener('change', commitFloat);
   }
-}
-
-function statusNote(editor: Editor): string {
-  if (editor.paintingMask) return 'Painting the mask';
-  if (editor.float && editor.tool === 'move-pixels') return 'Arrow keys nudge. Shift moves ten.';
-  const tool = editor.tool;
-  const drawing = tool === 'brush' || tool === 'eraser' || tool === 'pen' || tool === 'pencil' || tool === 'dither' || tool === 'recolor' || tool === 'random' || tool === 'lighten' || tool === 'darken';
-  if (drawing && editor.unserrate[tool] && activePreset(tool).stabilizer > 0) return 'Lag is on. The stroke catches up when you let go.';
-  if ((tool === 'bucket' || tool === 'wand') && editor.smoothEdges) return 'Fills the soft edge.';
-  if (editor.assistant) return editor.assistant.kind === 'parallel' ? 'Parallel lines' : editor.assistant.kind === 'ellipse' ? 'Ellipse guide' : 'Vanishing point';
-  if (editor.assistantPlace) return 'Drag to place the guide.';
-  return '';
 }
 
 function bindMixer(editor: Editor): void {

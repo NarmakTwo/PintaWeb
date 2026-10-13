@@ -621,7 +621,7 @@ function walk(from: Point, to: Point, spacing: number, visit: (point: Point) => 
   if (!Number.isFinite(from.x) || !Number.isFinite(from.y) || !Number.isFinite(to.x) || !Number.isFinite(to.y)) return;
   const distance = Math.hypot(to.x - from.x, to.y - from.y);
   const safeSpacing = Math.max(0.5, Number.isFinite(spacing) ? spacing : 1);
-  const steps = Math.min(500, Math.max(1, Math.ceil(distance / safeSpacing)));
+  const steps = Math.min(4096, Math.max(1, Math.ceil(distance / safeSpacing)));
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     visit({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t });
@@ -707,6 +707,7 @@ export class ToolController {
   private strokeClock = 0;
   private pencilPath: Point[] = [];
   private curvePath: CurvePoint[] = [];
+  private strokeSeed = 1;
   private held = 0;
   private touched = new Map<number, number>();
   private rateTimer = 0;
@@ -825,6 +826,7 @@ export class ToolController {
       return;
     }
     this.drawing = true;
+    this.strokeSeed = (Math.random() * 0xffffffff) >>> 0 || 1;
     closeBrushPanel();
     beginStrokeUI(editor);
     editor.beginSurface();
@@ -1336,7 +1338,8 @@ export class ToolController {
       editor.lockAlpha(image, this.before);
       layer.ctx.putImageData(image, 0, 0);
     } else if (tool === 'pencil' || tool === 'pen' || tool === 'brush' || tool === 'eraser') {
-      paintPresetStroke(editor, this.before, samples, brush, tool, this.button);
+      const live = !release && !editor.liveStrokeRender;
+      paintPresetStroke(editor, this.before, samples, brush, tool, this.button, { live, seed: this.strokeSeed });
     } else if (tool === 'recolor') {
       if (samples.length === 1) this.recolor(samples[0]);
       else for (const sample of samples) this.recolor(sample);

@@ -18,6 +18,9 @@ export interface BrushPreset {
   tab: BrushTab;
   tip: TipId;
   tipImage: string | null;
+  /** Pipe / animated tip cells (GIMP GIH). tipImage is cell 0 when set. */
+  tipImages: string[] | null;
+  pipeSelect: 'constant' | 'incremental' | 'angular' | 'random' | 'speed';
   tipMissing: boolean;
   spacing: number;
   scatter: number;
@@ -85,6 +88,8 @@ function preset(partial: Pick<BrushPreset, 'id' | 'name' | 'tab' | 'tip'> & Part
   return {
     builtin: true,
     tipImage: null,
+    tipImages: null,
+    pipeSelect: 'constant',
     tipMissing: false,
     spacing: 25,
     scatter: 0,
@@ -307,6 +312,35 @@ function centripetal(p0: StrokeSample, p1: StrokeSample, p2: StrokeSample, p3: S
   return mix(b1, b2, t1, t2, t);
 }
 
+/** Max dabs along one polyline segment — caps CPU on pathological jumps without leaving stamp gaps. */
+const MAX_SEGMENT_STEPS = 4096;
+
+/** Ensure consecutive samples are at most `spacing` apart (dab interpolation for fast strokes). */
+export function interpolateDabs(points: StrokeSample[], spacing: number): StrokeSample[] {
+  const gap = Math.max(0.75, spacing);
+  if (points.length <= 1) return points.map(point => ({ ...point }));
+  const out: StrokeSample[] = [{ ...points[0] }];
+  for (let index = 1; index < points.length; index++) {
+    const from = out[out.length - 1];
+    const to = points[index];
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    if (distance <= gap) {
+      out.push({ ...to });
+      continue;
+    }
+    const steps = Math.min(MAX_SEGMENT_STEPS, Math.max(1, Math.ceil(distance / gap)));
+    for (let step = 1; step <= steps; step++) {
+      const amount = step / steps;
+      out.push({
+        x: from.x + (to.x - from.x) * amount,
+        y: from.y + (to.y - from.y) * amount,
+        t: from.t + (to.t - from.t) * amount,
+      });
+    }
+  }
+  return out;
+}
+
 function sampleCurve(points: StrokeSample[], spacing: number): StrokeSample[] {
   if (points.length <= 2) return resample(points, spacing);
   const out: StrokeSample[] = [];
@@ -320,30 +354,14 @@ function sampleCurve(points: StrokeSample[], spacing: number): StrokeSample[] {
     const p2 = points[index + 1];
     const p3 = points[Math.min(points.length - 1, index + 2)];
     const distance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const steps = Math.min(64, Math.max(1, Math.ceil(distance / spacing)));
+    const steps = Math.min(MAX_SEGMENT_STEPS, Math.max(1, Math.ceil(distance / spacing)));
     for (let step = index === 0 ? 0 : 1; step <= steps; step++) push(centripetal(p0, p1, p2, p3, step / steps));
   }
   return out.length ? out : points.slice(0, 1);
 }
 
 function resample(points: StrokeSample[], spacing: number): StrokeSample[] {
-  if (points.length <= 1) return points.map(point => ({ ...point }));
-  const out: StrokeSample[] = [{ ...points[0] }];
-  for (let index = 1; index < points.length; index++) {
-    const from = points[index - 1];
-    const to = points[index];
-    const distance = Math.hypot(to.x - from.x, to.y - from.y);
-    const steps = Math.min(500, Math.max(1, Math.ceil(distance / spacing)));
-    for (let step = 1; step <= steps; step++) {
-      const amount = step / steps;
-      out.push({
-        x: from.x + (to.x - from.x) * amount,
-        y: from.y + (to.y - from.y) * amount,
-        t: from.t + (to.t - from.t) * amount,
-      });
-    }
-  }
-  return out;
+  return interpolateDabs(points, spacing);
 }
 
 function oneEuro(points: StrokeSample[]): StrokeSample[] {
@@ -425,21 +443,25 @@ export function planStroke(points: StrokeSample[], options: { smoothing: number;
   if (!points.length) return [];
   const spacing = Math.max(0.75, options.spacing);
   const end = points[points.length - 1];
+  let path: StrokeSample[];
   if (options.smoothing <= 0 && options.lag <= 0) {
-    const straight = resample(points, spacing);
-    return options.catchUp ? catchUp(straight, end, spacing) : straight;
+    path = resample(points, spacing);
+    if (options.catchUp) path = catchUp(path, end, spacing);
+  } else {
+    const filtered = options.smoothing > 0 ? oneEuro(points) : points.map(point => ({ ...point }));
+    const pieces = options.smoothing > 0 ? splitCorners(filtered) : [filtered];
+    path = [];
+    for (const piece of pieces) {
+      const lagged = stabilize(piece, options.lag);
+      const blended = blendToward(lagged, spacing, options.smoothing);
+      if (path.length && blended.length) path.push(...blended.slice(1));
+      else path = blended;
+    }
+    if (!path.length) path = [{ ...points[0] }];
+    if (options.catchUp) path = catchUp(path, end, spacing);
   }
-  const filtered = options.smoothing > 0 ? oneEuro(points) : points.map(point => ({ ...point }));
-  const pieces = options.smoothing > 0 ? splitCorners(filtered) : [filtered];
-  let path: StrokeSample[] = [];
-  for (const piece of pieces) {
-    const lagged = stabilize(piece, options.lag);
-    const blended = blendToward(lagged, spacing, options.smoothing);
-    if (path.length && blended.length) path.push(...blended.slice(1));
-    else path = blended;
-  }
-  if (!path.length) path = [{ ...points[0] }];
-  return options.catchUp ? catchUp(path, end, spacing) : path;
+  // Final densify: smoothing/blend can leave gaps larger than spacing on fast flicks.
+  return interpolateDabs(path, spacing);
 }
 
 function smoothstep(amount: number): number {
@@ -476,8 +498,25 @@ function hexColor(color: Rgb): string {
   return `#${channel(color.r)}${channel(color.g)}${channel(color.b)}${channel(color.a)}`;
 }
 
-function sway(amount: number): number {
-  return (Math.random() * 2 - 1) * ((amount || 0) / 100);
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = Math.imul(state ^ (state >>> 15), 1 | state);
+    value ^= value + Math.imul(value ^ (value >>> 7), 61 | value);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function sway(amount: number, rand: () => number = Math.random): number {
+  return (rand() * 2 - 1) * ((amount || 0) / 100);
+}
+
+/** Stroke-length % capped by the same % of brush size. */
+export function taperZone(strokeLength: number, percent: number, brushSize: number): number {
+  if (percent <= 0 || strokeLength <= 0) return 0;
+  const fraction = percent / 100;
+  return Math.min(strokeLength * fraction, Math.max(0, brushSize) * fraction);
 }
 
 function colorVaries(brush: BrushPreset): boolean {
@@ -523,13 +562,13 @@ function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: n
   return { r: Math.round(channel(hue + 1 / 3) * 255), g: Math.round(channel(hue) * 255), b: Math.round(channel(hue - 1 / 3) * 255) };
 }
 
-function varyColor(ink: Rgb, brush: BrushPreset, stroke: { h: number; s: number; l: number }, secondary: Rgb): Rgb {
+function varyColor(ink: Rgb, brush: BrushPreset, stroke: { h: number; s: number; l: number }, secondary: Rgb, rand: () => number): Rgb {
   const hsl = rgbToHsl(ink.r, ink.g, ink.b);
-  hsl.h += stroke.h + sway(brush.hueJitter);
-  hsl.s = clamp01(hsl.s + stroke.s + sway(brush.satJitter));
-  hsl.l = clamp01(hsl.l + stroke.l + sway(brush.lightJitter) - Math.random() * ((brush.darkJitter || 0) / 100));
+  hsl.h += stroke.h + sway(brush.hueJitter, rand);
+  hsl.s = clamp01(hsl.s + stroke.s + sway(brush.satJitter, rand));
+  hsl.l = clamp01(hsl.l + stroke.l + sway(brush.lightJitter, rand) - rand() * ((brush.darkJitter || 0) / 100));
   const next = hslToRgb(hsl.h, hsl.s, hsl.l);
-  const mix = Math.random() * ((brush.secondaryMix || 0) / 100);
+  const mix = rand() * ((brush.secondaryMix || 0) / 100);
   return {
     r: Math.round(next.r * (1 - mix) + secondary.r * mix),
     g: Math.round(next.g * (1 - mix) + secondary.g * mix),
@@ -617,10 +656,34 @@ function canvasOf(current: HTMLCanvasElement | null, width: number, height: numb
   return canvas;
 }
 
-function drawTip(ctx: CanvasRenderingContext2D, brush: BrushPreset, radius: number): void {
-  const image = brush.tip === 'image' && brush.tipImage ? loadImage(brush.tipImage) : null;
-  const cached = brush.tipImage ? imageCache.get(brush.tipImage) : undefined;
-  if (brush.tip === 'image' && (!brush.tipImage || cached === 'missing')) brush.tipMissing = true;
+function pipeCells(brush: BrushPreset): string[] {
+  if (brush.tipImages?.length) return brush.tipImages;
+  return brush.tipImage ? [brush.tipImage] : [];
+}
+
+function pickPipeTip(brush: BrushPreset, dabIndex: number, angle: number, velocity: number, rand: () => number): string | null {
+  const cells = pipeCells(brush);
+  if (!cells.length) return null;
+  if (cells.length === 1) return cells[0];
+  const mode = brush.pipeSelect || 'constant';
+  if (mode === 'incremental') return cells[dabIndex % cells.length];
+  if (mode === 'angular') {
+    const turn = ((angle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    return cells[Math.min(cells.length - 1, Math.floor((turn / (Math.PI * 2)) * cells.length))];
+  }
+  if (mode === 'speed') {
+    const fast = Math.max(0, Math.min(0.999, velocity / 0.9));
+    return cells[Math.min(cells.length - 1, Math.floor(fast * cells.length))];
+  }
+  if (mode === 'random') return cells[Math.floor(rand() * cells.length) % cells.length];
+  return cells[0];
+}
+
+function drawTip(ctx: CanvasRenderingContext2D, brush: BrushPreset, radius: number, tipUrl: string | null = null): void {
+  const url = tipUrl ?? brush.tipImage;
+  const image = brush.tip === 'image' && url ? loadImage(url) : null;
+  const cached = url ? imageCache.get(url) : undefined;
+  if (brush.tip === 'image' && (!url || cached === 'missing')) brush.tipMissing = true;
   ctx.lineWidth = Math.max(1, radius / 2);
   if (image) {
     ctx.drawImage(image, -radius, -radius, radius * 2, radius * 2);
@@ -695,7 +758,7 @@ function paintGrain(dab: CanvasRenderingContext2D, grain: HTMLImageElement, brus
   dab.drawImage(grain, (size - tile) / 2 + shift - tile / 2, (size - tile) / 2, tile, tile);
 }
 
-function stampDab(ctx: CanvasRenderingContext2D, brush: BrushPreset, x: number, y: number, radius: number, rotation: number, color: string, flow: number, erase: boolean, flipX = false, flipY = false, grainRoll = 0): void {
+function stampDab(ctx: CanvasRenderingContext2D, brush: BrushPreset, x: number, y: number, radius: number, rotation: number, color: string, flow: number, erase: boolean, flipX = false, flipY = false, grainRoll = 0, tipUrl: string | null = null): void {
   const size = Math.max(2, Math.ceil(radius * 2));
   dabCanvas = canvasOf(dabCanvas, size, size);
   const dab = dabCanvas.getContext('2d');
@@ -719,10 +782,11 @@ function stampDab(ctx: CanvasRenderingContext2D, brush: BrushPreset, x: number, 
     dab.strokeStyle = dab.fillStyle;
     dab.globalAlpha = ink.a / 255;
   }
-  drawTip(dab, brush, radius);
+  drawTip(dab, brush, radius, tipUrl);
   dab.restore();
-  if (brush.tip === 'image' && brush.tipImage) {
-    const cached = imageCache.get(brush.tipImage);
+  const maskUrl = tipUrl ?? brush.tipImage;
+  if (brush.tip === 'image' && maskUrl) {
+    const cached = imageCache.get(maskUrl);
     if (cached instanceof HTMLImageElement && cached.naturalWidth) {
       dab.globalCompositeOperation = 'source-in';
       dab.globalAlpha = 1;
@@ -776,13 +840,19 @@ function averageUnder(source: CanvasRenderingContext2D, x: number, y: number, ra
   return best;
 }
 
-export function paintPresetStroke(editor: Editor, before: ImageData, samples: StrokeSample[], brush: BrushPreset, tool: ToolId, button: number): void {
+export type PaintStrokeOptions = { live?: boolean; seed?: number };
+
+export function paintPresetStroke(editor: Editor, before: ImageData, samples: StrokeSample[], brush: BrushPreset, tool: ToolId, button: number, options: PaintStrokeOptions = {}): void {
   const doc = editor.doc;
   const layer = editor.layer;
   if (!doc || !layer || !samples.length) return;
+  const live = !!options.live;
+  const rand = mulberry32((options.seed ?? 1) >>> 0);
   const erase = tool === 'eraser' && button !== 2;
   const baseColor = button === 2 ? editor.secondary : editor.primary;
   const size = Math.max(1, editor.size);
+  const dabGap = Math.max(1, (size * (brush.spacing || 1)) / 100);
+  samples = interpolateDabs(samples, dabGap);
   const length = samples.reduce((total, point, index) => index === 0 ? 0 : total + Math.hypot(point.x - samples[index - 1].x, point.y - samples[index - 1].y), 0);
   const ignoreTaper = length < 4;
   bufferCanvas = canvasOf(bufferCanvas, doc.width, doc.height);
@@ -791,26 +861,31 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
   buffer.clearRect(0, 0, doc.width, doc.height);
   sampleCanvas = canvasOf(sampleCanvas, doc.width, doc.height);
   const sampler = sampleCanvas.getContext('2d', { willReadFrequently: true });
-  const readsCanvas = (brush.wetMix > 0 || brush.carry > 0) && !erase;
+  const readsCanvas = !live && (brush.wetMix > 0 || brush.carry > 0) && !erase;
   if (sampler && readsCanvas) sampler.putImageData(before, 0, 0);
   let traveled = 0;
   let width = size;
   let clock = samples[0].t;
   let carried = parseColor(baseColor);
   const secondary = parseColor(editor.secondary);
-  const strokeShift = {
-    h: sway(brush.strokeHue),
-    s: sway(brush.strokeSat),
-    l: sway(brush.strokeLight) - Math.random() * ((brush.strokeDark || 0) / 100),
-  };
-  const vary = !erase && colorVaries(brush);
+  const strokeShift = live
+    ? { h: 0, s: 0, l: 0 }
+    : {
+      h: sway(brush.strokeHue, rand),
+      s: sway(brush.strokeSat, rand),
+      l: sway(brush.strokeLight, rand) - rand() * ((brush.strokeDark || 0) / 100),
+    };
+  const vary = !live && !erase && colorVaries(brush);
   const places = ignoreTaper ? [samples[0]] : samples;
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  let grainRoll = brush.grainJitter ? Math.random() * 512 : 0;
+  let grainRoll = !live && brush.grainJitter ? rand() * 512 : 0;
   const lightBlend = !erase && (brush.blend === 'add' || brush.blend === 'screen');
+  const scatterAmount = live ? 0 : brush.scatter;
+  const stampCount = live ? 1 : Math.max(1, Math.min(16, brush.stamps || 1));
+  let dabIndex = 0;
   for (let index = 0; index < places.length; index++) {
     const point = places[index];
     const previous = places[Math.max(0, index - 1)];
@@ -838,21 +913,23 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
     let scale = 1;
     let fade = 1;
     if (!ignoreTaper) {
-      const head = length * brush.taperIn / 100;
-      const tail = length * brush.taperOut / 100;
+      const head = taperZone(length, brush.taperIn, size);
+      const tail = taperZone(length, brush.taperOut, size);
       if (head > 0 && traveled < head) scale = smoothstep(traveled / head);
       if (tail > 0 && traveled > length - tail) scale = Math.min(scale, smoothstep((length - traveled) / tail));
+      scale = Math.max(0.12, scale);
       if (!brush.taperSize) scale = 1;
-      fade = brush.taperOpacity ? scale || smoothstep(traveled / Math.max(head, 0.001)) : 1;
+      fade = brush.taperOpacity ? scale : 1;
       if (brush.taperOpacity && !brush.taperSize) {
         fade = 1;
         if (head > 0 && traveled < head) fade = smoothstep(traveled / head);
         if (tail > 0 && traveled > length - tail) fade = Math.min(fade, smoothstep((length - traveled) / tail));
+        fade = Math.max(0.12, fade);
       }
     }
     const angle = Math.atan2(point.y - previous.y, point.x - previous.x);
     const baseRotation = brush.rotation === 'follow' ? angle : brush.rotation === 'jitter' ? 0 : (brush.angle * Math.PI) / 180;
-    const side = brush.scatter > 0 ? (Math.random() * 2 - 1) * size * (brush.scatter / 100) : 0;
+    const side = scatterAmount > 0 ? (rand() * 2 - 1) * size * (scatterAmount / 100) : 0;
     const ox = point.x + Math.cos(angle + Math.PI / 2) * side;
     const oy = point.y + Math.sin(angle + Math.PI / 2) * side;
     let flow = (brush.flow / 100) * fade;
@@ -861,24 +938,23 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
       const amount = brush.speedOpacity / 100;
       flow *= amount >= 0 ? 1 - amount * fast : 1 - Math.abs(amount) * (1 - fast);
     }
-    if (brush.opacityJitter > 0) flow *= 1 - Math.random() * (brush.opacityJitter / 100);
+    if (!live && brush.opacityJitter > 0) flow *= 1 - rand() * (brush.opacityJitter / 100);
     flow = Math.max((brush.minOpacity || 0) / 100, Math.min((brush.maxOpacity ?? 100) / 100, flow));
     flow = dabFlow(brush, flow);
-    const count = Math.max(1, Math.min(16, brush.stamps || 1));
-    for (let stamp = 0; stamp < count; stamp++) {
-      const along = stamp === 0 ? 0 : (Math.random() * 2 - 1) * size * (0.35 + (brush.scatter || 0) / 200);
-      const across = stamp === 0 ? 0 : (Math.random() * 2 - 1) * size * 0.35;
+    for (let stamp = 0; stamp < stampCount; stamp++) {
+      const along = stamp === 0 ? 0 : (rand() * 2 - 1) * size * (0.35 + (scatterAmount || 0) / 200);
+      const across = stamp === 0 ? 0 : (rand() * 2 - 1) * size * 0.35;
       const jx = ox + Math.cos(angle) * along + Math.cos(angle + Math.PI / 2) * across;
       const jy = oy + Math.sin(angle) * along + Math.sin(angle + Math.PI / 2) * across;
-      const swing = brush.sizeJitter > 0 ? Math.max(0.15, 1 + (Math.random() * 2 - 1) * (brush.sizeJitter / 100)) : 1;
+      const swing = !live && brush.sizeJitter > 0 ? Math.max(0.15, 1 + (rand() * 2 - 1) * (brush.sizeJitter / 100)) : 1;
       const radius = Math.max(0.5, (width * (brush.taperSize ? scale : 1) * swing) / 2);
       let ink = parseColor(baseColor);
-      if (vary) ink = varyColor(ink, brush, strokeShift, secondary);
-      if (brush.wetMix > 0 && !erase && sampler) {
+      if (vary) ink = varyColor(ink, brush, strokeShift, secondary, rand);
+      if (!live && brush.wetMix > 0 && !erase && sampler) {
         const picked = averageUnder(sampler, jx, jy, radius);
         if (picked) ink = mixRgb(ink, picked, brush.wetMix / 100);
       }
-      if (brush.carry > 0 && !erase && sampler) {
+      if (!live && brush.carry > 0 && !erase && sampler) {
         const picked = averageUnder(sampler, jx, jy, radius);
         if (picked) {
           const amount = brush.carry / 100;
@@ -888,10 +964,12 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
       }
       const color = hexColor(ink);
       const dabErase = erase || ink.a <= 0;
-      let rotation = brush.rotation === 'jitter' ? Math.random() * Math.PI * 2 : baseRotation;
-      if ((brush.twist ?? 0) > 0) rotation += (Math.random() * 2 - 1) * Math.PI * ((brush.twist ?? 0) / 100);
-      const flipH = !!brush.flipX && Math.random() < 0.5;
-      const flipV = !!brush.flipY && Math.random() < 0.5;
+      let rotation = !live && brush.rotation === 'jitter' ? rand() * Math.PI * 2 : baseRotation;
+      if (!live && (brush.twist ?? 0) > 0) rotation += (rand() * 2 - 1) * Math.PI * ((brush.twist ?? 0) / 100);
+      const flipH = !live && !!brush.flipX && rand() < 0.5;
+      const flipV = !live && !!brush.flipY && rand() < 0.5;
+      const tipUrl = brush.tip === 'image' ? pickPipeTip(brush, dabIndex, angle, velocity, rand) : null;
+      dabIndex += 1;
       buffer.save();
       buffer.globalCompositeOperation = lightBlend ? strokeComposite(brush.blend, false) : 'source-over';
       for (const spot of mirrorOf(editor, { x: jx, y: jy })) {
@@ -899,20 +977,31 @@ export function paintPresetStroke(editor: Editor, before: ImageData, samples: St
         minY = Math.min(minY, spot.y - radius);
         maxX = Math.max(maxX, spot.x + radius);
         maxY = Math.max(maxY, spot.y + radius);
-        stampDab(buffer, brush, spot.x, spot.y, radius, rotation, color, flow, dabErase, flipH, flipV, grainRoll);
+        stampDab(buffer, brush, spot.x, spot.y, radius, rotation, color, flow, dabErase, flipH, flipV, live ? 0 : grainRoll, tipUrl);
       }
       buffer.restore();
     }
     if (sampler && readsCanvas) sampler.drawImage(bufferCanvas, 0, 0);
   }
   layer.ctx.putImageData(before, 0, 0);
-  const pad = size * 2 + 8 + size * ((brush.scatter || 0) / 100) + (brush.wetEdge ?? 0);
-  if (Number.isFinite(minX)) editor.cover(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY), layer, pad);
+  const blurPx = (brush.wetEdge ?? 0) > 0 ? Math.max(0.4, (brush.wetEdge ?? 0) / 40) : 0;
+  const pad = size * 2 + 8 + size * ((brush.scatter || 0) / 100) + (brush.wetEdge ?? 0) + Math.ceil(blurPx * 2);
+  let blitX = 0;
+  let blitY = 0;
+  let blitW = doc.width;
+  let blitH = doc.height;
+  if (Number.isFinite(minX)) {
+    editor.cover(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY), layer, pad);
+    blitX = Math.max(0, Math.floor(minX - pad));
+    blitY = Math.max(0, Math.floor(minY - pad));
+    blitW = Math.min(doc.width - blitX, Math.ceil(maxX + pad) - blitX);
+    blitH = Math.min(doc.height - blitY, Math.ceil(maxY + pad) - blitY);
+  }
   layer.ctx.save();
   layer.ctx.globalAlpha = Math.max(0, Math.min(1, editor.opacity / 100));
   layer.ctx.globalCompositeOperation = lightBlend ? 'source-over' : strokeComposite(brush.blend, erase || parseColor(baseColor).a <= 0);
-  if ((brush.wetEdge ?? 0) > 0) layer.ctx.filter = `blur(${Math.max(0.4, (brush.wetEdge ?? 0) / 40)}px)`;
-  layer.ctx.drawImage(bufferCanvas, 0, 0);
+  if (blurPx > 0) layer.ctx.filter = `blur(${blurPx}px)`;
+  if (blitW > 0 && blitH > 0) layer.ctx.drawImage(bufferCanvas, blitX, blitY, blitW, blitH, blitX, blitY, blitW, blitH);
   layer.ctx.filter = 'none';
   layer.ctx.restore();
   editor.applyClip(before);
@@ -982,6 +1071,7 @@ function redrawSettled(editor: Editor, stroke: RememberedStroke, from: StrokeSam
     return { x: point.x + (target.x - point.x) * amount, y: point.y + (target.y - point.y) * amount, t: point.t };
   });
   const spacing = Math.max(1, (stroke.size * stroke.preset.spacing) / 100);
+  editor.holdStroke(stroke.before);
   paintPresetStroke(editor, stroke.before, resample(mixed, spacing), stroke.preset, stroke.tool, stroke.button);
   editor.renderScene();
 }
@@ -1014,6 +1104,14 @@ export function rememberStroke(editor: Editor, before: ImageData, points: Stroke
 export function cancelSettle(): void {
   window.clearTimeout(settleTimer);
   window.cancelAnimationFrame(settleFrame);
+}
+
+/** Drop in-flight settle / adjust memory so Undo cannot be painted over again. */
+export function clearStrokeMemory(): void {
+  cancelSettle();
+  lastStroke = null;
+  handles = null;
+  dragHandle = -1;
 }
 
 export function closeBrushPanel(): void {
@@ -1166,10 +1264,11 @@ function paintPreviewStroke(ctx: CanvasRenderingContext2D, brush: BrushPreset, s
     const along = length > 0 ? traveled / length : 0.5;
     const body = pinch ? Math.sin(Math.max(0, Math.min(1, along)) * Math.PI) : 1;
     let scale = body;
-    const head = length * brush.taperIn / 100;
-    const tail = length * brush.taperOut / 100;
+    const head = taperZone(length, brush.taperIn, size);
+    const tail = taperZone(length, brush.taperOut, size);
     if (brush.taperSize && head > 0 && traveled < head) scale *= smoothstep(traveled / head);
     if (brush.taperSize && tail > 0 && traveled > length - tail) scale *= smoothstep((length - traveled) / tail);
+    scale = Math.max(0.12, scale);
     if (scale < 0.045) continue;
     const angle = Math.atan2(point.y - previous.y, point.x - previous.x);
     const baseRotation = brush.rotation === 'follow' ? angle : brush.rotation === 'jitter' ? rand() * Math.PI * 2 : (brush.angle * Math.PI) / 180;
@@ -1476,6 +1575,17 @@ function renderPanel(): void {
     <label>Scatter <input id="brush-scatter" type="range" min="0" max="400" value="${current.scatter}" /></label>
     <label>Twist <input id="brush-twist" type="range" min="0" max="200" value="${current.twist}" /></label>
     <label>Stamps <input id="brush-stamps" type="range" min="1" max="16" value="${current.stamps}" /></label>
+    <details class="brush-more" ${(current.tipImages?.length ?? 0) > 1 ? 'open' : ''}>
+      <summary>Pipe tip</summary>
+      <label>Cell pick <select id="brush-pipe-select">
+        <option value="constant" ${current.pipeSelect === 'constant' ? 'selected' : ''}>First cell</option>
+        <option value="incremental" ${current.pipeSelect === 'incremental' ? 'selected' : ''}>Incremental</option>
+        <option value="angular" ${current.pipeSelect === 'angular' ? 'selected' : ''}>Angular</option>
+        <option value="random" ${current.pipeSelect === 'random' ? 'selected' : ''}>Random</option>
+        <option value="speed" ${current.pipeSelect === 'speed' ? 'selected' : ''}>Speed</option>
+      </select></label>
+      <p class="brush-hint">${(current.tipImages?.length ?? 0) > 1 ? `${current.tipImages!.length} cells` : 'Import a GIMP pipe (.gih) for multiple cells.'}</p>
+    </details>
     <label>Flow <input id="brush-flow" type="range" min="1" max="100" value="${current.flow}" /></label>
     <label>Minimum opacity <input id="brush-min-opacity" type="range" min="0" max="100" value="${current.minOpacity}" /></label>
     <label>Maximum opacity <input id="brush-max-opacity" type="range" min="0" max="100" value="${current.maxOpacity}" /></label>
@@ -1521,6 +1631,10 @@ export function appendPresets(items: BrushPreset[]): void {
   presets.push(...items);
   tab = items[0].tab;
   selected[tab] = items[0].id;
+  for (const item of items) {
+    if (item.tipImage) void warmImage(item.tipImage);
+    for (const url of item.tipImages ?? []) void warmImage(url);
+  }
   mark();
 }
 
@@ -1700,7 +1814,7 @@ export function mountBrushes(editor: Editor): void {
     <div id="brush-list"></div>
     <div id="brush-edit" hidden></div>
     <input id="brush-file" type="file" accept="image/*" hidden />
-    <input id="brush-import-file" type="file" accept=".brush,.brushset,.abr,.zip,.tar,.tgz,.gz,application/zip,application/x-tar,application/gzip" multiple hidden />
+    <input id="brush-import-file" type="file" accept=".brush,.brushset,.abr,.gbr,.gih,.vbr,.gbp,.kpp,.myb,.bundle,.zip,.tar,.tgz,.gz,application/zip,application/x-tar,application/gzip" multiple hidden />
   `;
   document.body.append(panel);
   const file = panel.querySelector<HTMLInputElement>('#brush-file');
@@ -1808,6 +1922,13 @@ export function mountBrushes(editor: Editor): void {
       updatePreset({ tip: input.value as TipId, tipImage: null, tipMissing: false });
       refreshBrushPreview(editor);
     } else if (input.id === 'brush-rotation') updatePreset({ rotation: input.value as RotationMode }, true);
+    else if (input.id === 'brush-pipe-select') {
+      const value = input.value;
+      const pipeSelect = value === 'incremental' || value === 'angular' || value === 'random' || value === 'speed' || value === 'constant'
+        ? value
+        : 'constant';
+      updatePreset({ pipeSelect });
+    }
     else if (input.id === 'brush-blend') updatePreset({ blend: input.value as BrushBlend });
     else if (input.id === 'brush-speed') updatePreset({ speed: input.value as SpeedMode });
     else if (input.id === 'brush-grain-lock') updatePreset({ grainLock: input.value === 'canvas' ? 'canvas' : 'move' });

@@ -11,10 +11,10 @@ type Uid = { uid: number };
 type Archive = Record<string, unknown>;
 
 const MAX_SIDE = 128;
-const SET_NAME = /\.(brushset|abr)$/i;
-const SINGLE_NAME = /\.brush$/i;
+const SET_NAME = /\.(brushset|abr|gbp)$/i;
+const SINGLE_NAME = /\.(brush|gbr|gih|vbr|kpp|myb)$/i;
 const NESTED_ARCHIVE = /\.(zip|tar|tgz|tar\.gz|bundle)$/i;
-const STEM_EXT = /\.(brushset|brush|abr|zip|tar\.gz|tgz|tar|bundle)$/i;
+const STEM_EXT = /\.(brushset|brush|abr|gbp|gbr|gih|vbr|kpp|myb|zip|tar\.gz|tgz|tar|bundle)$/i;
 
 export interface BrushImportBatch {
   title: string;
@@ -45,18 +45,66 @@ async function readBrushBytes(bytes: Uint8Array, fileName: string, title: string
     const presets = await readAbr(bytes);
     return presets.length ? [{ title, presets }] : [];
   }
+  if (lower.endsWith('.gbr')) {
+    const preset = readGbr(bytes, title);
+    return preset ? [{ title, presets: [preset] }] : [];
+  }
+  if (lower.endsWith('.gih')) {
+    const presets = readGih(bytes, title);
+    return presets.length ? [{ title, presets }] : [];
+  }
+  if (lower.endsWith('.vbr')) {
+    const preset = readVbr(bytes, title);
+    return preset ? [{ title, presets: [preset] }] : [];
+  }
+  if (lower.endsWith('.myb')) {
+    const preset = readMyb(bytes, title);
+    return preset ? [{ title, presets: [preset] }] : [];
+  }
+  if (lower.endsWith('.kpp')) {
+    const preset = await readKpp(bytes, title, null);
+    return preset ? [{ title, presets: [preset] }] : [];
+  }
+  if (lower.endsWith('.gbp')) {
+    const files = await unpackArchive(bytes);
+    if (files) {
+      const presets: BrushPreset[] = [];
+      for (const [path, data] of files) {
+        const base = baseName(path);
+        if (/\.gbr$/i.test(base)) {
+          const preset = readGbr(data, stemName(base));
+          if (preset) presets.push(preset);
+        } else if (/\.gih$/i.test(base)) presets.push(...readGih(data, stemName(base)));
+        else if (/\.vbr$/i.test(base)) {
+          const preset = readVbr(data, stemName(base));
+          if (preset) presets.push(preset);
+        }
+      }
+      return presets.length ? [{ title, presets }] : [];
+    }
+  }
 
   const files = await unpackArchive(bytes);
   if (!files) return [];
 
+  // Krita / MyPaint .bundle (or zip) sniffing
+  if (lower.endsWith('.bundle') || lower.endsWith('.zip') || isZip(bytes)) {
+    const krita = await readKritaBundle(files, title);
+    const mypaint = readMyPaintBundle(files, title);
+    if (krita.length || mypaint.length) {
+      const batches = [...krita, ...mypaint].filter(batch => batch.presets.length);
+      if (batches.length) return batches;
+    }
+  }
+
   const sets: { name: string; data: Uint8Array }[] = [];
-  const singles: Uint8Array[] = [];
+  const singles: { name: string; data: Uint8Array }[] = [];
   const nested: { name: string; data: Uint8Array }[] = [];
   for (const [path, data] of files) {
     const name = baseName(path);
     const copy = data.slice();
     if (SET_NAME.test(name)) sets.push({ name, data: copy });
-    else if (SINGLE_NAME.test(name)) singles.push(copy);
+    else if (SINGLE_NAME.test(name)) singles.push({ name, data: copy });
     else if (depth < 1 && NESTED_ARCHIVE.test(name)) nested.push({ name, data: copy });
   }
 
@@ -66,8 +114,11 @@ async function readBrushBytes(bytes: Uint8Array, fileName: string, title: string
     for (const set of sets) {
       batches.push(...await readBrushBytes(set.data, set.name, stemName(set.name), depth + 1));
     }
-    for (const data of singles) {
-      try { loose.push(...await readProcreate(data)); } catch { /* skip a bad brush */ }
+    for (const item of singles) {
+      try {
+        const imported = await readBrushBytes(item.data, item.name, stemName(item.name), depth + 1);
+        for (const batch of imported) loose.push(...batch.presets);
+      } catch { /* skip a bad brush */ }
     }
     for (const pack of nested) {
       batches.push(...await readBrushBytes(pack.data, pack.name, stemName(pack.name), depth + 1));
@@ -932,6 +983,8 @@ function makePreset(patch: Pick<BrushPreset, 'name'> & Partial<BrushPreset>): Br
     tab: 'paint',
     tip: 'plain',
     tipImage: null,
+    tipImages: null,
+    pipeSelect: 'constant' as const,
     tipMissing: false,
     spacing: 25,
     scatter: 0,
@@ -1049,4 +1102,442 @@ function blendOf(mode: number): BrushBlend {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function readGbr(bytes: Uint8Array, fallbackName: string): BrushPreset | null {
+  if (bytes.length < 28) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const header = view.getUint32(0, false);
+  const version = view.getUint32(4, false);
+  if (header < 28 || header > bytes.length || (version !== 1 && version !== 2)) return null;
+  const width = view.getUint32(8, false);
+  const height = view.getUint32(12, false);
+  const bpp = view.getUint32(16, false);
+  const magic = String.fromCharCode(bytes[20], bytes[21], bytes[22], bytes[23]);
+  if (magic !== 'GIMP' || width < 1 || height < 1 || width * height > 4096 * 4096) return null;
+  if (bpp !== 1 && bpp !== 4) return null;
+  let name = fallbackName;
+  let spacing = 25;
+  // v1: fixed fields occupy 28 bytes (magic ends at 24; 24–27 unused), then name.
+  // v2: uint32 spacing at 24, then name at 28.
+  if (version === 2) {
+    spacing = Math.max(1, Math.min(200, view.getUint32(24, false) || 25));
+  }
+  const nameStart = 28;
+  if (header > nameStart) {
+    const raw = new TextDecoder().decode(bytes.subarray(nameStart, header));
+    name = raw.replace(/\0.*$/s, '').trim() || fallbackName;
+  }
+  const pixels = bytes.subarray(header);
+  const need = width * height * bpp;
+  if (pixels.length < need) return null;
+  let tipImage: string | null = null;
+  if (bpp === 1) {
+    tipImage = rasterUrl(width, height, pixels);
+  } else {
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(1, MAX_SIDE / Math.max(width, height));
+    const w = Math.max(1, Math.round(width * scale));
+    const h = Math.max(1, Math.round(height * scale));
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    const image = ctx.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+      const sy = Math.min(height - 1, Math.floor(y / scale));
+      for (let x = 0; x < w; x++) {
+        const sx = Math.min(width - 1, Math.floor(x / scale));
+        const src = (sy * width + sx) * 4;
+        const dst = (y * w + x) * 4;
+        image.data[dst] = image.data[dst + 1] = image.data[dst + 2] = 255;
+        image.data[dst + 3] = pixels[src + 3] ?? 0;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    tipImage = canvas.toDataURL('image/png');
+  }
+  if (!tipImage) return null;
+  return makePreset({ name, tip: 'image', tipImage, spacing, hardness: 100 });
+}
+
+function parsePipeSelect(raw: string): BrushPreset['pipeSelect'] {
+  const lower = raw.toLowerCase();
+  if (/incremental|index/.test(lower)) return 'incremental';
+  if (/angular|direction|bearing/.test(lower)) return 'angular';
+  if (/pressure|velocity|speed/.test(lower)) return 'speed';
+  if (/random/.test(lower)) return 'random';
+  return 'constant';
+}
+
+function readGih(bytes: Uint8Array, fallbackName: string): BrushPreset[] {
+  // GIH: one or two ASCII header lines, then concatenated GBR cells.
+  const head = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 1024)));
+  const firstNl = head.indexOf('\n');
+  if (firstNl < 0) return [];
+  const nameLine = head.slice(0, firstNl).trim().replace(/^"|"$/g, '') || fallbackName;
+  let bodyStart = firstNl + 1;
+  let pipeSelect: BrushPreset['pipeSelect'] = 'incremental';
+  let expected = 0;
+  const secondNl = head.indexOf('\n', bodyStart);
+  if (secondNl > bodyStart) {
+    const meta = head.slice(bodyStart, secondNl).trim();
+    if (/ncells:|sel\d|dim:|rank/i.test(meta) || /^\d+(\s+\d+){2,}/.test(meta)) {
+      bodyStart = secondNl + 1;
+      const ncells = /ncells:(\d+)/i.exec(meta)?.[1] ?? meta.split(/\s+/)[0];
+      expected = Math.max(0, Number(ncells) || 0);
+      const sel = /sel\d*:([a-z]+)/i.exec(meta)?.[1] ?? '';
+      pipeSelect = parsePipeSelect(sel || meta);
+    }
+  }
+  const body = bytes.subarray(bodyStart);
+  const tips: string[] = [];
+  let offset = 0;
+  let guard = 0;
+  while (offset + 28 < body.length && guard < 256) {
+    guard += 1;
+    const slice = body.subarray(offset);
+    const view = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
+    const header = view.getUint32(0, false);
+    const version = view.getUint32(4, false);
+    if (header < 28 || header > slice.length || (version !== 1 && version !== 2)) break;
+    const width = view.getUint32(8, false);
+    const height = view.getUint32(12, false);
+    const bpp = view.getUint32(16, false);
+    if (bpp !== 1 && bpp !== 4) break;
+    const need = header + width * height * bpp;
+    if (need > slice.length || width < 1 || height < 1) break;
+    const cell = readGbr(slice.subarray(0, need), nameLine);
+    if (cell?.tipImage) tips.push(cell.tipImage);
+    offset += need;
+    if (expected && tips.length >= expected) break;
+  }
+  if (!tips.length) {
+    const cell = readGbr(body, nameLine);
+    return cell ? [cell] : [];
+  }
+  return [makePreset({
+    name: nameLine,
+    tip: 'image',
+    tipImage: tips[0],
+    tipImages: tips,
+    pipeSelect,
+    spacing: 20,
+    hardness: 100,
+    rotation: pipeSelect === 'angular' ? 'follow' : 'fixed',
+  })];
+}
+
+function vbrTipImage(spikes: number, aspect: number, hardness: number): string | null {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  const cx = size / 2;
+  const cy = size / 2;
+  const rx = (size * 0.46) / Math.max(aspect, 0.25);
+  const ry = size * 0.46 * Math.min(aspect, 4);
+  ctx.clearRect(0, 0, size, size);
+  if (spikes <= 2) {
+    const soft = Math.max(0.15, 1 - hardness / 100);
+    const grad = ctx.createRadialGradient(cx, cy, rx * (1 - soft), cx, cy, Math.max(rx, ry));
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    for (let i = 0; i < spikes * 2; i++) {
+      const r = i % 2 === 0 ? Math.max(rx, ry) : Math.max(rx, ry) * (0.25 + (hardness / 100) * 0.45);
+      const a = (i / (spikes * 2)) * Math.PI * 2 - Math.PI / 2;
+      const x = cx + Math.cos(a) * r * (rx / Math.max(rx, ry));
+      const y = cy + Math.sin(a) * r * (ry / Math.max(rx, ry));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+  return canvas.toDataURL('image/png');
+}
+
+function readVbr(bytes: Uint8Array, fallbackName: string): BrushPreset | null {
+  const text = new TextDecoder().decode(bytes);
+  if (!/gimp-vbr/i.test(text) && !/^\s*\d/.test(text)) return null;
+  const numbers = text.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+  // gimp-vbr: version, then radius, spikes, hardness, aspect, angle (order varies by version).
+  const start = /gimp-vbr/i.test(text) ? 1 : 0;
+  const radius = numbers[start] ?? 10;
+  const spikes = Math.max(2, Math.min(64, Math.round(numbers[start + 1] ?? 2)));
+  const hardness = clamp(Math.round((numbers[start + 2] ?? 1) * 100), 0, 100);
+  const aspect = numbers[start + 3] ?? 1;
+  const angle = numbers[start + 4] ?? 0;
+  const tipImage = vbrTipImage(spikes, aspect, hardness);
+  return makePreset({
+    name: fallbackName,
+    tip: tipImage ? 'image' : spikes > 2 ? 'splatter' : aspect > 1.2 || aspect < 0.8 ? 'slash' : 'circle',
+    tipImage,
+    spacing: clamp(Math.round(12 + radius * 0.4), 8, 40),
+    hardness,
+    angle: Math.round(angle),
+    rotation: 'fixed',
+    sizeJitter: spikes > 4 ? 10 : 0,
+  });
+}
+
+function mybBase(setting: unknown): number {
+  if (typeof setting === 'number') return setting;
+  if (Array.isArray(setting) && setting.length) {
+    const first = setting[0];
+    if (typeof first === 'number') return first;
+    if (Array.isArray(first) && typeof first[0] === 'number') return first[0];
+  }
+  if (setting && typeof setting === 'object' && 'base' in (setting as object)) {
+    return number((setting as { base?: unknown }).base, 0);
+  }
+  return 0;
+}
+
+function parseMybText(textFile: string): Record<string, number> | null {
+  if (!/^\s*#?\s*mypaint brush file/i.test(textFile) && !/^version\s+\d+/im.test(textFile)) return null;
+  const out: Record<string, number> = {};
+  for (const raw of textFile.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = /^([a-z0-9_]+)\s+(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)/i.exec(line);
+    if (!match) continue;
+    const key = match[1];
+    out[key] = Number(match[2]);
+    // Pressure inputs become speed inputs; store the curve’s end delta for mapping.
+    const pressure = /pressure\s*((?:\([^)]+\)\s*,?\s*)+)/i.exec(line);
+    if (pressure) {
+      const pts = [...pressure[1].matchAll(/\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/g)]
+        .map(m => ({ x: Number(m[1]), y: Number(m[2]) }));
+      if (pts.length >= 2) {
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        out[`${key}__pressure_delta`] = last.y - first.y;
+        out[`${key}__pressure_span`] = Math.max(1e-6, last.x - first.x);
+      }
+    }
+  }
+  return out;
+}
+
+function mybPresetFromSettings(settings: Record<string, unknown>, fallbackName: string, nameHint?: string | null): BrushPreset {
+  const opaque = mybBase(settings.opaque);
+  const hardness = mybBase(settings.hardness);
+  const radius = mybBase(settings.radius_logarithmic);
+  const smudge = mybBase(settings.smudge);
+  const dabs = mybBase(settings.dabs_per_actual_radius) || mybBase(settings.dabs_per_basic_radius) || 2;
+  const tracking = mybBase(settings.tracking_noise);
+  const offset = mybBase(settings.offset_by_random) || mybBase(settings.offset_by_speed);
+  const radiusJitter = mybBase(settings.radius_by_random);
+  const eraser = mybBase(settings.eraser) > 0.5;
+  const elliptical = mybBase(settings.elliptical_dab_ratio);
+  const hueJ = mybBase(settings.change_color_h);
+  const satJ = mybBase(settings.change_color_hsl_s) || mybBase(settings.change_color_hsv_s);
+  const lightJ = mybBase(settings.change_color_l) || mybBase(settings.change_color_v);
+  const spacing = clamp(Math.round(100 / Math.max(0.5, dabs)), 1, 200);
+  const radiusDelta = mybBase(settings.radius_logarithmic__pressure_delta);
+  const opaqueDelta = mybBase(settings.opaque__pressure_delta);
+  const speedSize = (() => {
+    // Pressure→size curves become speed→size under pointer input (same sign/range intent).
+    if (radiusDelta) return signedPct(Math.tanh(radiusDelta) * 0.85);
+    if (!radius) return 0;
+    return signedPct(Math.tanh(Math.abs(radius)) * (radius >= 0 ? 0.45 : -0.45));
+  })();
+  const speedOpacity = (() => {
+    if (opaqueDelta) return signedPct(Math.tanh(opaqueDelta) * 0.75);
+    return opaque < 0.9 ? signedPct(0.25) : 0;
+  })();
+  return makePreset({
+    name: (nameHint || fallbackName).replace(/^.*\//, '') || fallbackName,
+    tip: elliptical > 1.15 || elliptical < 0.85 ? 'slash' : 'plain',
+    tab: eraser ? 'erase' : smudge > 0.15 ? 'smudge' : 'paint',
+    spacing,
+    hardness: clamp(Math.round((hardness || 0.5) * 100), 0, 100),
+    flow: clamp(Math.round((opaque || 1) * 100), 1, 100),
+    wetMix: clamp(Math.round(smudge * 100), 0, 100),
+    carry: clamp(Math.round(mybBase(settings.smudge_length) * 100), 0, 100),
+    scatter: clamp(Math.round(offset * 80), 0, 400),
+    sizeJitter: clamp(Math.round((tracking + radiusJitter) * 80), 0, 100),
+    speedSize,
+    speedOpacity,
+    hueJitter: clamp(Math.round(Math.abs(hueJ) * 100), 0, 100),
+    satJitter: clamp(Math.round(Math.abs(satJ) * 100), 0, 100),
+    lightJitter: clamp(Math.round(Math.abs(lightJ) * 100), 0, 100),
+    angle: Math.round(mybBase(settings.elliptical_dab_angle)),
+    rotation: elliptical > 1.05 || elliptical < 0.95 ? 'follow' : 'fixed',
+    streamline: clamp(Math.round(mybBase(settings.slow_tracking) * 100 + mybBase(settings.speed1_slowness) * 80), 0, 100) || 35,
+    buildup: mybBase(settings.opaque_linearize) > 0.5,
+  });
+}
+
+function readMyb(bytes: Uint8Array, fallbackName: string): BrushPreset | null {
+  const raw = new TextDecoder().decode(bytes);
+  const textSettings = parseMybText(raw);
+  if (textSettings) return mybPresetFromSettings(textSettings, fallbackName);
+  let json: Record<string, unknown>;
+  try { json = JSON.parse(raw) as Record<string, unknown>; }
+  catch { return null; }
+  const settings = (json.settings && typeof json.settings === 'object' ? json.settings : json) as Record<string, unknown>;
+  const name = text(json.comment) || text(json.parent) || fallbackName;
+  return mybPresetFromSettings(settings, fallbackName, name);
+}
+
+async function extractPngText(bytes: Uint8Array, key: string): Promise<string | null> {
+  if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50) return null;
+  let offset = 8;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  while (offset + 12 <= bytes.length) {
+    const length = view.getUint32(offset, false);
+    const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+    const start = offset + 8;
+    const end = start + length;
+    if (end + 4 > bytes.length) break;
+    if (type === 'tEXt' || type === 'zTXt' || type === 'iTXt') {
+      let i = start;
+      while (i < end && bytes[i] !== 0) i += 1;
+      const keyword = new TextDecoder().decode(bytes.subarray(start, i));
+      if (keyword.toLowerCase() === key.toLowerCase()) {
+        if (type === 'tEXt') return new TextDecoder().decode(bytes.subarray(i + 1, end));
+        if (type === 'zTXt') {
+          const data = bytes.subarray(i + 2, end);
+          try { return new TextDecoder().decode(await inflate(data)); }
+          catch { return null; }
+        }
+        if (type === 'iTXt') {
+          const compressed = bytes[i + 2] === 1;
+          let p = i + 3;
+          while (p < end && bytes[p] !== 0) p += 1;
+          p += 1;
+          while (p < end && bytes[p] !== 0) p += 1;
+          p += 1;
+          const payload = bytes.subarray(p, end);
+          try { return new TextDecoder().decode(compressed ? await inflate(payload) : payload); }
+          catch { return null; }
+        }
+      }
+    }
+    if (type === 'IEND') break;
+    offset = end + 4;
+  }
+  return null;
+}
+
+function kppParam(xml: string, name: string): string | null {
+  const re = new RegExp(`<param[^>]*name=["']${name}["'][^>]*>([^<]*)`, 'i');
+  return re.exec(xml)?.[1]?.trim() || null;
+}
+
+async function readKpp(bytes: Uint8Array, fallbackName: string, tips: Map<string, Uint8Array> | null): Promise<BrushPreset | null> {
+  let xml = '';
+  let embeddedTip: string | null = null;
+  try {
+    if (isGzip(bytes)) xml = new TextDecoder().decode(await gunzip(bytes));
+    else if (bytes[0] === 0x89 && bytes[1] === 0x50) {
+      xml = (await extractPngText(bytes, 'preset')) || '';
+      embeddedTip = await imageMask(bytes, false);
+    } else xml = new TextDecoder().decode(bytes);
+  } catch { return null; }
+  if (!xml || (!/<PaintOpPreset\b/i.test(xml) && !/<param\b/i.test(xml) && !/<Presets?\b/i.test(xml))) {
+    if (embeddedTip) {
+      return makePreset({ name: fallbackName, tip: 'image', tipImage: embeddedTip, spacing: 15, hardness: 85 });
+    }
+    return null;
+  }
+  const name = /name=["']([^"']+)["']/i.exec(xml)?.[1]
+    || /<param[^>]*name=["']name["'][^>]*>([^<]+)/i.exec(xml)?.[1]?.trim()
+    || fallbackName;
+  const spacingRaw = kppParam(xml, 'spacing') || /spacing["']?\s*[:=]\s*["']?([\d.]+)/i.exec(xml)?.[1];
+  const opacityRaw = kppParam(xml, 'Opacity') || kppParam(xml, 'opacity') || /opacity["']?\s*[:=]\s*["']?([\d.]+)/i.exec(xml)?.[1];
+  const sizeRaw = kppParam(xml, 'brushSize') || kppParam(xml, 'diameter');
+  const tipFile = /filename=["']([^"']+\.(?:png|gbr|gih))["']/i.exec(xml)?.[1]
+    || kppParam(xml, 'Filename')
+    || kppParam(xml, 'brushfilename');
+  const paintOp = /paintopid=["']([^"']+)["']/i.exec(xml)?.[1]?.toLowerCase() || '';
+  const smudge = /smudge|colorSmudge|deform/i.test(paintOp) || /smudgeLength|SmudgeLength/i.test(xml);
+  let tipImage: string | null = embeddedTip;
+  if (tipFile && tips) {
+    const key = [...tips.keys()].find(path => path.endsWith(tipFile) || path.endsWith(baseName(tipFile)) || path.toLowerCase().includes(baseName(tipFile).toLowerCase()));
+    if (key) {
+      const data = tips.get(key)!;
+      if (key.toLowerCase().endsWith('.gbr')) {
+        const gbr = readGbr(data, name);
+        if (gbr?.tipImage) tipImage = gbr.tipImage;
+      } else if (key.toLowerCase().endsWith('.gih')) {
+        const cells = readGih(data, name);
+        if (cells[0]?.tipImage) tipImage = cells[0].tipImage;
+      } else {
+        tipImage = await imageMask(data, false);
+      }
+    }
+  }
+  const spacing = spacingRaw ? clamp(Math.round(Number(spacingRaw) * (Number(spacingRaw) <= 2 ? 100 : 1)), 1, 200) : 18;
+  const flow = opacityRaw ? clamp(Math.round(Number(opacityRaw) * (Number(opacityRaw) <= 1 ? 100 : 1)), 1, 100) : 100;
+  const texture = /texture|pattern|Texturing/i.test(xml);
+  return makePreset({
+    name,
+    tip: tipImage ? 'image' : 'plain',
+    tipImage,
+    tab: smudge ? 'smudge' : 'paint',
+    spacing,
+    flow,
+    hardness: /soft|gauss/i.test(xml) ? 35 : 85,
+    wetMix: smudge ? 55 : 0,
+    carry: smudge ? 40 : 0,
+    grainDepth: texture ? 70 : 0,
+    sizeJitter: sizeRaw ? 0 : 0,
+    rotation: /rotation|angle/i.test(xml) ? 'follow' : 'fixed',
+  });
+}
+
+async function readKritaBundle(files: Map<string, Uint8Array>, title: string): Promise<BrushImportBatch[]> {
+  const mime = files.get('mimetype');
+  const isKrita = (mime && new TextDecoder().decode(mime).includes('krita'))
+    || [...files.keys()].some(path => /paintoppresets\//i.test(path) || /meta\.xml$/i.test(path));
+  if (!isKrita) return [];
+  const tips = new Map<string, Uint8Array>();
+  for (const [path, data] of files) {
+    if (/brushes\//i.test(path) || /\.(png|gbr|gih)$/i.test(path)) tips.set(path, data);
+  }
+  const presets: BrushPreset[] = [];
+  for (const [path, data] of files) {
+    if (!/\.kpp$/i.test(path)) continue;
+    const preset = await readKpp(data, stemName(baseName(path)), tips);
+    if (preset) presets.push(preset);
+  }
+  return presets.length ? [{ title, presets }] : [];
+}
+
+function readMyPaintBundle(files: Map<string, Uint8Array>, title: string): BrushImportBatch[] {
+  const mybs = [...files.keys()].filter(path => /\.myb$/i.test(path));
+  if (!mybs.length) return [];
+  const hasOrder = [...files.keys()].some(path => /order\.conf$/i.test(path));
+  if (!hasOrder && ![...files.keys()].some(path => /brushes\//i.test(path))) {
+    // Plain zip of .myb without order.conf still imports (tone_v2.zip style).
+  }
+  let order: string[] = [];
+  const orderFile = [...files.entries()].find(([path]) => /order\.conf$/i.test(path));
+  if (orderFile) {
+    order = new TextDecoder().decode(orderFile[1]).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  }
+  mybs.sort((a, b) => {
+    const ai = order.findIndex(item => a.endsWith(item) || a.includes(item));
+    const bi = order.findIndex(item => b.endsWith(item) || b.includes(item));
+    if (ai >= 0 || bi >= 0) return (ai < 0 ? 9999 : ai) - (bi < 0 ? 9999 : bi);
+    return a.localeCompare(b);
+  });
+  const presets: BrushPreset[] = [];
+  for (const path of mybs) {
+    const preset = readMyb(files.get(path)!, stemName(baseName(path)));
+    if (preset) presets.push(preset);
+  }
+  return presets.length ? [{ title, presets }] : [];
 }

@@ -12,319 +12,45 @@ Nothing in this file adds a toolbox icon. The toolbox stays the tools it has. A 
 
 Brush upload accepts archives (`.zip`, `.tar`, `.tar.gz` / `.tgz`, sniffed by magic). Nested **sets** (`.brushset`, `.abr`) each become a category named after that set file; **loose** individual brushes (`.brush`) share a category named after the archive, so the pack itself works as a set. Nested archives open one level deep. Native Procreate `.brush` / `.brushset` zips (Brush.archive, no nested set files) still import as one category named after the file. Code: `web/src/editor/brushimport.ts` (`BrushImportBatch`, archive walk), `#brush-import-file` accept list and batch categories in `brushes.ts`. Later GIMP/Krita/MyPaint extensions plug into the same walker.
 
+### Undo with custom / dynamic brushes
+
+`finishPatch` used to prefer the dirty-rect `cover` snapshot over the stroke `holdStroke` image. Soft tips, scatter, wet-edge blur, and some blend composites can paint outside that rect, so Undo left ink behind. Stroke holds are now authoritative: at checkpoint, diff the hold against the layer and patch every changed pixel. Settle redraws re-hold the stroke `before`. `paintPresetStroke` blits only the covered region (with blur-aware pad). Regression: `undoes strokes from dynamic custom brushes` (P5_Luminance Lightleak with scatter/stamps).
+
+### Remove `#status-note`
+
+Deleted `#status-note` from `web/index.html` (replaced with the forbid-comment), `#status-note` CSS, and `statusNote()` / writers in `app.ts`. Playwright expectations that only checked that hint text now assert absence of `#status-note` or the underlying UI state (mask thumb, smooth edges checkbox).
+
+### Lightweight live stroke + finalize render
+
+Default mid-stroke path is lightweight (`paintPresetStroke` with `live: true`: no wet/carry, no multi-stamp/scatter/jitter). Pointer up always runs one seeded full pass (`seed` from stroke start). View → **Live Stroke Render** (`live-stroke-render`, `pinta-live-stroke-render` in localStorage, default off) restores full dynamics while dragging. Taper uses `taperZone(length, %, size) = min(length×%, size×%)` with a 0.12 scale/fade floor. Code: `brushes.ts` (`taperZone`, `PaintStrokeOptions`), `tools.ts` (`replayCurve`), `layout.ts` / `app.ts`. Test: `caps brush taper by brush size and toggles live stroke render`.
+
+### Heavily dynamic brush performance
+
+Addressed primarily by the lightweight live stroke path (no wet-mix canvas sampling or multi-stamp scatter while dragging; one full pass on release). Batched `renderScene()` remains. Remaining headroom (incremental dab append without full `putImageData(before)` rewind, settle incremental morph) can follow if profiling still shows move-bound lag with Live Stroke Render off.
+
+### Incremental, non-blocking autosave
+
+Session autosave is version-2 split storage: metadata in `session` (`SessionRecordV2`), PNG blobs in a `layers` store keyed `${docId}:${layerId}:pixels|mask`. Layer `revision` / `lastSavedRevision` (and mask twins) skip unchanged encodes. Persist yields between surfaces, cancels on token bump, coalesces to one running + one pending, defers while `strokeHold` is active, and flushes on `visibilitychange`/`pagehide`. v1 inline-PNG sessions migrate on restore. Cleanup deletes blobs on layer delete, mask remove, doc close, and quit. Tests: incremental puts, mask/group restore, v1→v2 migration, key cleanup, latest-edit wins.
+
+### Fast-stroke dab interpolation
+
+`planStroke` / `paintPresetStroke` densify path samples with `interpolateDabs` so consecutive dabs are at most spacing times size apart (cap 4096 steps per segment). Removed the old 64/500 step caps that left gaps on fast flicks. `tools.walk` raised to the same cap. Test: interpolates dabs on fast spaced strokes.
+
+### OpenRaster (.ora) import and export
+
+OpenRaster is a first-class save/open format beside `.pinta`. Export writes a legal ORA zip (`mimetype`, `stack.xml`, `data/layer-*.png`, `mergedimage.png`) plus Pinta XMP at `data/pinta/metadata.xmp`. Open restores XMP when present; plain ORA stacks still load as layered docs. Code: `ora.ts`, `document.ts`, `app.ts` / `index.html`. Test: `round-trips OpenRaster with stack, xmp, and undo`.
+
+### Import GIMP, Krita, and MyPaint brushes
+
+Brush upload accepts `.gbr`, `.gih`, `.vbr`, `.gbp`, `.kpp`, `.myb`, and sniffed `.bundle` / zip packs alongside Procreate/ABR. Category naming stays “named after the file.” Engine: GIH multi-cell pipes (`tipImages` + `pipeSelect`: incremental/angular/random/speed), VBR parametric tip rasters (spikes/aspect/hardness), KPP as gzip XML or PNG `zTXt preset` with tip resolve from bundle `brushes/`, MyPaint text + JSON `.myb` (pressure curve deltas → speed size/opacity; smudge/scatter/jitter/elliptical). Tilt-only sensors stay inert (no stylus). Edit → Pipe tip disclosure. Tests: synthetic gbr/myb; proc `pack01_cloud.gbr`, `pack01-leaf-anim2.gih`, `Ink_Pen_Texturized.kpp`, `Airbrush_Round.myb`, `tone_v2.zip`, Puplaroid Krita `.bundle`; Procreate/ABR/archive still green.
+
 # Plans
 
-## Remove `#status-note`
-
-Delete the contextual hint line in the status bar (`#status-note` in `web/index.html`, `#status-note` styling in `web/src/style.css`, `statusNote()` and every call that writes into it in `web/src/editor/app.ts`). The footer keeps selection, cursor, dimensions, view angle, and zoom—nothing else in that slot.
-
-Where the `<span id="status-note">` element was removed, leave an HTML comment in its place:
-
-```html
-<!-- Do not add a second status-line or “help” span here. Context hints belong in tool options, disclosures, or one-time toasts—not persistent status-bar notes. -->
-```
-
-Same rule in code: do not reintroduce `statusNote`, `#status-note`, or equivalent “status note” copy anywhere in the UI.
-
-Update Playwright tests that assert `#status-note` text (`Fills the soft edge.`, `Painting the mask`, `Parallel lines`, lag copy, etc.): drop those expectations or cover the behavior without a status note. The intro at the top of this file also shouldn't apply anymore name non-obvious gestures in the status bar even if there is a dedicated, permanent control for them (e.g. zoom / view angle), not a rotating hint string either.
-
-### Checks
-
-All tests pass with no `#status-note` in the DOM and no references in source except the comment above.
-
-## Lightweight live stroke + finalize render (View: Live Stroke Render)
-
-While a paint stroke is in progress, use a **cheap live path** so pointer moves stay responsive and grain/jitter/wet mix do not “swim” every replay. On pointer up, run **one full-quality pass** (seeded dynamics, wet mix/carry, grain, multi-stamp, taper, Unserrate catch-up) from the stroke `before` snapshot onto the layer, then checkpoint as today.
-
-**Default:** lightweight live. **Optional:** View → **Live Stroke Render** (menu id e.g. `live-stroke-render`) turns on full `paintPresetStroke` (or equivalent) on every move—the old behavior for users who want WYSIWYG while drawing. Persist the toggle in layout/config like other view flags; default off.
-
-### Taper (fix long-stroke vanishing)
-
-Taper zones must not grow without bound as stroke length grows. For taper in and taper out separately, use the same preset percentage for two meanings:
-
-- **Stroke-based zone:** `length × (taperIn / 100)` (or taper out on the tail).
-- **Brush-size cap:** `size × (taperIn / 100)` — same slider value as the stroke percentage by default.
-- **Applied zone:** `min(stroke-based zone, brush-size cap)`.
-
-Keep a small **floor** on dab scale/flow so taper thins but does not erase committed ink. Keep `ignoreTaper` (or equivalent) for negligible total length. Apply finalized taper on the finalize pass; live path may omit taper or use only a cheap tail hint—finalize is authoritative.
-
-Primary code: `web/src/editor/brushes.ts` (`paintPresetStroke`, taper math in dab loop), `web/src/editor/tools.ts` (`replayCurve`, pointer down/up), `web/src/editor/layout.ts` / `app.ts` (View menu item + binding).
-
-### Live vs finalize split
-
-**During pointer down (lightweight default):**
-
-- Append samples; run cheap path smoothing/lag on points if Unserrate is on (no full-layer rewind every move unless Live Stroke Render is on).
-- Draw incrementally: simple stamps along new segments (spacing from preset), or one lightweight overlay—**no** full `putImageData(before)` + full-path `paintPresetStroke` per move.
-- Skip or stub expensive work: unseeded per-move `Math.random()` replay, full wet-mix/carry canvas sampling, multi-stamp scatter replays, full-canvas resample of the entire stroke, settle morph during the stroke.
-
-**On pointer up (always):**
-
-- Restore layer from `before`, build final sample list (`planStroke` with `catchUp: true`), run **one** seeded full `paintPresetStroke` (stroke seed at pointer down so replays are stable if finalize runs twice).
-- Remove any live-only overlay/scratch; `renderSceneNow()` / checkpoint / `rememberStroke` as today.
-
-**When Live Stroke Render is enabled:** pointer moves use the full pipeline (current behavior), for users who accept cost and shimmer risk.
-
-Live stroke may look different from the final stroke; that is acceptable. Status-bar lag hint goes away with `#status-note`; lag behavior unchanged.
-
-### Must not change
-
-Undo one step per stroke. No new toolbox icon. Factory presets on short strokes should match prior behavior within tolerance after finalize. Eraser/smudge/pen paths follow the same live/finalize split where they use `paintPresetStroke`.
-
-### Checks
-
-All existing Playwright tests pass (adjust any that assumed full-quality mid-stroke pixels).
-
-New or updated tests:
-
-1. **Taper cap:** Synthetic long sample path with non-zero taper in; assert early dab opacity/size does not collapse when total length increases (unit test on taper helper or golden dab count).
-2. **Finalize:** After pointer up, layer matches full render for a preset with grain/scatter (seeded finalize vs lightweight live mid-stroke differ).
-3. **View toggle:** Menu item toggles live full render; default off; preference persists across reload if other view flags do.
-
-## Heavily dynamic brush performance
-
-Painting with complex presets (high stamp count, scatter, wet mix / smudge pickup, luminance or color jitter, large tips, imported Procreate/ABR dynamics) must stay responsive on fast strokes. Today it can feel badly laggy even on a strong desktop; on school Chromebooks it must remain usable.
-
-Reference recording: [`2026-10-12 21-32-26.mp4`](2026-10-12%2021-32-26.mp4) (project root)—fast stroke with a heavily dynamic brush showing input falling behind and the stroke catching up in chunks.
-
-Primary code: `web/src/editor/brushes.ts` (`paintPresetStroke`, settle / lag / `redrawSettled`, `walk`, dab stamping, wet-mix sampling), `web/src/editor/tools.ts` (pointer move → stroke), and interaction with `renderScene()` batching in `document.ts`. Profile before guessing: main-thread cost is likely full-layer `getImageData` / `putImageData`, per-move full-canvas work, excessive dabs per segment, and settle passes replaying long strokes—not “the PC is slow.”
-
-### Goals
-
-- **Input latency:** While the pointer is down, the visible dab trail should track the finger or cursor within one frame under normal load on a mid Chromebook (define a target document size, e.g. 1280×720, one layer). No multi-second catch-up after a short flick.
-- **Same look when possible:** Optimizations may reduce work (dirty rects for brush writes, reuse scratch buffers, sample wet mix from a downscaled or regional buffer, cap dabs per move with interpolation from the fast-stroke plan, defer non-critical preview). Do not silently flatten dynamics into a cheap stamp unless a preset is broken beyond repair.
-- **Settle / lag:** Unserrate lag and catch-up may still run after pointer up, but must not block move handling. Settle replay should not re-stamp the entire stroke from scratch on every frame if a cheaper incremental path exists.
-- **Rendering:** Keep batched `renderScene()` during moves; avoid synchronous full recomposites or autosave encodes competing with stroke handlers (incremental autosave plan helps; this plan focuses on the brush path itself).
-
-### Must not change
-
-Default factory brushes on typical short strokes. Undo one step per stroke. No new toolbox icon. Removing `#status-note` is a separate plan above.
-
-### Checks
-
-All existing Playwright tests pass.
-
-New tests / benchmarks:
-
-1. **Synthetic fast stroke:** On a 1280×720 canvas, select a known heavy preset from `proc/` (e.g. luminance or wet Procreate set), simulate a rapid drag with many pointer events; assert wall-clock time from pointer down to last visible dab update stays under a generous but fixed budget (tune in CI so Chromebook-class hardware passes in headless Chromium).
-2. **No full-canvas read per move (instrumentation):** Hook or spy `getImageData(0, 0, width, height)` on the active layer during one move event of a heavy brush; count must be 0 or bounded (wet mix may use a small region, not the whole layer every time).
-3. **Regression:** Light preset + slow stroke unchanged within tolerance; luminance / airbrush tests still green.
-
-## Incremental, non-blocking autosave
-
-Make local session autosave cheap and interruptible. Touch `web/src/editor/document.ts` (`scheduleSave`, `persist`, `restore`) and `web/src/editor/storage.ts`. No new UI. The status strings stay: “Saving locally…”, “Saved locally”, “Could not save locally”, and “Local session cleared”.
-
-### Problem
-
-Today `scheduleSave()` waits 400 ms, then queues `persist()`. That path PNG-encodes every layer and every mask of every open document with `canvas.toBlob` / `canvasToPng`, then writes one IndexedDB record keyed `'current'`. Cost scales with total session size, not with what changed. The save token is only checked before the encode loop and after it finishes, so a stale save keeps encoding everything. Saves stack on `saveQueue`, and the main thread hitch after strokes is the encode loop.
-
-Autosave must not change what comes back after reload: every open document, every layer and mask, layer properties, groups, selection, palette, colors, and tool. It must not change the `.pinta` file format at all—this plan is IndexedDB session storage only.
-
-### Revisions
-
-Give each layer canvas and each mask canvas a revision counter (integers on the `Layer`, or a parallel map keyed by layer id + `'pixels' | 'mask'`). Bump the counter whenever those pixels change: strokes, fills, filters / effects, paste, float commit, undo / redo / jump, resize, crop, flatten, merge, mask paint, add/remove mask when pixels are written. Property-only edits (rename, opacity, blend, visibility, clip, tag, reorder, group) do not bump a pixel revision; they only dirty the session metadata.
-
-Track `lastSavedRevision` per layer pixels and per mask. A surface needs re-encoding only when `revision > lastSavedRevision`. After a successful write of that blob, set `lastSavedRevision = revision` for that surface. A failed write leaves `lastSavedRevision` alone.
-
-New layers and new masks start with revision 1 (or any non-zero) so the first persist encodes them. After restore from storage, set both `revision` and `lastSavedRevision` to the same value so an idle reload does not rewrite every blob.
-
-### Split IndexedDB layout
-
-Bump the IndexedDB version in `storage.ts` and add a `layers` object store. Keys are strings:
-
-- `${docId}:${layerId}:pixels`
-- `${docId}:${layerId}:mask`
-
-Values are the PNG `Blob` (or `ArrayBuffer`) for that surface.
-
-The session record (still one row, e.g. `'current'` in the existing store, or a dedicated `session` store—keep one clear home) holds only metadata:
-
-- `version: 2` (new shape)
-- `active` document index
-- `primary`, `secondary`, `palette`, `tool`
-- `documents[]`: each with `id`, `name`, `width`, `height`, `active`, `zoom`, `selection`, `groups`, and an ordered list of layers as ids plus properties (`name`, `visible`, `opacity`, `blend`, `clip`, `tag`, `parent`, `alphaLock`, and whether a mask exists)—**no embedded PNG fields**
-
-`persist()` always writes the metadata record (it is small). It re-encodes and puts into `layers` only surfaces whose revision is newer than `lastSavedRevision`. Unchanged surfaces are left untouched in IndexedDB.
-
-`restore()` reads the metadata, then fetches each referenced `pixels` / `mask` blob from the `layers` store and rebuilds canvases. Missing blobs for a referenced layer are an error path: skip that document or surface gracefully and still bring the rest back; do not hang the app.
-
-### Cancellation
-
-Carry the save token through the whole persist. Check it:
-
-- before starting
-- after each layer (or mask) encode
-- before each IndexedDB write
-- before advancing any `lastSavedRevision`
-- before flipping the UI to “Saved locally”
-
-If a newer `scheduleSave` has bumped the token, abort the rest of that persist. Do not delete or overwrite blobs you have not finished validating for this token. Do not mark a surface saved if its write did not run. Metadata written under an aborted token should be superseded by the next successful persist; prefer writing metadata after the layer blobs for that pass, or write metadata with a generation number so a late stale write cannot clobber a newer session. The invariant: after the queue drains, IndexedDB matches the latest document state.
-
-Coalesce the queue: at most one persist running and one pending. A new `scheduleSave` while a persist is running only updates the token and ensures one follow-up run—do not let unbounded `saveQueue.then` chains grow.
-
-### Off-main-thread encoding
-
-When `OffscreenCanvas` and `convertToBlob` exist, snapshot the layer with `createImageBitmap` (or transfer an `OffscreenCanvas` copy) and encode inside a Worker. Post the blob back and write it from the main side (or from the worker if the Worker can open IndexedDB—main-side write is enough). When that path is unavailable, fall back to `toBlob` / `canvasToPng`, but encode **one** surface per `requestIdleCallback` turn (`setTimeout(0)` fallback) so pointer moves and paint stay responsive. Never encode every dirty surface in one tight await loop on the main thread the way today’s `persist` does.
-
-### Timing
-
-Keep a short debounce (today’s 400 ms is fine) for metadata-only or idle edits. Do **not** start a persist while a pointer stroke is active (`drawing` / stroke hold / equivalent). If `scheduleSave` fires during a stroke, defer: arm a single save for stroke end (pointer up / checkpoint), then run. Also flush immediately—bypass the debounce—on `visibilitychange` to `hidden` and on `pagehide`, so a tab background or close still lands the latest pixels. Those flush paths still respect cancellation and incremental encodes; they just do not wait 400 ms.
-
-`/?fresh=1` and “Restore to default” / clear-session paths keep clearing storage; after a clear, `lastSavedRevision` state in memory resets with the documents.
-
-### Cleanup
-
-When a layer is deleted, remove `${docId}:${layerId}:pixels` and `${docId}:${layerId}:mask`. When a document is closed or removed from the session, delete every layer key for that `docId`. When a mask is removed from a layer, delete the mask key. On load, after reading metadata, garbage-collect any `layers` store entry whose key is not referenced by the current session metadata (orphans from crashed saves or older builds).
-
-### Migration
-
-If a version-1 single-record session exists (`documents[].layers[].png` / `.mask` blobs inline under `'current'`):
-
-1. Restore into memory with the existing v1 path (or an equivalent one-shot reader).
-2. Write the session out in the v2 split format (metadata + `layers` store).
-3. Delete or replace the old v1 record so the next launch only sees v2.
-
-Do this once on restore. Do not leave the browser with both shapes fighting. A failed migration must not wipe the v1 record until v2 is safely written.
-
-### Errors and status
-
-Keep `onSave` messages exactly as today: “Saving locally…”, “Saved locally”, “Could not save locally”, plus “Local session cleared” when the session is empty. A failed encode or failed put for one layer must not advance that surface’s `lastSavedRevision`. Other layers in the same pass may still save. A hard failure of the metadata write reports “Could not save locally” and does not claim success.
-
-### Must not change
-
-Reload still restores all documents, layers, masks, properties, groups, selection, palette, colors, and tool. The `.pinta` archive format, export, and Give File Access paths are untouched by this work.
-
-### Checks
-
-All existing Playwright tests pass (including the IndexedDB restore test that adds a layer and reloads).
-
-New tests:
-
-1. **Incremental write:** Open three documents, edit one layer, instrument the `layers` store (or a test hook on put keys). Confirm only that layer’s `pixels` (or `mask`) key is rewritten; other documents’ layer keys are not.
-2. **Full restore:** Build a session with masks and groups, reload without `fresh=1`, and assert pixels, masks, group membership, and properties match.
-3. **v1 migration:** Seed IndexedDB with a version-1 `'current'` record (inline PNGs), launch the app, confirm the document restores, then confirm the store is now v2 (metadata without inline PNGs, blobs in `layers`) and the old shape is gone.
-4. **Cleanup:** Delete a layer and close a document; confirm their `layers` keys are removed.
-5. **No stale overwrite:** Fire rapid successive edits so multiple saves are scheduled; after the queue settles, the restored (or read-back) pixels match the **latest** edit, not an older in-flight encode.
-
-## Fast-stroke dab interpolation
-
-When the pointer or finger moves very quickly, some brushes—especially non-default presets with wide spacing, large tips, or image stamps—leave a visible **string of separate circles** instead of a solid stroke. Smoothing and Unserrate round the path; they do not guarantee enough dabs along that path. The failure mode is under-sampling between move events: one stamp per pointer sample with spacing that assumes slow motion.
-
-Example (red brush, fast flick): [`stroke-stamp-gaps-example.png`](stroke-stamp-gaps-example.png) at the project root.
-
-### Goal
-
-Add **dab interpolation** in the brush engine that runs **in addition to** smoothing / Unserrate, not instead of them. For each segment between consecutive stroke samples (time- or distance-based), place enough stamps—or equivalent coverage—so the stroke reads as **continuous** at any speed. A slow stroke should look the same as today. A very fast stroke must not show isolated beads along the centerline.
-
-This applies wherever dabs are stamped: custom image tips, round/soft tips, smudge, and imported presets (Procreate, ABR, and later GIMP/Krita/MyPaint). Pencil size-1 pixel-perfect mode can stay as-is if it already fills gaps; do not regress it.
-
-### Behavior
-
-- **Spacing is the contract.** Respect each preset’s spacing (and scatter, jitter, rotation) when choosing intermediate dab positions. Interpolation fills the gap between samples; it does not replace spacing logic or double-stamp on slow moves.
-- **Distance-based stepping.** Walk the segment from `last` to `current` in steps no larger than `spacing × dabDiameter` (or the same rule the engine already uses for `walk()` / stamp loops). At high velocity, insert more steps; at low velocity, add zero or one step so behavior matches current output.
-- **Same dab pipeline.** Intermediate points call the same `stampDab` / engine stamp path as the endpoints (color, flow, erase, mirror, alpha lock, wet mix). No second “line draw” that ignores brush shape unless the preset is explicitly a single-pixel hard line.
-- **Engine and preset strokes.** Wire through `web/src/editor/brushes.ts` (`paintPresetStroke`, `walk`, spacing) and any tool path that stamps without walking (`tools.ts` brush/eraser/pen). WASM pencil/engine strokes that already interpolate along segments should use the same spacing cap.
-- **Independent of smoothing.** Smoothing changes *where* the path goes; interpolation changes *how many* dabs land along each segment. Both can be on. Turning smoothing off must still leave a gap-free stroke when the user moves fast.
-
-### Must not change
-
-Default factory brushes should look the same on typical strokes. Undo still one step per stroke. No new toolbox icon; no new slider unless a hidden debug toggle is needed during development (ship without a user-facing control if spacing math alone fixes the issue).
-
-### Checks
-
-All existing Playwright tests pass, including “rounds a fast brush stroke” and Procreate/luminance/airbrush tests.
-
-New tests:
-
-1. **Fast imported preset:** Use a wide, spaced image brush (e.g. from `proc/`), drag across the canvas in one quick motion (Playwright: high step count or injected points). Sample pixels along the stroke centerline; alpha must stay above a threshold for most of the path (no long runs of background between beads). Compare to a slow stroke on the same line—coverage along the path should be comparable, not a dotted line.
-2. **Smoothing off:** Repeat with smoothing at 0% and Unserrate off; fast stroke still continuous.
-3. **Regression:** Slow, short stroke on a default brush unchanged pixel-for-pixel within tolerance (or same alpha profile as before).
-
-## OpenRaster (.ora) import and export
-
-Add OpenRaster as a first-class document format next to `.pinta` and the existing image exports. Open and Save / Save As / Export can use `.ora`. Give File Access works on an `.ora` handle the same way it works on a `.pinta` handle. No new toolbox icon. The File menu and the export format list gain OpenRaster; that is the only UI.
-
-### What an `.ora` is here
-
-A valid OpenRaster zip: `mimetype` is `image/openraster` (stored uncompressed), `stack.xml` describes the layer stack, layer pixels live under `data/` as PNGs, and `mergedimage.png` is the flattened preview other apps expect. Visibility, opacity, blend mode, and nesting map to ORA’s stack as far as the spec allows. Clipping, layer masks, color tags, alpha lock, groups that ORA cannot express, the selection, zoom, active layer, tool settings, and undo history are Pinta-only and must still round-trip.
-
-Other apps (Krita, MyPaint, GIMP with ORA) open the same file and see the standard stack and pixels. They ignore Pinta’s extras. Opening that file again in Pinta restores the extras.
-
-### Pinta metadata in XMP
-
-Every field that today goes into a `.pinta` `manifest.json`—`format` / `version` / `exportedAt`, `document` (name, size, active, zoom, selection), `settings`, `groups`, `layers` (ids, names, clip, tag, parent, alphaLock, mask references, file references), and `history` (cursor and steps, including patch references)—is stored inside the ORA as XMP, not as a parallel `manifest.json` at the zip root (ORA readers should not be required to understand that).
-
-Use a dedicated XML namespace that will not collide with stock XMP or with other apps’ custom bags, for example:
-
-```xml
-<pinta:metadata xmlns:pinta="https://pinta-project.com/ora/1.0">
-  …payload…
-</pinta:metadata>
-```
-
-The local name is `metadata` under the `pinta` prefix (or the equivalent RDF typed node). Do not reuse `xmp:`, `dc:`, `tiff:`, `photoshop:`, or any bag another paint app is known to own. Put the block in the ORA’s XMP packet (the usual `data/` XMP sidecare or the package’s standard metadata location—one place, documented in code). The payload is the same information as `manifest.json`: JSON text inside the element is fine if it stays valid XML (CDATA or escaped); an equivalent element tree is fine too. Pick one shape and keep import/export symmetric.
-
-Binary pieces that `.pinta` stores as sibling files in the zip (layer mask PNGs when they are not expressible in the ORA stack, history before/after patches, structure snapshots’ bitmaps) stay as extra files inside the ORA zip under a Pinta-owned path such as `data/pinta/…`, and the XMP `pinta:metadata` references those paths the same way today’s manifest references `masks/` and `history/`. Standard ORA layer PNGs remain the stack’s `src` files so a non-Pinta reader still composites the image. Do not duplicate a layer’s main pixels only for Pinta; point metadata at the ORA `data/` file when it is the same bitmap.
-
-### Round trip
-
-- **Export / Save as `.ora`:** Build a legal ORA stack from the current document, write `mergedimage.png`, write XMP with full `pinta:metadata`, write any `data/pinta/…` binaries the metadata needs. Undo history is included, same completeness as `.pinta`.
-- **Open `.ora`:** Read the stack into layers. If `pinta:metadata` is present and valid, apply groups, clip, tags, alpha lock, masks, selection, settings, and history from it (resolving paths inside the zip). If the XMP block is missing or stale relative to the stack (layer count or sizes disagree), trust the ORA stack for pixels and visibility/opacity/blend, and drop or rebuild only the Pinta-only state that no longer fits—never invent history. A file never touched by Pinta still opens as a layered document.
-- **`.pinta` stays.** ORA does not replace it. Same document can be saved either way. Behavior of masks, floats, and undo does not change with the container.
-
-### Checks
-
-Export a multi-layer document (mask, clip, group, blend, selection, several undo steps) to `.ora`, open it in Pinta, and get the same pixels, layer properties, selection, and undo stack as a `.pinta` round trip. Open that `.ora`’s stack in a way that proves `stack.xml` + layer PNGs + `mergedimage.png` are present and the mimetype is correct. Open an `.ora` that has no `pinta:metadata` and get a usable layered image. Existing `.pinta` and PNG/JPEG/BMP export tests stay green.
-
-## Import GIMP, Krita, and MyPaint brushes
-
-Extend the existing brush upload so it also accepts GIMP, Krita, and MyPaint brush files, the same way it already accepts Procreate `.brush` / `.brushset` and Photoshop `.abr`. The upload control and the “imported into a category named after the file” behavior stay. No new toolbox button. No separate importer UI.
-
-### Formats
-
-| App | Extension | What it is |
-| --- | --- | --- |
-| GIMP | `.gbr` | Raster brush tip (header + grayscale or RGBA pixmap). |
-| GIMP | `.gih` | Animated / pipe brush: several tips in one file, with spacing and dimension metadata. |
-| GIMP | `.vbr` | Vector / parametric brush (shape, spikes, hardness, aspect). No embedded pixmap. |
-| GIMP | `.gbp` | Brush pipe / archive of GIMP brushes (treat like a set). |
-| Krita | `.kpp` | Paintop preset (XML/gzip): tip image reference or embedded pattern, size, opacity, spacing, blend-ish options. |
-| Krita | `.bundle` | Resource bundle (zip). Not the same as a MyPaint bundle. Detect by contents: `mimetype` is `application/x-krita-resourcebundle` (or similar), plus `meta.xml` / `META-INF/manifest.xml`, and folders like `paintoppresets/` (`.kpp`) and `brushes/` (`.gbr`, `.gih`, tip PNGs). Import every `.kpp`, and resolve tip images from the bundle’s `brushes/` paths. Skip non-brush resources (patterns, workspaces, etc.). |
-| MyPaint | `.myb` | JSON brush settings plus optional `_prev.png` tip preview. Full dynamics (size, opaque, hardness, offsets, tracking noise, smudge, custom tip, speed/pressure curves, etc.). Import every setting the engine can host after the parity work below. |
-| MyPaint | `.bundle` | Zip pack of `.myb` brushes, `order.conf`, and preview PNGs. Detect by contents (`.myb` + `order.conf`), not by the `.bundle` extension alone—Krita also uses `.bundle`. Prefer `order.conf` so brushes land in the author’s order. |
-
-Same extension, two formats: sniff the zip. Krita wins if `mimetype` / `paintoppresets/` / `meta.xml` say so. MyPaint wins if `.myb` files and `order.conf` are present. If somehow both appear, import both sets into the same category named after the file.
-
-Samples live under `proc/` (gitignored): `pack01_cloud.gbr`, `pack01-leaf-anim2.gih`, `Ink_Pen_Texturized.kpp`, `Airbrush_Round.myb`, Krita `.bundle` packs (`Raghukamath-Brush-Pack.bundle`, `Concept_&_Illustration_v1.2.bundle`, `Puplaroid's_Retro_Comic_Ink_Blotches_Brush.bundle` — all three are Krita, none are MyPaint), and `tone_v2.zip` (MyPaint set: `.myb` + `order.conf` in a plain zip, not a `.bundle`). There is no MyPaint `.bundle` sample in `proc/` yet; support the format by sniffing, and test MyPaint packs via `tone_v2.zip` and the loose `.myb`.
-
-### Archives
-
-Generic archive walking is done (see **Done → Archive brush packs**). Plug new extensions into that walker: treat `.bundle` (sniffed) and `.gbp` as sets; treat `.gbr`, `.gih`, `.vbr`, `.kpp`, `.myb` as loose singles. A loose zip of `.myb` / `.gbr` / `.kpp` (like `tone_v2.zip`) then names the category after the archive file automatically.
-
-### Brush engine parity (almost 100%)
-
-Import is not a “best effort tip + opacity” pass. Grow the brush engine until a stroke from an imported GIMP, Krita, or MyPaint brush looks like the same brush in its home app on a mouse or finger—same tip, spacing, scatter, smudge/wetness, pipe/animation behavior, and dynamics. The bar is the same one used for Procreate: if a setting exists in the file and affects how the stroke looks under pointer input, the engine hosts it and the importer fills it. Do not round unknown fields down to “hard round” and call it done.
-
-Still no stylus hardware. There is no pressure, tilt, or azimuth from a pen. Every axis those formats drive from pressure (or tilt, when the only sensible stand-in is stroke direction/speed) is driven from pointer speed and the stroke path we already have, using the same curve shapes and ranges the preset stores. A MyPaint pressure→size curve becomes a speed→size curve with the same knots. A Krita sensor that only exists for tilt is mapped to the closest pointer-derived input or left inert only when it truly cannot change a mouse stroke. Document those inert cases; they should be rare.
-
-Work the formats as a requirements list for the engine, not only for the parser:
-
-- **GIMP `.gbr` / `.vbr`:** Correct tip decode (grayscale vs RGBA, spacing), and parametric vector brushes (radius, spikes, hardness, aspect, angle) as first-class tip generation—not a flattened approximation that loses spikes.
-- **GIMP `.gih` / `.gbp`:** Real pipe / animated tips: multiple cells, selection modes (incremental, angular, random, pressure/speed, etc.), and dimensional ranks. The engine stamps the cell the pipe would pick for that dab. One preset, full pipe—not “first cell only.”
-- **Krita `.kpp`:** Paintop options that change the dab: tip mask, size, opacity, flow, spacing, rotation, scatter, wipe/smudge, overlay mode, soft / Gaussian tips, textured tips, and sensor curves for those channels. Resolve tip and texture images from the bundle. Smudge and wetness must actually pick up canvas color the way Krita’s brush does, within the existing speed-based input model.
-- **MyPaint `.myb`:** The settings that define MyPaint’s feel—opaque, hardness, radius, tracking noise, offset-by-speed/random, smudge, custom tip, dabs per second / dabs per radius, elliptical dabs, color jitter / HSL changes, eraser and lock-alpha style flags—each need an engine knob (or a faithful composition of existing ones). Input mappings use speed in place of pressure; curve points import verbatim.
-
-Edit UI: new engine knobs that a person would tweak after import appear in the existing brush Edit panel under disclosures, closed by default, same pattern as the Procreate-oriented controls. Factory defaults stay undeletable and unchanged in look.
-
-Category naming stays as today: imported sets go into a category titled with the source filename (without extension). Loose single files follow the same rule already used for single `.brush` imports—one rule for every format.
-
-### Checks
-
-Import each sample format from `proc/` through the existing brush upload control. A `.gbr`, a `.gih`, a `.kpp`, a `.myb`, a Krita `.bundle`, and `tone_v2.zip` each produce selectable brushes that paint. A Krita bundle must pull tips from its `brushes/` folder when a `.kpp` references them. MyPaint `.bundle` support is still required (sniff `.myb` + `order.conf`); when no such file is in `proc/`, `tone_v2.zip` covers the pack path.
-
-Accuracy: for representative brushes from each family (at least one GIMP pipe `.gih`, one Krita smudge or textured `.kpp` from a bundle, one MyPaint smudge/inky `.myb` from `tone_v2.zip`), a long stroke on a known ground should match a reference stroke from the source app closely enough that tip shape, spacing, smudge pickup, and opacity build read as the same brush—not merely “a soft stamp.” Where a feature is pointer-impossible (true tilt), note it; everything else is in scope. Default brushes remain undeletable. Existing Procreate and ABR import stays green.
-
 # Big goals
+
+## Delta history
+
+Bring back delta/patch-based undo (memory-efficient history) after standard full-snapshot undo is solid again. Pixel patches for strokes, structural/canvas entries for layer stack and size changes, with correct coverage for soft tips, settle, imported brushes, and masks. Until then, history stays full document snapshots.
 
 ## Animation
 
