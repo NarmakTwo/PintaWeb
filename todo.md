@@ -8,6 +8,42 @@ Nothing in this file adds a toolbox icon. The toolbox stays the tools it has. A 
 
 # Plans
 
+## OpenRaster (.ora) import and export
+
+Add OpenRaster as a first-class document format next to `.pinta` and the existing image exports. Open and Save / Save As / Export can use `.ora`. Give File Access works on an `.ora` handle the same way it works on a `.pinta` handle. No new toolbox icon. The File menu and the export format list gain OpenRaster; that is the only UI.
+
+### What an `.ora` is here
+
+A valid OpenRaster zip: `mimetype` is `image/openraster` (stored uncompressed), `stack.xml` describes the layer stack, layer pixels live under `data/` as PNGs, and `mergedimage.png` is the flattened preview other apps expect. Visibility, opacity, blend mode, and nesting map to ORA’s stack as far as the spec allows. Clipping, layer masks, color tags, alpha lock, groups that ORA cannot express, the selection, zoom, active layer, tool settings, and undo history are Pinta-only and must still round-trip.
+
+Other apps (Krita, MyPaint, GIMP with ORA) open the same file and see the standard stack and pixels. They ignore Pinta’s extras. Opening that file again in Pinta restores the extras.
+
+### Pinta metadata in XMP
+
+Every field that today goes into a `.pinta` `manifest.json`—`format` / `version` / `exportedAt`, `document` (name, size, active, zoom, selection), `settings`, `groups`, `layers` (ids, names, clip, tag, parent, alphaLock, mask references, file references), and `history` (cursor and steps, including patch references)—is stored inside the ORA as XMP, not as a parallel `manifest.json` at the zip root (ORA readers should not be required to understand that).
+
+Use a dedicated XML namespace that will not collide with stock XMP or with other apps’ custom bags, for example:
+
+```xml
+<pinta:metadata xmlns:pinta="https://pinta-project.com/ora/1.0">
+  …payload…
+</pinta:metadata>
+```
+
+The local name is `metadata` under the `pinta` prefix (or the equivalent RDF typed node). Do not reuse `xmp:`, `dc:`, `tiff:`, `photoshop:`, or any bag another paint app is known to own. Put the block in the ORA’s XMP packet (the usual `data/` XMP sidecare or the package’s standard metadata location—one place, documented in code). The payload is the same information as `manifest.json`: JSON text inside the element is fine if it stays valid XML (CDATA or escaped); an equivalent element tree is fine too. Pick one shape and keep import/export symmetric.
+
+Binary pieces that `.pinta` stores as sibling files in the zip (layer mask PNGs when they are not expressible in the ORA stack, history before/after patches, structure snapshots’ bitmaps) stay as extra files inside the ORA zip under a Pinta-owned path such as `data/pinta/…`, and the XMP `pinta:metadata` references those paths the same way today’s manifest references `masks/` and `history/`. Standard ORA layer PNGs remain the stack’s `src` files so a non-Pinta reader still composites the image. Do not duplicate a layer’s main pixels only for Pinta; point metadata at the ORA `data/` file when it is the same bitmap.
+
+### Round trip
+
+- **Export / Save as `.ora`:** Build a legal ORA stack from the current document, write `mergedimage.png`, write XMP with full `pinta:metadata`, write any `data/pinta/…` binaries the metadata needs. Undo history is included, same completeness as `.pinta`.
+- **Open `.ora`:** Read the stack into layers. If `pinta:metadata` is present and valid, apply groups, clip, tags, alpha lock, masks, selection, settings, and history from it (resolving paths inside the zip). If the XMP block is missing or stale relative to the stack (layer count or sizes disagree), trust the ORA stack for pixels and visibility/opacity/blend, and drop or rebuild only the Pinta-only state that no longer fits—never invent history. A file never touched by Pinta still opens as a layered document.
+- **`.pinta` stays.** ORA does not replace it. Same document can be saved either way. Behavior of masks, floats, and undo does not change with the container.
+
+### Checks
+
+Export a multi-layer document (mask, clip, group, blend, selection, several undo steps) to `.ora`, open it in Pinta, and get the same pixels, layer properties, selection, and undo stack as a `.pinta` round trip. Open that `.ora`’s stack in a way that proves `stack.xml` + layer PNGs + `mergedimage.png` are present and the mimetype is correct. Open an `.ora` that has no `pinta:metadata` and get a usable layered image. Existing `.pinta` and PNG/JPEG/BMP export tests stay green.
+
 ## Import GIMP, Krita, and MyPaint brushes
 
 Extend the existing brush upload so it also accepts GIMP, Krita, and MyPaint brush files, the same way it already accepts Procreate `.brush` / `.brushset` and Photoshop `.abr`. The upload control and the “imported into a category named after the file” behavior stay. No new toolbox button. No separate importer UI.
@@ -21,28 +57,42 @@ Extend the existing brush upload so it also accepts GIMP, Krita, and MyPaint bru
 | GIMP | `.vbr` | Vector / parametric brush (shape, spikes, hardness, aspect). No embedded pixmap. |
 | GIMP | `.gbp` | Brush pipe / archive of GIMP brushes (treat like a set). |
 | Krita | `.kpp` | Paintop preset (XML/gzip): tip image reference or embedded pattern, size, opacity, spacing, blend-ish options. |
-| MyPaint | `.myb` | JSON brush settings plus optional `_prev.png` tip preview. Dynamics use speed and pressure curves; map what we can onto the existing engine (size, opacity, spacing, scatter, hardness, tip image). Skip stylus-only axes. |
-| MyPaint | `.bundle` | Zip pack of `.myb` brushes, order files, and previews. |
+| Krita | `.bundle` | Resource bundle (zip). Not the same as a MyPaint bundle. Detect by contents: `mimetype` is `application/x-krita-resourcebundle` (or similar), plus `meta.xml` / `META-INF/manifest.xml`, and folders like `paintoppresets/` (`.kpp`) and `brushes/` (`.gbr`, `.gih`, tip PNGs). Import every `.kpp`, and resolve tip images from the bundle’s `brushes/` paths. Skip non-brush resources (patterns, workspaces, etc.). |
+| MyPaint | `.myb` | JSON brush settings plus optional `_prev.png` tip preview. Full dynamics (size, opaque, hardness, offsets, tracking noise, smudge, custom tip, speed/pressure curves, etc.). Import every setting the engine can host after the parity work below. |
+| MyPaint | `.bundle` | Zip pack of `.myb` brushes, `order.conf`, and preview PNGs. Detect by contents (`.myb` + `order.conf`), not by the `.bundle` extension alone—Krita also uses `.bundle`. Prefer `order.conf` so brushes land in the author’s order. |
 
-Samples live under `proc/` (gitignored): `pack01_cloud.gbr`, `pack01-leaf-anim2.gih`, `Ink_Pen_Texturized.kpp`, `Airbrush_Round.myb`, MyPaint `.bundle` packs, and `tone_v2.zip` (a zip of `.myb` files). Use those files when implementing and when writing the Playwright import check.
+Same extension, two formats: sniff the zip. Krita wins if `mimetype` / `paintoppresets/` / `meta.xml` say so. MyPaint wins if `.myb` files and `order.conf` are present. If somehow both appear, import both sets into the same category named after the file.
+
+Samples live under `proc/` (gitignored): `pack01_cloud.gbr`, `pack01-leaf-anim2.gih`, `Ink_Pen_Texturized.kpp`, `Airbrush_Round.myb`, Krita `.bundle` packs (`Raghukamath-Brush-Pack.bundle`, `Concept_&_Illustration_v1.2.bundle`, `Puplaroid's_Retro_Comic_Ink_Blotches_Brush.bundle` — all three are Krita, none are MyPaint), and `tone_v2.zip` (MyPaint set: `.myb` + `order.conf` in a plain zip, not a `.bundle`). There is no MyPaint `.bundle` sample in `proc/` yet; support the format by sniffing, and test MyPaint packs via `tone_v2.zip` and the loose `.myb`.
 
 ### Archives
 
-Any zip-like archive (`.zip`, `.bundle`, and plain zip files that are not MyPaint bundles) that contains one or more of the extensions above should import every matching brush inside it. Walk the archive recursively. Ignore unrelated files. A MyPaint `.bundle` is both a known format and an archive: prefer its order file when present so brushes land in the author’s order. A loose zip of `.myb` / `.gbr` / `.kpp` files (like `tone_v2.zip`) still works and names the category after the archive file.
+Any zip-like archive (`.zip`, `.bundle`) that contains one or more of the brush extensions above should import every matching brush inside it. Walk the archive recursively. Ignore unrelated files. Sniff Krita vs MyPaint `.bundle` as above; do not assume the extension. A loose zip of `.myb` / `.gbr` / `.kpp` files (like `tone_v2.zip`) still works and names the category after the archive file.
 
 Nested archives are enough for one level: a zip that contains a `.bundle` or another zip of brushes is opened; deeper nesting can stop there.
 
-### Mapping into Pinta
+### Brush engine parity (almost 100%)
 
-Each imported tip becomes a `BrushPreset` the engine already understands. Raster tips (`.gbr`, `.gih` frames, Krita tip images, MyPaint preview/tip PNGs) become `tipImage` presets. Parametric `.vbr` brushes become plain/hard round-style presets with the closest size, aspect, and hardness. Settings that have no home in the current engine (true pressure curves, tilt, GIMP pipe randomness beyond a single tip or a simple stamp list) are dropped or approximated; the brush must still stamp and look useful, not empty.
+Import is not a “best effort tip + opacity” pass. Grow the brush engine until a stroke from an imported GIMP, Krita, or MyPaint brush looks like the same brush in its home app on a mouse or finger—same tip, spacing, scatter, smudge/wetness, pipe/animation behavior, and dynamics. The bar is the same one used for Procreate: if a setting exists in the file and affects how the stroke looks under pointer input, the engine hosts it and the importer fills it. Do not round unknown fields down to “hard round” and call it done.
 
-A `.gih` with multiple cells becomes one preset that uses the first cell as the tip unless the engine already has a stamp/animation path worth wiring; do not invent a second brush system. Prefer one good tip over a half-working pipe.
+Still no stylus hardware. There is no pressure, tilt, or azimuth from a pen. Every axis those formats drive from pressure (or tilt, when the only sensible stand-in is stroke direction/speed) is driven from pointer speed and the stroke path we already have, using the same curve shapes and ranges the preset stores. A MyPaint pressure→size curve becomes a speed→size curve with the same knots. A Krita sensor that only exists for tilt is mapped to the closest pointer-derived input or left inert only when it truly cannot change a mouse stroke. Document those inert cases; they should be rare.
 
-Imported sets go into a category titled with the source filename (without extension), matching Procreate/ABR set import. Loose single files go into a category named from that file, or into the existing import category pattern already used for single `.brush` files—keep one rule and use it for all of these formats.
+Work the formats as a requirements list for the engine, not only for the parser:
+
+- **GIMP `.gbr` / `.vbr`:** Correct tip decode (grayscale vs RGBA, spacing), and parametric vector brushes (radius, spikes, hardness, aspect, angle) as first-class tip generation—not a flattened approximation that loses spikes.
+- **GIMP `.gih` / `.gbp`:** Real pipe / animated tips: multiple cells, selection modes (incremental, angular, random, pressure/speed, etc.), and dimensional ranks. The engine stamps the cell the pipe would pick for that dab. One preset, full pipe—not “first cell only.”
+- **Krita `.kpp`:** Paintop options that change the dab: tip mask, size, opacity, flow, spacing, rotation, scatter, wipe/smudge, overlay mode, soft / Gaussian tips, textured tips, and sensor curves for those channels. Resolve tip and texture images from the bundle. Smudge and wetness must actually pick up canvas color the way Krita’s brush does, within the existing speed-based input model.
+- **MyPaint `.myb`:** The settings that define MyPaint’s feel—opaque, hardness, radius, tracking noise, offset-by-speed/random, smudge, custom tip, dabs per second / dabs per radius, elliptical dabs, color jitter / HSL changes, eraser and lock-alpha style flags—each need an engine knob (or a faithful composition of existing ones). Input mappings use speed in place of pressure; curve points import verbatim.
+
+Edit UI: new engine knobs that a person would tweak after import appear in the existing brush Edit panel under disclosures, closed by default, same pattern as the Procreate-oriented controls. Factory defaults stay undeletable and unchanged in look.
+
+Category naming stays as today: imported sets go into a category titled with the source filename (without extension). Loose single files follow the same rule already used for single `.brush` imports—one rule for every format.
 
 ### Checks
 
-Import each sample format from `proc/` through the existing brush upload control. A `.gbr`, a `.gih`, a `.kpp`, a `.myb`, a `.bundle`, and a zip that only contains `.myb` files each produce selectable brushes that paint. Default brushes remain undeletable. Existing Procreate and ABR import stays green.
+Import each sample format from `proc/` through the existing brush upload control. A `.gbr`, a `.gih`, a `.kpp`, a `.myb`, a Krita `.bundle`, and `tone_v2.zip` each produce selectable brushes that paint. A Krita bundle must pull tips from its `brushes/` folder when a `.kpp` references them. MyPaint `.bundle` support is still required (sniff `.myb` + `order.conf`); when no such file is in `proc/`, `tone_v2.zip` covers the pack path.
+
+Accuracy: for representative brushes from each family (at least one GIMP pipe `.gih`, one Krita smudge or textured `.kpp` from a bundle, one MyPaint smudge/inky `.myb` from `tone_v2.zip`), a long stroke on a known ground should match a reference stroke from the source app closely enough that tip shape, spacing, smudge pickup, and opacity build read as the same brush—not merely “a soft stamp.” Where a feature is pointer-impossible (true tilt), note it; everything else is in scope. Default brushes remain undeletable. Existing Procreate and ABR import stays green.
 
 # Big goals
 
