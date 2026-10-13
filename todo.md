@@ -6,7 +6,109 @@ The main goal is that Pinta is easy to learn, and powerful when you go looking. 
 
 Nothing in this file adds a toolbox icon. The toolbox stays the tools it has. A new control goes in the tool options, a menu that already exists, or a disclosure that starts closed. Input is a mouse, a touchpad, or a finger. There is no stylus pressure, tilt, or azimuth. Speed means how fast that pointer moves.
 
+## Done
+
+### Archive brush packs (zip, tar, tar.gz)
+
+Brush upload accepts archives (`.zip`, `.tar`, `.tar.gz` / `.tgz`, sniffed by magic). Nested **sets** (`.brushset`, `.abr`) each become a category named after that set file; **loose** individual brushes (`.brush`) share a category named after the archive, so the pack itself works as a set. Nested archives open one level deep. Native Procreate `.brush` / `.brushset` zips (Brush.archive, no nested set files) still import as one category named after the file. Code: `web/src/editor/brushimport.ts` (`BrushImportBatch`, archive walk), `#brush-import-file` accept list and batch categories in `brushes.ts`. Later GIMP/Krita/MyPaint extensions plug into the same walker.
+
 # Plans
+
+## Remove `#status-note`
+
+Delete the contextual hint line in the status bar (`#status-note` in `web/index.html`, `#status-note` styling in `web/src/style.css`, `statusNote()` and every call that writes into it in `web/src/editor/app.ts`). The footer keeps selection, cursor, dimensions, view angle, and zoom—nothing else in that slot.
+
+Where the `<span id="status-note">` element was removed, leave an HTML comment in its place:
+
+```html
+<!-- Do not add a second status-line or “help” span here. Context hints belong in tool options, disclosures, or one-time toasts—not persistent status-bar notes. -->
+```
+
+Same rule in code: do not reintroduce `statusNote`, `#status-note`, or equivalent “status note” copy anywhere in the UI.
+
+Update Playwright tests that assert `#status-note` text (`Fills the soft edge.`, `Painting the mask`, `Parallel lines`, lag copy, etc.): drop those expectations or cover the behavior without a status note. The intro at the top of this file also shouldn't apply anymore name non-obvious gestures in the status bar even if there is a dedicated, permanent control for them (e.g. zoom / view angle), not a rotating hint string either.
+
+### Checks
+
+All tests pass with no `#status-note` in the DOM and no references in source except the comment above.
+
+## Lightweight live stroke + finalize render (View: Live Stroke Render)
+
+While a paint stroke is in progress, use a **cheap live path** so pointer moves stay responsive and grain/jitter/wet mix do not “swim” every replay. On pointer up, run **one full-quality pass** (seeded dynamics, wet mix/carry, grain, multi-stamp, taper, Unserrate catch-up) from the stroke `before` snapshot onto the layer, then checkpoint as today.
+
+**Default:** lightweight live. **Optional:** View → **Live Stroke Render** (menu id e.g. `live-stroke-render`) turns on full `paintPresetStroke` (or equivalent) on every move—the old behavior for users who want WYSIWYG while drawing. Persist the toggle in layout/config like other view flags; default off.
+
+### Taper (fix long-stroke vanishing)
+
+Taper zones must not grow without bound as stroke length grows. For taper in and taper out separately, use the same preset percentage for two meanings:
+
+- **Stroke-based zone:** `length × (taperIn / 100)` (or taper out on the tail).
+- **Brush-size cap:** `size × (taperIn / 100)` — same slider value as the stroke percentage by default.
+- **Applied zone:** `min(stroke-based zone, brush-size cap)`.
+
+Keep a small **floor** on dab scale/flow so taper thins but does not erase committed ink. Keep `ignoreTaper` (or equivalent) for negligible total length. Apply finalized taper on the finalize pass; live path may omit taper or use only a cheap tail hint—finalize is authoritative.
+
+Primary code: `web/src/editor/brushes.ts` (`paintPresetStroke`, taper math in dab loop), `web/src/editor/tools.ts` (`replayCurve`, pointer down/up), `web/src/editor/layout.ts` / `app.ts` (View menu item + binding).
+
+### Live vs finalize split
+
+**During pointer down (lightweight default):**
+
+- Append samples; run cheap path smoothing/lag on points if Unserrate is on (no full-layer rewind every move unless Live Stroke Render is on).
+- Draw incrementally: simple stamps along new segments (spacing from preset), or one lightweight overlay—**no** full `putImageData(before)` + full-path `paintPresetStroke` per move.
+- Skip or stub expensive work: unseeded per-move `Math.random()` replay, full wet-mix/carry canvas sampling, multi-stamp scatter replays, full-canvas resample of the entire stroke, settle morph during the stroke.
+
+**On pointer up (always):**
+
+- Restore layer from `before`, build final sample list (`planStroke` with `catchUp: true`), run **one** seeded full `paintPresetStroke` (stroke seed at pointer down so replays are stable if finalize runs twice).
+- Remove any live-only overlay/scratch; `renderSceneNow()` / checkpoint / `rememberStroke` as today.
+
+**When Live Stroke Render is enabled:** pointer moves use the full pipeline (current behavior), for users who accept cost and shimmer risk.
+
+Live stroke may look different from the final stroke; that is acceptable. Status-bar lag hint goes away with `#status-note`; lag behavior unchanged.
+
+### Must not change
+
+Undo one step per stroke. No new toolbox icon. Factory presets on short strokes should match prior behavior within tolerance after finalize. Eraser/smudge/pen paths follow the same live/finalize split where they use `paintPresetStroke`.
+
+### Checks
+
+All existing Playwright tests pass (adjust any that assumed full-quality mid-stroke pixels).
+
+New or updated tests:
+
+1. **Taper cap:** Synthetic long sample path with non-zero taper in; assert early dab opacity/size does not collapse when total length increases (unit test on taper helper or golden dab count).
+2. **Finalize:** After pointer up, layer matches full render for a preset with grain/scatter (seeded finalize vs lightweight live mid-stroke differ).
+3. **View toggle:** Menu item toggles live full render; default off; preference persists across reload if other view flags do.
+
+## Heavily dynamic brush performance
+
+Painting with complex presets (high stamp count, scatter, wet mix / smudge pickup, luminance or color jitter, large tips, imported Procreate/ABR dynamics) must stay responsive on fast strokes. Today it can feel badly laggy even on a strong desktop; on school Chromebooks it must remain usable.
+
+Reference recording: [`2026-10-12 21-32-26.mp4`](2026-10-12%2021-32-26.mp4) (project root)—fast stroke with a heavily dynamic brush showing input falling behind and the stroke catching up in chunks.
+
+Primary code: `web/src/editor/brushes.ts` (`paintPresetStroke`, settle / lag / `redrawSettled`, `walk`, dab stamping, wet-mix sampling), `web/src/editor/tools.ts` (pointer move → stroke), and interaction with `renderScene()` batching in `document.ts`. Profile before guessing: main-thread cost is likely full-layer `getImageData` / `putImageData`, per-move full-canvas work, excessive dabs per segment, and settle passes replaying long strokes—not “the PC is slow.”
+
+### Goals
+
+- **Input latency:** While the pointer is down, the visible dab trail should track the finger or cursor within one frame under normal load on a mid Chromebook (define a target document size, e.g. 1280×720, one layer). No multi-second catch-up after a short flick.
+- **Same look when possible:** Optimizations may reduce work (dirty rects for brush writes, reuse scratch buffers, sample wet mix from a downscaled or regional buffer, cap dabs per move with interpolation from the fast-stroke plan, defer non-critical preview). Do not silently flatten dynamics into a cheap stamp unless a preset is broken beyond repair.
+- **Settle / lag:** Unserrate lag and catch-up may still run after pointer up, but must not block move handling. Settle replay should not re-stamp the entire stroke from scratch on every frame if a cheaper incremental path exists.
+- **Rendering:** Keep batched `renderScene()` during moves; avoid synchronous full recomposites or autosave encodes competing with stroke handlers (incremental autosave plan helps; this plan focuses on the brush path itself).
+
+### Must not change
+
+Default factory brushes on typical short strokes. Undo one step per stroke. No new toolbox icon. Removing `#status-note` is a separate plan above.
+
+### Checks
+
+All existing Playwright tests pass.
+
+New tests / benchmarks:
+
+1. **Synthetic fast stroke:** On a 1280×720 canvas, select a known heavy preset from `proc/` (e.g. luminance or wet Procreate set), simulate a rapid drag with many pointer events; assert wall-clock time from pointer down to last visible dab update stays under a generous but fixed budget (tune in CI so Chromebook-class hardware passes in headless Chromium).
+2. **No full-canvas read per move (instrumentation):** Hook or spy `getImageData(0, 0, width, height)` on the active layer during one move event of a heavy brush; count must be 0 or bounded (wet mix may use a small region, not the whole layer every time).
+3. **Regression:** Light preset + slow stroke unchanged within tolerance; luminance / airbrush tests still green.
 
 ## Incremental, non-blocking autosave
 
@@ -104,6 +206,40 @@ New tests:
 4. **Cleanup:** Delete a layer and close a document; confirm their `layers` keys are removed.
 5. **No stale overwrite:** Fire rapid successive edits so multiple saves are scheduled; after the queue settles, the restored (or read-back) pixels match the **latest** edit, not an older in-flight encode.
 
+## Fast-stroke dab interpolation
+
+When the pointer or finger moves very quickly, some brushes—especially non-default presets with wide spacing, large tips, or image stamps—leave a visible **string of separate circles** instead of a solid stroke. Smoothing and Unserrate round the path; they do not guarantee enough dabs along that path. The failure mode is under-sampling between move events: one stamp per pointer sample with spacing that assumes slow motion.
+
+Example (red brush, fast flick): [`stroke-stamp-gaps-example.png`](stroke-stamp-gaps-example.png) at the project root.
+
+### Goal
+
+Add **dab interpolation** in the brush engine that runs **in addition to** smoothing / Unserrate, not instead of them. For each segment between consecutive stroke samples (time- or distance-based), place enough stamps—or equivalent coverage—so the stroke reads as **continuous** at any speed. A slow stroke should look the same as today. A very fast stroke must not show isolated beads along the centerline.
+
+This applies wherever dabs are stamped: custom image tips, round/soft tips, smudge, and imported presets (Procreate, ABR, and later GIMP/Krita/MyPaint). Pencil size-1 pixel-perfect mode can stay as-is if it already fills gaps; do not regress it.
+
+### Behavior
+
+- **Spacing is the contract.** Respect each preset’s spacing (and scatter, jitter, rotation) when choosing intermediate dab positions. Interpolation fills the gap between samples; it does not replace spacing logic or double-stamp on slow moves.
+- **Distance-based stepping.** Walk the segment from `last` to `current` in steps no larger than `spacing × dabDiameter` (or the same rule the engine already uses for `walk()` / stamp loops). At high velocity, insert more steps; at low velocity, add zero or one step so behavior matches current output.
+- **Same dab pipeline.** Intermediate points call the same `stampDab` / engine stamp path as the endpoints (color, flow, erase, mirror, alpha lock, wet mix). No second “line draw” that ignores brush shape unless the preset is explicitly a single-pixel hard line.
+- **Engine and preset strokes.** Wire through `web/src/editor/brushes.ts` (`paintPresetStroke`, `walk`, spacing) and any tool path that stamps without walking (`tools.ts` brush/eraser/pen). WASM pencil/engine strokes that already interpolate along segments should use the same spacing cap.
+- **Independent of smoothing.** Smoothing changes *where* the path goes; interpolation changes *how many* dabs land along each segment. Both can be on. Turning smoothing off must still leave a gap-free stroke when the user moves fast.
+
+### Must not change
+
+Default factory brushes should look the same on typical strokes. Undo still one step per stroke. No new toolbox icon; no new slider unless a hidden debug toggle is needed during development (ship without a user-facing control if spacing math alone fixes the issue).
+
+### Checks
+
+All existing Playwright tests pass, including “rounds a fast brush stroke” and Procreate/luminance/airbrush tests.
+
+New tests:
+
+1. **Fast imported preset:** Use a wide, spaced image brush (e.g. from `proc/`), drag across the canvas in one quick motion (Playwright: high step count or injected points). Sample pixels along the stroke centerline; alpha must stay above a threshold for most of the path (no long runs of background between beads). Compare to a slow stroke on the same line—coverage along the path should be comparable, not a dotted line.
+2. **Smoothing off:** Repeat with smoothing at 0% and Unserrate off; fast stroke still continuous.
+3. **Regression:** Slow, short stroke on a default brush unchanged pixel-for-pixel within tolerance (or same alpha profile as before).
+
 ## OpenRaster (.ora) import and export
 
 Add OpenRaster as a first-class document format next to `.pinta` and the existing image exports. Open and Save / Save As / Export can use `.ora`. Give File Access works on an `.ora` handle the same way it works on a `.pinta` handle. No new toolbox icon. The File menu and the export format list gain OpenRaster; that is the only UI.
@@ -163,9 +299,7 @@ Samples live under `proc/` (gitignored): `pack01_cloud.gbr`, `pack01-leaf-anim2.
 
 ### Archives
 
-Any zip-like archive (`.zip`, `.bundle`) that contains one or more of the brush extensions above should import every matching brush inside it. Walk the archive recursively. Ignore unrelated files. Sniff Krita vs MyPaint `.bundle` as above; do not assume the extension. A loose zip of `.myb` / `.gbr` / `.kpp` files (like `tone_v2.zip`) still works and names the category after the archive file.
-
-Nested archives are enough for one level: a zip that contains a `.bundle` or another zip of brushes is opened; deeper nesting can stop there.
+Generic archive walking is done (see **Done → Archive brush packs**). Plug new extensions into that walker: treat `.bundle` (sniffed) and `.gbp` as sets; treat `.gbr`, `.gih`, `.vbr`, `.kpp`, `.myb` as loose singles. A loose zip of `.myb` / `.gbr` / `.kpp` (like `tone_v2.zip`) then names the category after the archive file automatically.
 
 ### Brush engine parity (almost 100%)
 

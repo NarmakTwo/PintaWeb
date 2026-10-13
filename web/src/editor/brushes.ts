@@ -1700,7 +1700,7 @@ export function mountBrushes(editor: Editor): void {
     <div id="brush-list"></div>
     <div id="brush-edit" hidden></div>
     <input id="brush-file" type="file" accept="image/*" hidden />
-    <input id="brush-import-file" type="file" accept=".brush,.brushset,.abr" multiple hidden />
+    <input id="brush-import-file" type="file" accept=".brush,.brushset,.abr,.zip,.tar,.tgz,.gz,application/zip,application/x-tar,application/gzip" multiple hidden />
   `;
   document.body.append(panel);
   const file = panel.querySelector<HTMLInputElement>('#brush-file');
@@ -1867,21 +1867,23 @@ export function mountBrushes(editor: Editor): void {
       let failed = false;
       for (const file of chosen) {
         try {
-          const loaded = await readBrushFile(file);
-          if (!loaded.length) continue;
-          const title = file.name.replace(/\.(brushset|brush|abr)$/i, '').trim() || file.name;
-          const groups = new Map<BrushTab, string>();
-          for (const item of loaded) {
-            let id = groups.get(item.tab);
-            if (!id) {
-              id = `category-${Date.now()}-${categories.length}-${groups.size}`;
-              categories.push({ id, name: title, tab: item.tab, openByDefault: false });
-              categoryOpen[id] = true;
-              groups.set(item.tab, id);
+          const batches = await readBrushFile(file);
+          if (!batches.length) continue;
+          for (const batch of batches) {
+            if (!batch.presets.length) continue;
+            const groups = new Map<BrushTab, string>();
+            for (const item of batch.presets) {
+              let id = groups.get(item.tab);
+              if (!id) {
+                id = `category-${Date.now()}-${categories.length}-${groups.size}`;
+                categories.push({ id, name: batch.title, tab: item.tab, openByDefault: false });
+                categoryOpen[id] = true;
+                groups.set(item.tab, id);
+              }
+              item.category = id;
             }
-            item.category = id;
+            items.push(...batch.presets);
           }
-          items.push(...loaded);
         } catch {
           failed = true;
         }

@@ -1,10 +1,62 @@
 import { expect, test, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const RED_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64',
 );
+
+function crc32(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (~crc) >>> 0;
+}
+
+function storeZip(entries: { name: string; data: Uint8Array }[]): Buffer {
+  const encoder = new TextEncoder();
+  const locals: Uint8Array[] = [];
+  const centrals: Uint8Array[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const name = encoder.encode(entry.name);
+    const crc = crc32(entry.data);
+    const local = new DataView(new ArrayBuffer(30 + name.length));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(8, 0, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, entry.data.length, true);
+    local.setUint32(22, entry.data.length, true);
+    local.setUint16(26, name.length, true);
+    new Uint8Array(local.buffer).set(name, 30);
+    locals.push(new Uint8Array(local.buffer), entry.data);
+    const central = new DataView(new ArrayBuffer(46 + name.length));
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(4, 20, true);
+    central.setUint16(6, 20, true);
+    central.setUint16(10, 0, true);
+    central.setUint32(16, crc, true);
+    central.setUint32(20, entry.data.length, true);
+    central.setUint32(24, entry.data.length, true);
+    central.setUint16(28, name.length, true);
+    central.setUint32(42, offset, true);
+    new Uint8Array(central.buffer).set(name, 46);
+    centrals.push(new Uint8Array(central.buffer));
+    offset += 30 + name.length + entry.data.length;
+  }
+  const centralSize = centrals.reduce((sum, part) => sum + part.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, entries.length, true);
+  end.setUint16(10, entries.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  return Buffer.concat([...locals, ...centrals, Buffer.from(end.buffer)]);
+}
 
 test.describe.configure({ mode: 'serial' });
 
@@ -2040,6 +2092,24 @@ test('imports Procreate brushes and a Photoshop brush set', async ({ page }) => 
   await page.locator('.brush-category-head', { hasText: /^Default HD Brushes$/ }).click();
   await page.locator('.brush-row[aria-pressed="true"] [data-preset-edit]').click();
   await expect(page.locator('#brush-tip')).toHaveValue('image');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#brush-panel')).toBeHidden();
+});
+
+test('imports a zip of brush sets and loose brushes', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  const root = resolve(process.cwd(), '../proc');
+  const pack = storeZip([
+    { name: 'Earth.brushset', data: new Uint8Array(readFileSync(resolve(root, 'Earth.brushset'))) },
+    { name: 'Hard Airbrush.brush', data: new Uint8Array(readFileSync(resolve(root, 'Hard Airbrush.brush'))) },
+  ]);
+  await page.locator('#brush-library').click();
+  await page.locator('#brush-import-file').setInputFiles({ name: 'Studio Pack.zip', mimeType: 'application/zip', buffer: pack });
+  const earth = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Earth$/ }) });
+  await expect(earth.locator('.brush-row', { hasText: 'Palm Husk' })).toHaveCount(1);
+  const studio = page.locator('.brush-category').filter({ has: page.locator('.brush-category-head', { hasText: /^Studio Pack$/ }) });
+  await expect(studio.locator('.brush-row', { hasText: 'Hard Airbrush' })).toHaveCount(1);
   await page.keyboard.press('Escape');
   await expect(page.locator('#brush-panel')).toBeHidden();
 });

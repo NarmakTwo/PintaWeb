@@ -4,26 +4,157 @@ import { warmImage, type BrushPreset, type BrushBlend, type GrainBlend, type Rot
 // Brush.archive is an NSKeyedArchiver binary plist. Shape and grain files use
 // the names stored in the archive, not a fixed Shape.png. Photoshop .abr here
 // is version 6: 8BIM samp holds the tip bitmaps, 8BIM desc holds the names.
+// Generic zip/tar/tar.gz packs may nest .brushset / .abr sets and loose .brush
+// files; sets keep their own category names, loose brushes share the pack name.
 
 type Uid = { uid: number };
 type Archive = Record<string, unknown>;
 
 const MAX_SIDE = 128;
+const SET_NAME = /\.(brushset|abr)$/i;
+const SINGLE_NAME = /\.brush$/i;
+const NESTED_ARCHIVE = /\.(zip|tar|tgz|tar\.gz|bundle)$/i;
+const STEM_EXT = /\.(brushset|brush|abr|zip|tar\.gz|tgz|tar|bundle)$/i;
 
-export async function readBrushFile(file: File): Promise<BrushPreset[]> {
+export interface BrushImportBatch {
+  title: string;
+  presets: BrushPreset[];
+}
+
+export async function readBrushFile(file: File): Promise<BrushImportBatch[]> {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const name = file.name.toLowerCase();
   try {
-    if (name.endsWith('.abr') || (bytes.length > 4 && !isZip(bytes) && bytes[1] === 6)) return await readAbr(bytes);
-    if (isZip(bytes)) return await readProcreate(bytes);
+    return await readBrushBytes(bytes, file.name, stemName(file.name), 0);
   } catch {
     return [];
   }
-  return [];
+}
+
+function stemName(name: string): string {
+  const base = name.split(/[/\\]/).pop() ?? name;
+  return base.replace(STEM_EXT, '').trim() || base;
+}
+
+function baseName(path: string): string {
+  return path.split('/').pop() ?? path;
+}
+
+async function readBrushBytes(bytes: Uint8Array, fileName: string, title: string, depth: number): Promise<BrushImportBatch[]> {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.abr') || (bytes.length > 4 && !isZip(bytes) && !isGzip(bytes) && !looksLikeTar(bytes) && bytes[1] === 6)) {
+    const presets = await readAbr(bytes);
+    return presets.length ? [{ title, presets }] : [];
+  }
+
+  const files = await unpackArchive(bytes);
+  if (!files) return [];
+
+  const sets: { name: string; data: Uint8Array }[] = [];
+  const singles: Uint8Array[] = [];
+  const nested: { name: string; data: Uint8Array }[] = [];
+  for (const [path, data] of files) {
+    const name = baseName(path);
+    const copy = data.slice();
+    if (SET_NAME.test(name)) sets.push({ name, data: copy });
+    else if (SINGLE_NAME.test(name)) singles.push(copy);
+    else if (depth < 1 && NESTED_ARCHIVE.test(name)) nested.push({ name, data: copy });
+  }
+
+  if (sets.length || singles.length || nested.length) {
+    const batches: BrushImportBatch[] = [];
+    const loose: BrushPreset[] = [];
+    for (const set of sets) {
+      batches.push(...await readBrushBytes(set.data, set.name, stemName(set.name), depth + 1));
+    }
+    for (const data of singles) {
+      try { loose.push(...await readProcreate(data)); } catch { /* skip a bad brush */ }
+    }
+    for (const pack of nested) {
+      batches.push(...await readBrushBytes(pack.data, pack.name, stemName(pack.name), depth + 1));
+    }
+    if (loose.length) batches.push({ title, presets: loose });
+    return batches.filter(batch => batch.presets.length);
+  }
+
+  const presets = await readProcreate(bytes);
+  return presets.length ? [{ title, presets }] : [];
 }
 
 function isZip(bytes: Uint8Array): boolean {
   return bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+}
+
+function isGzip(bytes: Uint8Array): boolean {
+  return bytes.length > 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
+
+function looksLikeTar(bytes: Uint8Array): boolean {
+  if (bytes.length < 512) return false;
+  const magic = String.fromCharCode(...bytes.subarray(257, 262));
+  return magic === 'ustar' || tarSize(bytes, 0) >= 0;
+}
+
+async function unpackArchive(bytes: Uint8Array): Promise<Map<string, Uint8Array> | null> {
+  if (isZip(bytes)) return unzip(bytes);
+  if (isGzip(bytes)) {
+    const raw = await gunzip(bytes);
+    if (isZip(raw)) return unzip(raw);
+    if (looksLikeTar(raw)) return untar(raw);
+    return null;
+  }
+  if (looksLikeTar(bytes)) return untar(bytes);
+  return null;
+}
+
+async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function tarSize(bytes: Uint8Array, offset: number): number {
+  if (offset + 512 > bytes.length) return -1;
+  let size = 0;
+  for (let index = 0; index < 11; index++) {
+    const code = bytes[offset + 124 + index];
+    if (code === 0) break;
+    if (code === 32) continue;
+    if (code < 0x30 || code > 0x37) return -1;
+    size = size * 8 + (code - 0x30);
+  }
+  return size;
+}
+
+function untar(bytes: Uint8Array): Map<string, Uint8Array> {
+  const files = new Map<string, Uint8Array>();
+  let offset = 0;
+  while (offset + 512 <= bytes.length) {
+    if (bytes.subarray(offset, offset + 512).every(byte => byte === 0)) break;
+    const size = tarSize(bytes, offset);
+    if (size < 0) break;
+    let name = '';
+    for (let index = 0; index < 100; index++) {
+      const code = bytes[offset + index];
+      if (!code) break;
+      name += String.fromCharCode(code);
+    }
+    const prefix = bytes[offset + 345] ? (() => {
+      let text = '';
+      for (let index = 0; index < 155; index++) {
+        const code = bytes[offset + 345 + index];
+        if (!code) break;
+        text += String.fromCharCode(code);
+      }
+      return text;
+    })() : '';
+    const path = prefix ? `${prefix}/${name}` : name;
+    const type = bytes[offset + 156];
+    const start = offset + 512;
+    const end = start + size;
+    offset = start + Math.ceil(size / 512) * 512;
+    if (!path || path.endsWith('/') || path.startsWith('__MACOSX/') || (type !== 0 && type !== 48 /* '0' */)) continue;
+    if (end <= bytes.length) files.set(path, bytes.subarray(start, end));
+  }
+  return files;
 }
 
 async function unzip(bytes: Uint8Array): Promise<Map<string, Uint8Array>> {
