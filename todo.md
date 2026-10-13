@@ -6,6 +6,44 @@ The main goal is that Pinta is easy to learn, and powerful when you go looking. 
 
 Nothing in this file adds a toolbox icon. The toolbox stays the tools it has. A new control goes in the tool options, a menu that already exists, or a disclosure that starts closed. Input is a mouse, a touchpad, or a finger. There is no stylus pressure, tilt, or azimuth. Speed means how fast that pointer moves.
 
+# Plans
+
+## Import GIMP, Krita, and MyPaint brushes
+
+Extend the existing brush upload so it also accepts GIMP, Krita, and MyPaint brush files, the same way it already accepts Procreate `.brush` / `.brushset` and Photoshop `.abr`. The upload control and the “imported into a category named after the file” behavior stay. No new toolbox button. No separate importer UI.
+
+### Formats
+
+| App | Extension | What it is |
+| --- | --- | --- |
+| GIMP | `.gbr` | Raster brush tip (header + grayscale or RGBA pixmap). |
+| GIMP | `.gih` | Animated / pipe brush: several tips in one file, with spacing and dimension metadata. |
+| GIMP | `.vbr` | Vector / parametric brush (shape, spikes, hardness, aspect). No embedded pixmap. |
+| GIMP | `.gbp` | Brush pipe / archive of GIMP brushes (treat like a set). |
+| Krita | `.kpp` | Paintop preset (XML/gzip): tip image reference or embedded pattern, size, opacity, spacing, blend-ish options. |
+| MyPaint | `.myb` | JSON brush settings plus optional `_prev.png` tip preview. Dynamics use speed and pressure curves; map what we can onto the existing engine (size, opacity, spacing, scatter, hardness, tip image). Skip stylus-only axes. |
+| MyPaint | `.bundle` | Zip pack of `.myb` brushes, order files, and previews. |
+
+Samples live under `proc/` (gitignored): `pack01_cloud.gbr`, `pack01-leaf-anim2.gih`, `Ink_Pen_Texturized.kpp`, `Airbrush_Round.myb`, MyPaint `.bundle` packs, and `tone_v2.zip` (a zip of `.myb` files). Use those files when implementing and when writing the Playwright import check.
+
+### Archives
+
+Any zip-like archive (`.zip`, `.bundle`, and plain zip files that are not MyPaint bundles) that contains one or more of the extensions above should import every matching brush inside it. Walk the archive recursively. Ignore unrelated files. A MyPaint `.bundle` is both a known format and an archive: prefer its order file when present so brushes land in the author’s order. A loose zip of `.myb` / `.gbr` / `.kpp` files (like `tone_v2.zip`) still works and names the category after the archive file.
+
+Nested archives are enough for one level: a zip that contains a `.bundle` or another zip of brushes is opened; deeper nesting can stop there.
+
+### Mapping into Pinta
+
+Each imported tip becomes a `BrushPreset` the engine already understands. Raster tips (`.gbr`, `.gih` frames, Krita tip images, MyPaint preview/tip PNGs) become `tipImage` presets. Parametric `.vbr` brushes become plain/hard round-style presets with the closest size, aspect, and hardness. Settings that have no home in the current engine (true pressure curves, tilt, GIMP pipe randomness beyond a single tip or a simple stamp list) are dropped or approximated; the brush must still stamp and look useful, not empty.
+
+A `.gih` with multiple cells becomes one preset that uses the first cell as the tip unless the engine already has a stamp/animation path worth wiring; do not invent a second brush system. Prefer one good tip over a half-working pipe.
+
+Imported sets go into a category titled with the source filename (without extension), matching Procreate/ABR set import. Loose single files go into a category named from that file, or into the existing import category pattern already used for single `.brush` files—keep one rule and use it for all of these formats.
+
+### Checks
+
+Import each sample format from `proc/` through the existing brush upload control. A `.gbr`, a `.gih`, a `.kpp`, a `.myb`, a `.bundle`, and a zip that only contains `.myb` files each produce selectable brushes that paint. Default brushes remain undeletable. Existing Procreate and ABR import stays green.
+
 # Big goals
 
 ## Animation

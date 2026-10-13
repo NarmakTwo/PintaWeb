@@ -220,6 +220,120 @@ function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   return ctx;
 }
 
+function drawContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Could not create a drawing surface.');
+  return ctx;
+}
+
+const CACHE_BUDGET = 256 * 1024 * 1024;
+
+function unionRect(a: Rect, b: Rect): Rect {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  const right = Math.max(a.x + a.w, b.x + b.w);
+  const bottom = Math.max(a.y + a.h, b.y + b.h);
+  return { x, y, w: right - x, h: bottom - y };
+}
+
+function scaleRound(alpha: number, cover: number): number {
+  return Math.round(alpha * cover / 255);
+}
+
+function probeDestinationIn(): boolean {
+  const scratch = document.createElement('canvas');
+  scratch.width = 1;
+  scratch.height = 1;
+  const ctx = scratch.getContext('2d');
+  const source = document.createElement('canvas');
+  source.width = 1;
+  source.height = 1;
+  const sourceCtx = source.getContext('2d', { willReadFrequently: true });
+  const cover = document.createElement('canvas');
+  cover.width = 1;
+  cover.height = 1;
+  const coverCtx = cover.getContext('2d');
+  if (!ctx || !sourceCtx || !coverCtx) return false;
+  const alphas = [255, 200, 128, 10];
+  const covers = [255, 128, 64, 1];
+  const observed: number[] = [];
+  const pixel = sourceCtx.createImageData(1, 1);
+  const mask = coverCtx.createImageData(1, 1);
+  mask.data[0] = 255;
+  mask.data[1] = 255;
+  mask.data[2] = 255;
+  for (let index = 0; index < alphas.length; index++) {
+    pixel.data[0] = 255;
+    pixel.data[1] = 0;
+    pixel.data[2] = 0;
+    pixel.data[3] = alphas[index];
+    sourceCtx.putImageData(pixel, 0, 0);
+    mask.data[3] = covers[index];
+    coverCtx.putImageData(mask, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.drawImage(source, 0, 0);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(cover, 0, 0);
+    observed.push(ctx.getImageData(0, 0, 1, 1).data[3]);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  const unchanged = observed.every((value, index) => value === alphas[index]);
+  const cleared = observed.every(value => value === 0);
+  return !unchanged && !cleared;
+}
+
+function maskTables(): { rgb: Uint8Array; alpha: Uint8Array } | null {
+  const size = 256;
+  const scratch = document.createElement('canvas');
+  scratch.width = size;
+  scratch.height = size;
+  const ctx = scratch.getContext('2d');
+  const source = document.createElement('canvas');
+  source.width = size;
+  source.height = size;
+  const sourceCtx = source.getContext('2d', { willReadFrequently: true });
+  const cover = document.createElement('canvas');
+  cover.width = size;
+  cover.height = size;
+  const coverCtx = cover.getContext('2d');
+  if (!ctx || !sourceCtx || !coverCtx) return null;
+  const coverImage = coverCtx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const offset = (y * size + x) * 4;
+      coverImage.data[offset] = 255;
+      coverImage.data[offset + 1] = 255;
+      coverImage.data[offset + 2] = 255;
+      coverImage.data[offset + 3] = y;
+    }
+  }
+  coverCtx.putImageData(coverImage, 0, 0);
+  const image = sourceCtx.createImageData(size, size);
+  const words = new Uint32Array(image.data.buffer);
+  const rgb = new Uint8Array(size * size * size);
+  const alpha = new Uint8Array(size * size);
+  for (let a = 0; a < size; a++) {
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) words[y * size + x] = x | (x << 8) | (x << 16) | (a << 24);
+    }
+    sourceCtx.putImageData(image, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(source, 0, 0);
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.drawImage(cover, 0, 0);
+    const out = ctx.getImageData(0, 0, size, size).data;
+    const plane = a * size * size;
+    for (let y = 0; y < size; y++) {
+      alpha[a * size + y] = out[(y * size) * 4 + 3];
+      for (let x = 0; x < size; x++) rgb[plane + y * size + x] = out[(y * size + x) * 4];
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  return { rgb, alpha };
+}
+
 function bytesToBase64(bytes: Uint8Array): string {
   let text = '';
   for (let index = 0; index < bytes.length; index += 0x8000) {
@@ -367,6 +481,34 @@ export class Editor {
     selectionBefore: Uint8Array | null;
     activeBefore: number;
   } | null = null;
+  private renderSerial = 0;
+  private renderToken = 0;
+  private stackRevision = 0;
+  private builtRevision = -1;
+  private builtDocId = '';
+  private builtActive = -1;
+  private builtWidth = 0;
+  private builtHeight = 0;
+  private aboveFlat = false;
+  private directStack = false;
+  private belowCache: HTMLCanvasElement | null = null;
+  private aboveCache: HTMLCanvasElement | null = null;
+  private maskScratch: HTMLCanvasElement | null = null;
+  private clipScratch: HTMLCanvasElement | null = null;
+  private floatScratch: HTMLCanvasElement | null = null;
+  private compositeFrame: HTMLCanvasElement | null = null;
+  private alphaScratch: HTMLCanvasElement | null = null;
+  private maskAlpha = new Map<HTMLCanvasElement, HTMLCanvasElement>();
+  private maskDirty = new WeakMap<HTMLCanvasElement, Rect | 'all'>();
+  private alphaList: HTMLCanvasElement[] = [];
+  private cpuMasked = new WeakMap<Layer, HTMLCanvasElement>();
+  private cpuList: HTMLCanvasElement[] = [];
+  private dropMasked = false;
+  private paintClip: Rect | null = null;
+  private destIn: { ok: boolean } | null = null;
+  private maskTable: { rgb: Uint8Array; alpha: Uint8Array } | null = null;
+  forceCpuMask = false;
+  partialPaints = 0;
 
   get doc(): Doc | null {
     return this.docs[this.index] ?? null;
@@ -497,6 +639,7 @@ export class Editor {
     const height = bottom - top;
     if (width < 1 || height < 1) return;
     const rect = { x: left, y: top, w: width, h: height };
+    if (target === 'mask' && layer.mask) this.noteMask(layer.mask, rect);
     if (!this.dirtyRect || this.dirtyRect.layerId !== layer.id || this.dirtyRect.target !== target) {
       this.dirtyRect = {
         layerId: layer.id,
@@ -717,6 +860,7 @@ export class Editor {
     const image = side === 'before' ? patch.before : patch.after;
     const ctx = layer ? this.surface(layer, patch.target) : null;
     if (ctx && image.width === patch.rect.w && image.height === patch.rect.h) ctx.putImageData(image, patch.rect.x, patch.rect.y);
+    if (layer?.mask && patch.target === 'mask') this.noteMask(layer.mask, patch.rect);
     doc.selection = copySelection(side === 'before' ? patch.selectionBefore : patch.selectionAfter);
     const active = side === 'before' ? patch.activeBefore : patch.activeAfter;
     if (active >= 0 && active < doc.layers.length) doc.active = active;
@@ -854,8 +998,9 @@ export class Editor {
   }
 
   private presentHistory(): void {
+    this.invalidateStack();
     this.rebuildEdges();
-    this.renderScene();
+    this.renderSceneNow();
     this.scheduleSave();
     this.notify();
   }
@@ -878,7 +1023,7 @@ export class Editor {
     else if (patch) entry = patch;
     else {
       this.rememberBase(doc);
-      this.renderScene();
+      this.renderSceneNow();
       this.notify();
       return;
     }
@@ -889,7 +1034,8 @@ export class Editor {
     doc.cursor++;
     this.rememberBase(doc);
     this.trimHistory(doc);
-    this.renderScene();
+    if (this.historyChangesStack(doc, entry)) this.invalidateStack();
+    this.renderSceneNow();
     this.scheduleSave();
     this.notify();
   }
@@ -997,14 +1143,14 @@ export class Editor {
     doc.cursor = 0;
     this.rebuildEdges();
     this.fit();
-    this.renderScene();
+    this.renderSceneNow();
     this.scheduleSave();
     this.notify();
   }
 
   newDocument(width: number, height: number, background: string, name = 'Untitled'): boolean {
     if (width < 1 || height < 1 || width * height > MAX_PIXELS) {
-      this.toast('Choose dimensions up to 8 megapixels.');
+      this.toast('Choose dimensions up to 12 megapixels.');
       return false;
     }
     const doc = this.blank(width, height, name);
@@ -1031,7 +1177,7 @@ export class Editor {
       }
       this.syncSize();
       this.rebuildEdges();
-      this.renderScene();
+      this.renderSceneNow();
       this.scheduleSave();
       this.notify();
       return;
@@ -1074,7 +1220,7 @@ export class Editor {
     if (leaving) void forgetFileHandle(leaving.id);
     this.syncSize();
     this.rebuildEdges();
-    this.renderScene();
+    this.renderSceneNow();
     this.scheduleSave();
     this.notify();
   }
@@ -1085,7 +1231,7 @@ export class Editor {
     this.index = index;
     this.syncSize();
     this.rebuildEdges();
-    this.renderScene();
+    this.renderSceneNow();
     this.notify();
   }
 
@@ -1097,7 +1243,7 @@ export class Editor {
     await clearSession();
     await clearFileHandles();
     this.syncSize();
-    this.renderScene();
+    this.renderSceneNow();
     this.onSave?.('Local session cleared');
     this.notify();
   }
@@ -1161,18 +1307,62 @@ export class Editor {
   }
 
   renderScene(): void {
+    if (!this.view || this.renderToken) return;
+    const token = ++this.renderSerial;
+    this.renderToken = token;
+    requestAnimationFrame(() => {
+      if (this.renderToken !== token) return;
+      this.renderToken = 0;
+      this.paintView();
+    });
+  }
+
+  renderSceneNow(): void {
+    this.renderSerial++;
+    this.renderToken = 0;
+    this.paintView();
+  }
+
+  invalidateStack(): void {
+    this.stackRevision++;
+    this.cpuMasked = new WeakMap();
+    this.cpuList = [];
+  }
+
+  private historyChangesStack(doc: Doc, entry: HistoryEntry): boolean {
+    if (entry.kind !== 'pixels') return true;
+    const active = doc.layers[doc.active];
+    return !active || entry.layerId !== active.id;
+  }
+
+  private paintView(): void {
+    this.ensureMaskMode();
     const doc = this.doc;
     if (!this.view) return;
-    const ctx = context2d(this.view);
-    ctx.clearRect(0, 0, this.view.width, this.view.height);
+    const ctx = drawContext(this.view);
     this.preview.getContext('2d')?.clearRect(0, 0, this.preview.width, this.preview.height);
     if (!doc) {
+      ctx.clearRect(0, 0, this.view.width, this.view.height);
       this.onScene?.();
       return;
     }
-    this.paintStack(ctx, true);
-    ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = 'source-over';
+    const reusable = this.splitReady(doc);
+    this.ensureSplit(doc);
+    const rect = reusable && !this.float ? this.paintBounds(doc) : null;
+    this.paintClip = null;
+    const target = rect ? this.sized(this.compositeFrame, doc.width, doc.height) : this.view;
+    if (rect) this.compositeFrame = target;
+    const paint = drawContext(target);
+    paint.save();
+    paint.globalAlpha = 1;
+    paint.globalCompositeOperation = 'source-over';
+    paint.clearRect(0, 0, doc.width, doc.height);
+    this.blitStack(paint, doc, this.splitReady(doc));
+    paint.restore();
+    if (rect && target !== this.view) {
+      this.partialPaints++;
+      ctx.putImageData(paint.getImageData(rect.x, rect.y, rect.w, rect.h), rect.x, rect.y);
+    }
     this.paintOverlay();
     this.onScene?.();
   }
@@ -1196,62 +1386,319 @@ export class Editor {
     return true;
   }
 
-  private paintStack(ctx: CanvasRenderingContext2D, includeFloat: boolean): void {
-    const doc = this.doc;
-    if (!doc) return;
-    for (let index = 0; index < doc.layers.length; index++) {
+  private splitReady(doc: Doc): boolean {
+    return !this.directStack
+      && !!this.belowCache
+      && this.builtRevision === this.stackRevision
+      && this.builtDocId === doc.id
+      && this.builtActive === doc.active
+      && this.builtWidth === doc.width
+      && this.builtHeight === doc.height;
+  }
+
+  private aboveCanCache(doc: Doc): boolean {
+    for (let index = doc.active + 1; index < doc.layers.length; index++) {
       const layer = doc.layers[index];
       if (!this.layerShown(layer)) continue;
-      const lower = index > 0 && this.layerShown(doc.layers[index - 1]) ? doc.layers[index - 1].canvas : null;
-      ctx.save();
-      ctx.globalAlpha = layer.opacity / 100;
-      ctx.globalCompositeOperation = COMPOSITE[layer.blend] ?? 'source-over';
-      let source = includeFloat && this.float && layer === this.layer ? this.floatCanvas(layer) : layer.canvas;
-      if (layer.mask) source = this.applyLayerMask(source, layer.mask);
-      if (layer.clip) source = this.masked(source, lower);
-      ctx.drawImage(source, 0, 0);
-      ctx.restore();
+      if ((COMPOSITE[layer.blend] ?? 'source-over') !== 'source-over' || layer.clip) return false;
     }
+    return true;
+  }
+
+  private paintBounds(doc: Doc): Rect | null {
+    const dirty = this.dirtyRect;
+    if (!dirty) return null;
+    const pad = Math.ceil(this.size) + 8;
+    const x = Math.max(0, dirty.rect.x - pad);
+    const y = Math.max(0, dirty.rect.y - pad);
+    const right = Math.min(doc.width, dirty.rect.x + dirty.rect.w + pad);
+    const bottom = Math.min(doc.height, dirty.rect.y + dirty.rect.h + pad);
+    const w = right - x;
+    const h = bottom - y;
+    if (w < 1 || h < 1 || w * h >= doc.width * doc.height) return null;
+    return { x, y, w, h };
+  }
+
+  private ensureSplit(doc: Doc): void {
+    if (this.splitReady(doc)) return;
+    const bytes = doc.width * doc.height * 4;
+    if (bytes * 2 > CACHE_BUDGET) {
+      this.directStack = true;
+      this.belowCache = null;
+      this.aboveCache = null;
+      return;
+    }
+    this.directStack = false;
+    this.belowCache = this.sized(this.belowCache, doc.width, doc.height);
+    this.aboveFlat = this.aboveCanCache(doc);
+    this.aboveCache = this.aboveFlat ? this.sized(this.aboveCache, doc.width, doc.height) : this.aboveCache;
+    const below = drawContext(this.belowCache);
+    below.globalCompositeOperation = 'source-over';
+    below.globalAlpha = 1;
+    below.clearRect(0, 0, doc.width, doc.height);
+    const previousClip = this.paintClip;
+    this.paintClip = null;
+    for (let index = 0; index < doc.active; index++) this.paintOne(below, index, false);
+    if (this.aboveFlat && this.aboveCache) {
+      const above = drawContext(this.aboveCache);
+      above.globalCompositeOperation = 'source-over';
+      above.globalAlpha = 1;
+      above.clearRect(0, 0, doc.width, doc.height);
+      for (let index = doc.active + 1; index < doc.layers.length; index++) this.paintOne(above, index, false);
+    }
+    this.paintClip = previousClip;
+    this.builtRevision = this.stackRevision;
+    this.builtDocId = doc.id;
+    this.builtActive = doc.active;
+    this.builtWidth = doc.width;
+    this.builtHeight = doc.height;
+    this.pruneAlphas(doc);
+    this.fitBudget(doc);
+  }
+
+  private pruneAlphas(doc: Doc): void {
+    const live = new Set<HTMLCanvasElement>();
+    for (const layer of doc.layers) if (layer.mask) live.add(layer.mask);
+    for (const mask of [...this.maskAlpha.keys()]) if (!live.has(mask)) this.maskAlpha.delete(mask);
+    this.alphaList = [...this.maskAlpha.values()];
+  }
+
+  private fitBudget(doc: Doc): void {
+    const bytes = doc.width * doc.height * 4;
+    const stack = bytes * (this.belowCache ? 1 : 0) + (this.aboveFlat && this.aboveCache ? bytes : 0);
+    const alphaBytes = this.alphaList.reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0);
+    const cpuBytes = this.cpuList.reduce((sum, canvas) => sum + canvas.width * canvas.height * 4, 0);
+    if (stack + alphaBytes + cpuBytes <= CACHE_BUDGET) {
+      this.dropMasked = false;
+      return;
+    }
+    this.dropMasked = true;
+    this.cpuMasked = new WeakMap();
+    this.cpuList = [];
+    if (stack + alphaBytes <= CACHE_BUDGET) return;
+    this.maskAlpha.clear();
+    this.alphaList = [];
+  }
+
+  private blitStack(ctx: CanvasRenderingContext2D, doc: Doc, split: boolean): void {
+    if (split && this.belowCache) {
+      this.blitImage(ctx, this.belowCache);
+      if (doc.layers[doc.active]) this.paintOne(ctx, doc.active, true);
+      if (this.aboveFlat && this.aboveCache) this.blitImage(ctx, this.aboveCache);
+      else for (let index = doc.active + 1; index < doc.layers.length; index++) this.paintOne(ctx, index, true);
+      return;
+    }
+    for (let index = 0; index < doc.layers.length; index++) this.paintOne(ctx, index, true);
+  }
+
+  private blitImage(ctx: CanvasRenderingContext2D, source: HTMLCanvasElement): void {
+    const area = this.paintClip;
+    if (!area) {
+      ctx.drawImage(source, 0, 0);
+      return;
+    }
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(source, area.x, area.y, area.w, area.h, area.x, area.y, area.w, area.h);
+  }
+
+  private paintOne(ctx: CanvasRenderingContext2D, index: number, includeFloat: boolean): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const layer = doc.layers[index];
+    if (!layer || !this.layerShown(layer)) return;
+    const lower = index > 0 && this.layerShown(doc.layers[index - 1]) ? doc.layers[index - 1].canvas : null;
+    ctx.save();
+    ctx.globalAlpha = layer.opacity / 100;
+    ctx.globalCompositeOperation = COMPOSITE[layer.blend] ?? 'source-over';
+    let source: HTMLCanvasElement = includeFloat && this.float && layer === this.layer ? this.floatCanvas(layer) : layer.canvas;
+    if (layer.mask) source = this.applyLayerMask(layer, source, layer.mask);
+    if (layer.clip) source = this.masked(source, lower);
+    this.blitImage(ctx, source);
+    ctx.restore();
+  }
+
+  private sized(canvas: HTMLCanvasElement | null, width: number, height: number): HTMLCanvasElement {
+    const next = canvas ?? document.createElement('canvas');
+    if (next.width !== width || next.height !== height) {
+      next.width = width;
+      next.height = height;
+    }
+    return next;
+  }
+
+  private noteMask(mask: HTMLCanvasElement, rect: Rect | 'all'): void {
+    const previous = this.maskDirty.get(mask);
+    if (!previous) {
+      this.maskDirty.set(mask, rect);
+      return;
+    }
+    if (previous === 'all' || rect === 'all') {
+      this.maskDirty.set(mask, 'all');
+      return;
+    }
+    this.maskDirty.set(mask, unionRect(previous, rect));
+  }
+
+  private cacheBytes(): number {
+    let total = 0;
+    if (this.belowCache && !this.directStack) total += this.belowCache.width * this.belowCache.height * 4;
+    if (this.aboveFlat && this.aboveCache) total += this.aboveCache.width * this.aboveCache.height * 4;
+    for (const canvas of this.alphaList) total += canvas.width * canvas.height * 4;
+    for (const canvas of this.cpuList) total += canvas.width * canvas.height * 4;
+    return total;
+  }
+
+  private ensureMaskMode(): void {
+    if (this.destIn) return;
+    this.destIn = { ok: probeDestinationIn() };
+  }
+
+  private maskOnCpu(): boolean {
+    return this.forceCpuMask || !this.destIn?.ok;
+  }
+
+  private syncMaskAlpha(mask: HTMLCanvasElement): HTMLCanvasElement {
+    let alpha = this.maskAlpha.get(mask) ?? null;
+    let area = this.maskDirty.get(mask) ?? null;
+    if (!alpha || alpha.width !== mask.width || alpha.height !== mask.height) {
+      const bytes = mask.width * mask.height * 4;
+      if (this.cacheBytes() + bytes > CACHE_BUDGET) {
+        this.dropMasked = true;
+        alpha = this.sized(this.alphaScratch, mask.width, mask.height);
+        this.alphaScratch = alpha;
+        area = 'all';
+      } else {
+        alpha = document.createElement('canvas');
+        alpha.width = mask.width;
+        alpha.height = mask.height;
+        this.maskAlpha.set(mask, alpha);
+        this.alphaList.push(alpha);
+        area = 'all';
+      }
+    }
+    if (area && alpha) this.writeMaskAlpha(mask, alpha, area);
+    this.maskDirty.delete(mask);
+    return alpha ?? mask;
+  }
+
+  private writeMaskAlpha(mask: HTMLCanvasElement, alpha: HTMLCanvasElement, area: Rect | 'all'): void {
+    const rect = area === 'all' ? { x: 0, y: 0, w: mask.width, h: mask.height } : area;
+    const x = Math.max(0, rect.x);
+    const y = Math.max(0, rect.y);
+    const w = Math.min(mask.width, rect.x + rect.w) - x;
+    const h = Math.min(mask.height, rect.y + rect.h) - y;
+    if (w < 1 || h < 1) return;
+    const maskCtx = mask.getContext('2d', { willReadFrequently: true });
+    if (!maskCtx) return;
+    const src = maskCtx.getImageData(x, y, w, h);
+    const image = new ImageData(w, h);
+    const from = src.data;
+    const to = image.data;
+    for (let index = 0; index < from.length; index += 4) {
+      to[index] = 255;
+      to[index + 1] = 255;
+      to[index + 2] = 255;
+      to[index + 3] = Math.round(0.2126 * from[index] + 0.7152 * from[index + 1] + 0.0722 * from[index + 2]);
+    }
+    drawContext(alpha).putImageData(image, x, y);
   }
 
   private floatCanvas(layer: Layer): HTMLCanvasElement {
-    const canvas = document.createElement('canvas');
-    canvas.width = layer.canvas.width;
-    canvas.height = layer.canvas.height;
-    const ctx = context2d(canvas);
+    const canvas = this.sized(this.floatScratch, layer.canvas.width, layer.canvas.height);
+    this.floatScratch = canvas;
+    const ctx = drawContext(canvas);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(layer.canvas, 0, 0);
     if (this.float?.frame) ctx.drawImage(this.float.frame, 0, 0);
     else if (this.float) ctx.drawImage(this.float.sprite, this.float.x, this.float.y);
     return canvas;
   }
 
-  private applyLayerMask(source: HTMLCanvasElement, mask: HTMLCanvasElement): HTMLCanvasElement {
-    const canvas = document.createElement('canvas');
-    canvas.width = source.width;
-    canvas.height = source.height;
-    const ctx = context2d(canvas);
-    ctx.drawImage(source, 0, 0);
-    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const maskCtx = mask.getContext('2d', { willReadFrequently: true });
-    if (!maskCtx) return canvas;
-    const maskData = maskCtx.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let index = 0; index < image.data.length; index += 4) {
-      const luminance = Math.round(0.2126 * maskData[index] + 0.7152 * maskData[index + 1] + 0.0722 * maskData[index + 2]);
-      image.data[index + 3] = Math.round(image.data[index + 3] * luminance / 255);
+  private applyLayerMask(layer: Layer, source: HTMLCanvasElement, mask: HTMLCanvasElement): HTMLCanvasElement {
+    const alpha = this.syncMaskAlpha(mask);
+    if (!this.maskOnCpu()) {
+      const canvas = this.sized(this.maskScratch, source.width, source.height);
+      this.maskScratch = canvas;
+      const ctx = drawContext(canvas);
+      ctx.save();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      const area = this.paintClip;
+      ctx.imageSmoothingEnabled = false;
+      if (area) ctx.clearRect(area.x, area.y, area.w, area.h);
+      else ctx.clearRect(0, 0, canvas.width, canvas.height);
+      this.blitImage(ctx, source);
+      ctx.globalCompositeOperation = 'destination-in';
+      this.blitImage(ctx, alpha);
+      ctx.restore();
+      return canvas;
     }
-    ctx.putImageData(image, 0, 0);
+    return this.cpuMask(layer, source, alpha);
+  }
+
+  private cpuMask(layer: Layer, source: HTMLCanvasElement, alpha: HTMLCanvasElement): HTMLCanvasElement {
+    const table = this.destIn?.ok ? this.maskTable ?? (this.maskTable = maskTables()) : null;
+    let canvas = this.dropMasked ? null : this.cpuMasked.get(layer) ?? null;
+    const fresh = !canvas || canvas.width !== source.width || canvas.height !== source.height;
+    if (!canvas || fresh) {
+      if (this.dropMasked || this.cacheBytes() + source.width * source.height * 4 > CACHE_BUDGET) {
+        this.dropMasked = true;
+        canvas = this.sized(this.maskScratch, source.width, source.height);
+        this.maskScratch = canvas;
+      } else {
+        canvas = document.createElement('canvas');
+        canvas.width = source.width;
+        canvas.height = source.height;
+        this.cpuMasked.set(layer, canvas);
+        this.cpuList.push(canvas);
+      }
+    }
+    const area = fresh || this.dropMasked ? null : this.paintClip;
+    const x = area ? area.x : 0;
+    const y = area ? area.y : 0;
+    const w = area ? area.w : source.width;
+    const h = area ? area.h : source.height;
+    const ctx = drawContext(canvas);
+    const image = context2d(source).getImageData(x, y, w, h);
+    const cover = context2d(alpha).getImageData(x, y, w, h).data;
+    for (let index = 0; index < image.data.length; index += 4) {
+      const luminance = cover[index + 3];
+      if (!table) {
+        image.data[index + 3] = scaleRound(image.data[index + 3], luminance);
+        continue;
+      }
+      const red = image.data[index];
+      const green = image.data[index + 1];
+      const blue = image.data[index + 2];
+      const alpha = image.data[index + 3];
+      const row = (alpha * 256 + luminance) * 256;
+      image.data[index] = table.rgb[row + red];
+      image.data[index + 1] = table.rgb[row + green];
+      image.data[index + 2] = table.rgb[row + blue];
+      image.data[index + 3] = table.alpha[alpha * 256 + luminance];
+    }
+    ctx.putImageData(image, x, y);
     return canvas;
   }
 
   private masked(source: HTMLCanvasElement, below: HTMLCanvasElement | null): HTMLCanvasElement {
-    const canvas = document.createElement('canvas');
-    canvas.width = source.width;
-    canvas.height = source.height;
-    if (!below) return canvas;
-    const ctx = context2d(canvas);
-    ctx.drawImage(source, 0, 0);
-    ctx.globalCompositeOperation = 'destination-in';
-    ctx.drawImage(below, 0, 0);
+    const canvas = this.sized(this.clipScratch, source.width, source.height);
+    this.clipScratch = canvas;
+    const ctx = drawContext(canvas);
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    const area = this.paintClip;
+    ctx.imageSmoothingEnabled = false;
+    if (area) ctx.clearRect(area.x, area.y, area.w, area.h);
+    else ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (below) {
+      this.blitImage(ctx, source);
+      ctx.globalCompositeOperation = 'destination-in';
+      this.blitImage(ctx, below);
+    }
+    ctx.restore();
     return canvas;
   }
 
@@ -1492,14 +1939,14 @@ export class Editor {
     if (doc.selection) this.engine.clip(copy, base, doc.selection);
     this.lockAlpha(copy, base);
     layer.ctx.putImageData(copy, 0, 0);
-    this.renderScene();
+    this.renderSceneNow();
   }
 
   cancelPreview(): void {
     const layer = this.layer;
     if (this.previewBase && layer) layer.ctx.putImageData(this.previewBase, 0, 0);
     this.previewBase = null;
-    this.renderScene();
+    this.renderSceneNow();
   }
 
   commitPreview(label: string): void {
@@ -1520,7 +1967,7 @@ export class Editor {
     this.float = null;
     this.discardWatch();
     this.rebuildEdges();
-    this.renderScene();
+    this.renderSceneNow();
   }
 
   feather(radius: number): void {
@@ -1696,7 +2143,7 @@ export class Editor {
   resize(width: number, height: number): void {
     const doc = this.doc;
     if (!doc || width < 1 || height < 1 || width * height > MAX_PIXELS) {
-      this.toast('Choose dimensions up to 8 megapixels.');
+      this.toast('Choose dimensions up to 12 megapixels.');
       return;
     }
     this.redrawAll(width, height, (ctx, source) => {
@@ -1709,7 +2156,7 @@ export class Editor {
   resizeCanvas(width: number, height: number, anchor: string): void {
     const doc = this.doc;
     if (!doc || width < 1 || height < 1 || width * height > MAX_PIXELS) {
-      this.toast('Choose dimensions up to 8 megapixels.');
+      this.toast('Choose dimensions up to 12 megapixels.');
       return;
     }
     const dx = anchor.includes('w') ? 0 : anchor.includes('e') ? width - doc.width : Math.round((width - doc.width) / 2);
@@ -1859,7 +2306,7 @@ export class Editor {
     lower.ctx.save();
     lower.ctx.globalAlpha = upper.opacity / 100;
     lower.ctx.globalCompositeOperation = COMPOSITE[upper.blend];
-    const upperSource = upper.mask ? this.applyLayerMask(upper.canvas, upper.mask) : upper.canvas;
+    const upperSource = upper.mask ? this.applyLayerMask(upper, upper.canvas, upper.mask) : upper.canvas;
     if (upper.visible) lower.ctx.drawImage(upper.clip ? this.masked(upperSource, lower.canvas) : upperSource, 0, 0);
     lower.ctx.restore();
     doc.layers.splice(doc.active, 1);
@@ -1922,7 +2369,7 @@ export class Editor {
       this.soloMemory = layers.map(layer => layer.visible);
       layers.forEach((layer, layerIndex) => { layer.visible = layerIndex === index; });
     }
-    this.renderScene();
+    this.renderSceneNow();
     this.checkpoint('Solo Layer');
   }
 
@@ -2027,6 +2474,7 @@ export class Editor {
     const layer = this.doc?.layers[index];
     if (!layer) return;
     layer.opacity = Math.max(0, Math.min(100, opacity));
+    if (this.doc && index !== this.doc.active) this.invalidateStack();
     this.renderScene();
     if (commit) this.checkpoint('Layer Opacity');
   }
@@ -2354,6 +2802,7 @@ export class Editor {
     const doc = this.doc;
     if (!doc) return;
     this.cancelFloat();
+    this.renderSceneNow();
     const matte = mime === 'image/jpeg' || mime === 'image/bmp' ? '#ffffff' : undefined;
     const canvas = this.composite(matte);
     const blob = mime === 'image/bmp'
@@ -2526,7 +2975,10 @@ export class Editor {
   async archiveDocument(index: number): Promise<Blob | null> {
     const doc = this.docs[index];
     if (!doc) return null;
-    if (index === this.index) this.cancelFloat();
+    if (index === this.index) {
+      this.cancelFloat();
+      this.renderSceneNow();
+    }
     const files: { name: string; data: Uint8Array }[] = [];
     const layerFiles = [];
     for (const layer of doc.layers) {
@@ -2699,7 +3151,7 @@ export class Editor {
       this.index = this.docs.length ? Math.max(0, Math.min(active, this.docs.length - 1)) : -1;
       this.syncSize();
       this.rebuildEdges();
-      this.renderScene();
+      this.renderSceneNow();
       this.notify();
     } finally {
       this.restoring = false;
@@ -3165,7 +3617,7 @@ export class Editor {
       this.index = Math.max(0, Math.min(session.active, this.docs.length - 1));
       this.syncSize();
       this.rebuildEdges();
-      this.renderScene();
+      this.renderSceneNow();
       this.notify();
       this.toast('Restored your last image from this browser.');
       return true;

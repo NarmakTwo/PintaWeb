@@ -28,7 +28,7 @@ export interface Bounds {
   h: number;
 }
 
-export const MAX_PIXELS = 8_000_000;
+export const MAX_PIXELS = 12_000_000;
 
 export const DEFAULT_PALETTE = [
   '#000000', '#404040', '#808080', '#c0c0c0', '#ffffff', '#800000', '#ff0000', '#ff8080',

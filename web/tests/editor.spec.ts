@@ -2289,6 +2289,181 @@ test('saves history in a pinta file and undoes after reload', async ({ page }) =
   expect((await pixel(page, 0.5, 0.5))[0]).toBeGreaterThan(240);
 });
 
+test('matches a full recomposite after a stroke on a large layered document', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 4000, 3000);
+  await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta: {
+      doc: {
+        width: number;
+        height: number;
+        active: number;
+        layers: Array<{
+          ctx: CanvasRenderingContext2D;
+          maskCtx?: CanvasRenderingContext2D;
+          visible: boolean;
+          opacity: number;
+          blend: string;
+          clip: boolean;
+        }>;
+        groups: Array<{ id: number }>;
+      } | null;
+      paintingMask: boolean;
+      partialPaints: number;
+      addLayer(): void;
+      addMask(): void;
+      cover(x: number, y: number, w: number, h: number): void;
+      checkpoint(label: string): void;
+      groupLayer(index: number): void;
+      setGroupVisible(id: number, visible: boolean): void;
+      invalidateStack(): void;
+      renderSceneNow(): void;
+    } }).__pinta;
+    const doc = editor.doc;
+    if (!doc) throw new Error('No document.');
+    for (let index = 0; index < 9; index++) editor.addLayer();
+    const fill = (index: number, color: string, x: number, y: number, w: number, h: number) => {
+      const layer = doc.layers[index];
+      layer.ctx.fillStyle = color;
+      layer.ctx.fillRect(x, y, w, h);
+    };
+    fill(1, '#c0392b', 200, 200, 2400, 1800);
+    fill(2, '#1e8449', 0, 0, doc.width, doc.height);
+    fill(3, '#2471a3', 400, 300, 2800, 2000);
+    fill(5, '#e67e22', 600, 400, 2600, 1800);
+    fill(6, '#16a085', 100, 100, 3000, 2200);
+    fill(8, '#8e44ad', 800, 500, 2000, 1600);
+    const paintMask = (index: number, x: number, y: number, w: number, h: number) => {
+      doc.active = index;
+      editor.addMask();
+      editor.cover(x, y, w, h);
+      const mask = doc.layers[index].maskCtx;
+      if (!mask) throw new Error('Mask was not created.');
+      mask.fillStyle = 'rgb(128, 96, 64)';
+      mask.fillRect(x, y, w, h);
+      editor.checkpoint('Mask');
+      editor.paintingMask = false;
+    };
+    paintMask(1, 0, 0, 1800, doc.height);
+    paintMask(4, 0, 0, 2200, doc.height);
+    doc.layers[2].clip = true;
+    doc.layers[3].blend = 'multiply';
+    doc.layers[3].opacity = 70;
+    doc.layers[5].blend = 'multiply';
+    doc.layers[6].blend = 'screen';
+    doc.layers[6].clip = true;
+    doc.layers[7].visible = false;
+    doc.layers[8].opacity = 45;
+    editor.groupLayer(9);
+    const group = doc.groups[0];
+    if (!group) throw new Error('Group was not created.');
+    editor.setGroupVisible(group.id, false);
+    doc.active = 4;
+    editor.paintingMask = false;
+    editor.partialPaints = 0;
+    editor.invalidateStack();
+    editor.renderSceneNow();
+  });
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('36');
+  const start = await paperPoint(page, 0.12, 0.45);
+  const end = await paperPoint(page, 0.88, 0.62);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(end.x, end.y, { steps: 12 });
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  const partial = await page.evaluate(() => (window as unknown as { __pinta: { partialPaints: number } }).__pinta.partialPaints);
+  expect(partial).toBeGreaterThan(0);
+  const mismatch = await page.evaluate(() => {
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return { index: 0, before: 0, after: 0, width: 0, height: 0 };
+    const before = new Uint8ClampedArray(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+    const editor = (window as unknown as { __pinta: { invalidateStack(): void; renderSceneNow(): void } }).__pinta;
+    editor.invalidateStack();
+    editor.renderSceneNow();
+    const after = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let index = 0; index < before.length; index++) {
+      if (before[index] !== after[index]) return { index, before: before[index], after: after[index], width: canvas.width, height: canvas.height };
+    }
+    return null;
+  });
+  expect(mismatch).toBeNull();
+  await page.mouse.up();
+});
+
+test('cpu mask fallback matches destination-in', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  const gpu = await page.evaluate(() => {
+    const editor = (window as unknown as { __pinta: {
+      doc: {
+        active: number;
+        layers: Array<{ ctx: CanvasRenderingContext2D; maskCtx?: CanvasRenderingContext2D }>;
+      } | null;
+      paintingMask: boolean;
+      forceCpuMask: boolean;
+      addLayer(): void;
+      addMask(): void;
+      cover(x: number, y: number, w: number, h: number): void;
+      checkpoint(label: string): void;
+      invalidateStack(): void;
+      renderSceneNow(): void;
+    } }).__pinta;
+    const doc = editor.doc;
+    if (!doc) throw new Error('No document.');
+    editor.addLayer();
+    const layer = doc.layers[doc.active];
+    const image = layer.ctx.createImageData(64, 64);
+    for (let index = 0; index < image.data.length; index += 4) {
+      image.data[index] = 180;
+      image.data[index + 1] = 40;
+      image.data[index + 2] = 90;
+      image.data[index + 3] = 200;
+    }
+    layer.ctx.putImageData(image, 0, 0);
+    editor.addMask();
+    editor.cover(0, 0, 64, 64);
+    const mask = layer.maskCtx;
+    if (!mask) throw new Error('Mask was not created.');
+    const cover = mask.createImageData(64, 64);
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
+        const index = (y * 64 + x) * 4;
+        const gray = (x * 3 + y * 5) % 256;
+        cover.data[index] = gray;
+        cover.data[index + 1] = (gray * 2) % 256;
+        cover.data[index + 2] = 255 - gray;
+        cover.data[index + 3] = 255;
+      }
+    }
+    mask.putImageData(cover, 0, 0);
+    editor.checkpoint('Mask');
+    editor.paintingMask = false;
+    editor.forceCpuMask = false;
+    editor.invalidateStack();
+    editor.renderSceneNow();
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, 64, 64).data;
+    return Array.from(data);
+  });
+  expect(gpu[3]).toBe(255);
+  expect(gpu[0]).not.toBe(gpu[32 * 4]);
+  const mismatch = await page.evaluate(expected => {
+    const editor = (window as unknown as { __pinta: { forceCpuMask: boolean; invalidateStack(): void; renderSceneNow(): void } }).__pinta;
+    editor.forceCpuMask = true;
+    editor.invalidateStack();
+    editor.renderSceneNow();
+    const canvas = document.querySelector('#image-canvas') as HTMLCanvasElement;
+    const data = canvas.getContext('2d')!.getImageData(0, 0, 64, 64).data;
+    for (let index = 0; index < data.length; index++) {
+      if (data[index] !== expected[index]) return { index, gpu: expected[index], cpu: data[index] };
+    }
+    return null;
+  }, gpu);
+  expect(mismatch).toBeNull();
+});
+
 test.describe('touchscreen', () => {
   test.use({ hasTouch: true });
 

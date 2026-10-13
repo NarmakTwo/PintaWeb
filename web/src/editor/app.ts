@@ -53,6 +53,7 @@ function ask(id: string): Promise<string> {
 export async function start(): Promise<void> {
   loadLayout();
   const editor = new Editor();
+  (window as unknown as { __pinta?: Editor }).__pinta = editor;
   const tools = new ToolController(editor);
   buildChrome(editor, tools);
   editor.attach($('image-canvas'), $('preview-canvas'), $('overlay-canvas'), $('paper'), $('stage'));
@@ -815,7 +816,7 @@ function wire(editor: Editor, tools: ToolController): void {
     if (maskButton?.dataset.mask && editor.doc) {
       editor.doc.active = Number(maskButton.dataset.mask);
       editor.paintingMask = true;
-      editor.renderScene();
+      editor.renderSceneNow();
       editor.notify();
       return;
     }
@@ -823,7 +824,7 @@ function wire(editor: Editor, tools: ToolController): void {
     if (!row?.dataset.layer || !editor.doc) return;
     editor.paintingMask = false;
     editor.doc.active = Number(row.dataset.layer);
-    editor.renderScene();
+    editor.renderSceneNow();
     editor.notify();
   });
   $('layer-list').addEventListener('change', event => {
