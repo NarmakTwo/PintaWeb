@@ -228,6 +228,89 @@ test('applies every adjustment and effect', async ({ page }) => {
   await expect(page.locator('#image-dimensions')).toHaveText('48 × 48');
 });
 
+test('pastes and drops an image onto a new layer while a field is focused', async ({ page, context }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  const redPng = await page.evaluate(async () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 16;
+    canvas.height = 16;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('No canvas.');
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 0, 16, 16);
+    const blob = await new Promise<Blob>(resolve => canvas.toBlob(value => resolve(value!), 'image/png'));
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    const field = document.getElementById('color-hex') as HTMLInputElement;
+    field.value = 'keep';
+    field.focus();
+    return [...new Uint8Array(await blob.arrayBuffer())];
+  });
+  await page.keyboard.press('Control+v');
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(2);
+  await expect(page.locator('#history-list .history-item').last()).toHaveText('Paste Into New Layer');
+  await expect(page.locator('#color-hex')).toHaveValue('keep');
+  await page.keyboard.press('Escape');
+  const pasted = await pixel(page, 0.05, 0.05);
+  expect(pasted.slice(0, 4)).toEqual([255, 0, 0, 255]);
+
+  await page.evaluate(bytes => {
+    const file = new File([new Uint8Array(bytes)], 'dropped.png', { type: 'image/png' });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    document.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, redPng);
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(3);
+  await expect(page.locator('#history-list .history-item').last()).toHaveText('Paste Into New Layer');
+});
+
+test('scales a large paste to fit and selects it, and leaves a small paste at its own size', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('No canvas.');
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 0, 128, 64);
+    canvas.toBlob(blob => {
+      if (!blob) throw new Error('No image.');
+      const file = new File([blob], 'wide.png', { type: 'image/png' });
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      document.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+    }, 'image/png');
+  });
+  await expect(page.locator('#image-dimensions')).toHaveText('64 × 64');
+  await expect(page.locator('#selection-status')).toHaveText('Selection: 0, 16, 64 × 32');
+  await expect(page.locator('[data-tool="move-pixels"]')).toHaveAttribute('aria-pressed', 'true');
+  expect((await pixel(page, 0.5, 0.5)).slice(0, 4)).toEqual([255, 0, 0, 255]);
+  expect((await pixel(page, 0.5, 0.02))[0]).toBeGreaterThan(240);
+
+  await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 16;
+    canvas.height = 16;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('No canvas.');
+    ctx.fillStyle = '#00ff00';
+    ctx.fillRect(0, 0, 16, 16);
+    canvas.toBlob(blob => {
+      if (!blob) throw new Error('No image.');
+      const file = new File([blob], 'small.png', { type: 'image/png' });
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      document.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+    }, 'image/png');
+  });
+  await expect(page.locator('#selection-status')).toHaveText('Selection: 0, 0, 16 × 16');
+  expect((await pixel(page, 0.05, 0.05)).slice(0, 3)).toEqual([0, 255, 0]);
+  expect((await pixel(page, 0.5, 0.5)).slice(0, 4)).toEqual([255, 0, 0, 255]);
+});
+
 test('imports and exports an image', async ({ page }) => {
   await ready(page);
   await page.locator('#file-input').setInputFiles({ name: 'dot.png', mimeType: 'image/png', buffer: RED_PNG });

@@ -2426,6 +2426,21 @@ export class Editor {
     return canvas;
   }
 
+  /** Fit a paste inside the canvas. Smaller images stay at their own size, at the origin. Larger images scale uniformly and stay fully inside. */
+  private pastePlacement(sourceW: number, sourceH: number, canvasW: number, canvasH: number): { x: number; y: number; w: number; h: number } {
+    let w = Math.max(1, sourceW);
+    let h = Math.max(1, sourceH);
+    const oversized = w > canvasW || h > canvasH;
+    if (oversized) {
+      const scale = Math.min(canvasW / w, canvasH / h);
+      w = Math.min(canvasW, Math.max(1, Math.floor(sourceW * scale + 1e-4)));
+      h = Math.min(canvasH, Math.max(1, Math.floor(sourceH * scale + 1e-4)));
+    }
+    const x = oversized ? Math.max(0, Math.round((canvasW - w) / 2)) : 0;
+    const y = oversized ? Math.max(0, Math.round((canvasH - h) / 2)) : 0;
+    return { x, y, w, h };
+  }
+
   pasteCanvas(source: CanvasImageSource & { width: number; height: number }, destination: 'layer' | 'new-layer' | 'new-image'): void {
     if (destination === 'new-image') {
       const doc = this.blank(source.width, source.height, 'Pasted');
@@ -2442,17 +2457,11 @@ export class Editor {
     const doc = this.doc;
     if (!doc) return;
     const current = doc;
-    let drawWidth = source.width;
-    let drawHeight = source.height;
-    const fitted = source.width > current.width || source.height > current.height;
-    if (fitted) {
-      const scale = Math.min(current.width / source.width, current.height / source.height);
-      drawWidth = Math.max(1, Math.round(source.width * scale));
-      drawHeight = Math.max(1, Math.round(source.height * scale));
-    }
-    const origin = !fitted && current.selection ? boundsOf(current.selection, current.width, current.height) : null;
-    const x = fitted ? Math.round((current.width - drawWidth) / 2) : origin?.x ?? 0;
-    const y = fitted ? Math.round((current.height - drawHeight) / 2) : origin?.y ?? 0;
+    const placed = this.pastePlacement(source.width, source.height, current.width, current.height);
+    const x = placed.x;
+    const y = placed.y;
+    const drawWidth = placed.w;
+    const drawHeight = placed.h;
     if (destination === 'new-layer') this.addLayer();
     const layer = this.layer;
     if (!layer) return;

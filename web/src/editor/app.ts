@@ -702,17 +702,27 @@ function wire(editor: Editor, tools: ToolController): void {
   $<HTMLInputElement>('palette-input').addEventListener('change', () => void takePalette(editor));
   $<HTMLInputElement>('config-input').addEventListener('change', () => void takeConfig(editor));
   document.addEventListener('paste', event => {
-    if (editing()) return;
-    const file = [...(event.clipboardData?.files ?? [])].find(item => item.type.startsWith('image/'));
-    if (file) {
+    const images = imageFiles(event.clipboardData);
+    if (images.length) {
       event.preventDefault();
-      void file.arrayBuffer().then(buffer => createImageBitmap(new Blob([buffer], { type: file.type }))).then(bitmap => pasteBitmap(editor, bitmap, 'layer'));
+      void placeExternalImages(editor, images);
       return;
     }
+    if (editing()) return;
     if (editor.clipboard) {
       event.preventDefault();
       void pasteBitmap(editor, editor.clipboard, 'layer');
     }
+  });
+  document.addEventListener('dragover', event => {
+    if (!event.dataTransfer || ![...event.dataTransfer.types].includes('Files')) return;
+    event.preventDefault();
+  });
+  document.addEventListener('drop', event => {
+    const images = imageFiles(event.dataTransfer);
+    if (!images.length) return;
+    event.preventDefault();
+    void placeExternalImages(editor, images);
   });
   window.addEventListener('keydown', event => onKey(event, editor, tools), true);
   window.addEventListener('keyup', event => {
@@ -1366,6 +1376,38 @@ function cut(editor: Editor): void {
   if (had) editor.eraseSelection();
 }
 
+function isImageFile(file: File): boolean {
+  return file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|avif|ico)$/i.test(file.name);
+}
+
+function imageFiles(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const fromFiles = [...data.files].filter(isImageFile);
+  if (fromFiles.length) return fromFiles;
+  const fromItems: File[] = [];
+  for (const item of data.items) {
+    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file) fromItems.push(file);
+  }
+  return fromItems;
+}
+
+async function placeExternalImages(editor: Editor, files: File[]): Promise<void> {
+  for (const file of files) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      try {
+        editor.pasteCanvas(bitmap, editor.doc ? 'new-layer' : 'new-image');
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      editor.toast('This image could not be pasted.');
+    }
+  }
+}
+
 async function pasteBitmap(editor: Editor, source: HTMLCanvasElement | ImageBitmap | null, destination: 'layer' | 'new-layer' | 'new-image'): Promise<void> {
   if (!source) {
     editor.toast('The clipboard is empty.');
@@ -1539,6 +1581,8 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     return;
   }
   if (hit?.command) {
+    // Ctrl+V is handled by the paste listener so an image still lands when a field is focused.
+    if (hit.command === 'paste') return;
     event.preventDefault();
     void run(editor, tools, hit.command);
     return;
