@@ -69,6 +69,8 @@ const COMMANDS: { id: string; label: string; shortcut: string; sentence: string 
   { id: 'toggle-toolbar', label: 'Tool Options', shortcut: '', sentence: 'Show or hide the tool options.' },
   { id: 'toggle-docks', label: 'Layers and History', shortcut: '', sentence: 'Show or hide the side docks.' },
   { id: 'toggle-tabs', label: 'Image Tabs', shortcut: '', sentence: 'Show or hide the image tabs.' },
+  { id: 'toggle-timeline', label: 'Timeline', shortcut: '', sentence: 'Show or hide the animation timeline.' },
+  { id: 'convert-object', label: 'Convert to Object', shortcut: '', sentence: 'Turn the selection into a reusable object.' },
   { id: 'toggle-grid', label: 'Pixel Grid', shortcut: '', sentence: 'Show or hide the pixel grid.' },
   { id: 'grid-size', label: 'Grid Size…', shortcut: '', sentence: 'Set the grid spacing.' },
   { id: 'grid-square', label: 'Square Grid', shortcut: '', sentence: 'Use a square grid.' },
@@ -137,13 +139,13 @@ function effectMenuTokens(): string[] {
 function defaultMenus(): Record<MenuId, string[]> {
   return {
     file: ['new', 'open', 'sep', 'close', 'close-all', 'sep', 'save', 'save-as', 'save-all', 'sep', 'import-layer', 'sep', 'open-palette', 'save-palette', 'reset-palette', 'sep', 'screenshot', 'quit'],
-    edit: ['undo', 'redo', 'sep', 'cut', 'copy', 'copy-merged', 'paste', 'paste-layer', 'paste-image', 'sep', 'erase-selection', 'fill-selection', 'invert-selection', 'offset-selection', 'sep', 'select-all', 'deselect', 'sep', 'adjust-stroke'],
+    edit: ['undo', 'redo', 'sep', 'cut', 'copy', 'copy-merged', 'paste', 'paste-layer', 'paste-image', 'sep', 'convert-object', 'sep', 'erase-selection', 'fill-selection', 'invert-selection', 'offset-selection', 'sep', 'select-all', 'deselect', 'sep', 'adjust-stroke'],
     view: ['zoom-in', 'zoom-out', 'zoom-100', 'zoom-fit', 'zoom-selection', 'sep', 'toggle-rulers', 'toggle-status', 'toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-grid', 'grid-size', 'grid-square', 'grid-iso', 'toggle-snap', 'reset-view', 'assist-none', 'assist-parallel', 'assist-ellipse', 'assist-vanish', 'toggle-cursor', 'live-stroke-render', 'sep', 'unit-px', 'unit-in', 'unit-cm', 'sep', 'theme-dark', 'sep', 'fullscreen'],
     image: ['crop', 'auto-crop', 'sep', 'resize', 'canvas-size', 'sep', 'flip-h', 'flip-v', 'sep', 'rotate-cw', 'rotate-ccw', 'rotate-180', 'sep', 'flatten'],
     layers: ['layer-add', 'layer-delete', 'layer-duplicate', 'layer-merge', 'sep', 'layer-up', 'layer-down', 'sep', 'layer-flip-h', 'layer-flip-v', 'layer-rotate', 'sep', 'layer-mask', 'layer-unmask', 'layer-properties', 'import-layer'],
     adjustments: effectTokens(ADJUSTMENTS),
     effects: effectMenuTokens(),
-    window: ['toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-status', 'customize', 'sep', 'file-access', 'install', 'sep', 'import-config', 'export-config', 'sep', 'restore-defaults'],
+    window: ['toggle-tools', 'toggle-toolbar', 'toggle-docks', 'toggle-tabs', 'toggle-timeline', 'toggle-status', 'customize', 'sep', 'file-access', 'install', 'sep', 'import-config', 'export-config', 'sep', 'restore-defaults'],
     help: ['shortcuts', 'about'],
   };
 }

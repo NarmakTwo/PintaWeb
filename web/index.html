@@ -110,6 +110,8 @@
         </aside>
       </div>
 
+      <div id="timeline" class="timeline" hidden aria-label="Timeline"></div>
+
       <div id="tabs" class="tabs" role="tablist"></div>
 
       <footer class="statusbar">
@@ -170,6 +172,9 @@
             <option value="image/bmp">BMP</option>
             <option value="application/pinta">Pinta (.pinta)</option>
             <option value="image/openraster">OpenRaster (.ora)</option>
+            <option value="image/gif" data-anim-only hidden>GIF animation</option>
+            <option value="application/png-sequence" data-anim-only hidden>PNG sequence (.zip)</option>
+            <option value="image/sprite-sheet" data-anim-only hidden>Sprite sheet</option>
           </select>
         </label>
         <div class="dialog-actions">

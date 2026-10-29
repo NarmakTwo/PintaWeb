@@ -711,8 +711,14 @@ export class ToolController {
   private held = 0;
   private touched = new Map<number, number>();
   private rateTimer = 0;
+  private boneLay: Point | null = null;
+  private boneDrag: { id: number; startAngle: number } | null = null;
 
   constructor(private readonly editor: Editor) {}
+
+  bakeFloat(): void {
+    if (this.editor.float) this.finishMove();
+  }
 
   commitText(): void {
     commitText(this.editor);
@@ -788,6 +794,12 @@ export class ToolController {
     this.moved = false;
     this.start = point;
     this.last = point;
+    if (editor.doc?.anim.editingObject != null && event.shiftKey) {
+      this.drawing = true;
+      this.boneLay = { x: point.x, y: point.y };
+      capturePointer(editor.paper, event.pointerId);
+      return;
+    }
     if (editor.space || event.button === 1 || editor.tool === 'pan') {
       this.panning = true;
       this.scroll = { x: editor.stage.scrollLeft, y: editor.stage.scrollTop, cx: event.clientX, cy: event.clientY };
@@ -829,6 +841,7 @@ export class ToolController {
     this.strokeSeed = (Math.random() * 0xffffffff) >>> 0 || 1;
     closeBrushPanel();
     beginStrokeUI(editor);
+    editor.ensurePaintKey();
     editor.beginSurface();
     this.before = editor.layer.ctx.getImageData(0, 0, doc.width, doc.height);
     editor.holdStroke(this.before);
@@ -895,6 +908,10 @@ export class ToolController {
     if (this.panning) {
       editor.stage.scrollLeft = this.scroll.x - (event.clientX - this.scroll.cx);
       editor.stage.scrollTop = this.scroll.y - (event.clientY - this.scroll.cy);
+      return;
+    }
+    if (this.boneLay && point) {
+      this.last = point;
       return;
     }
     if (this.pending && !this.drawing && point && editor.tool === 'line') {
@@ -1003,6 +1020,13 @@ export class ToolController {
       editor.assistantDraft = null;
       editor.paintOverlay();
       editor.notify();
+      return;
+    }
+    if (this.boneLay && this.start) {
+      const end = editor.imagePoint(event) ?? this.last ?? this.start;
+      editor.addBone(this.boneLay.x, this.boneLay.y, end.x, end.y);
+      this.boneLay = null;
+      this.drawing = false;
       return;
     }
     if (!this.drawing || !this.start) return;

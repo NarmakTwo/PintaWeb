@@ -14,7 +14,10 @@ import {
 import { exportConfig, importConfigFile, restoreDefaults, type ConfigAppearance } from './config.ts';
 import { canvasToPng, downloadBlob, parsePalette, saveFileHandle, serializePalette } from './storage.ts';
 import { ToolController } from './tools.ts';
+import { mountTimeline, easeOptions } from './timeline.ts';
+import { zipStore } from './zip.ts';
 import { boundsOf, DEFAULT_PALETTE, TOOLS, type ToolId, type Unit } from './types.ts';
+import type { EaseName } from './animation.ts';
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
@@ -29,6 +32,9 @@ const EXT: Record<string, string> = {
   'image/bmp': '.bmp',
   'application/pinta': '.pinta',
   'image/openraster': '.ora',
+  'image/gif': '.gif',
+  'application/png-sequence': '.zip',
+  'image/sprite-sheet': '.png',
 };
 
 function editing(): boolean {
@@ -65,7 +71,10 @@ export async function start(): Promise<void> {
   const tools = new ToolController(editor);
   buildChrome(editor, tools);
   editor.attach($('image-canvas'), $('preview-canvas'), $('overlay-canvas'), $('paper'), $('stage'));
-  editor.onChanged = () => sync(editor);
+  editor.onChanged = () => {
+    sync(editor);
+    (editor as Editor & { refreshTimeline?: () => void }).refreshTimeline?.();
+  };
   editor.onScene = () => {
     paintRulers(editor);
     const angleLabel = document.getElementById('view-angle');
@@ -83,7 +92,12 @@ export async function start(): Promise<void> {
     app.dataset.saveSerial = String(editor.saveSerial);
   };
   editor.onHistoryNavigate = clearStrokeMemory;
+  editor.onBeforeFrameChange = () => {
+    tools.commitText();
+    tools.bakeFloat();
+  };
   wire(editor, tools);
+  mountTimeline(editor, (x, y, entries) => openContext(x, y, entries));
   applyDocks();
   refillMenus();
   mountCustomize(name => {
@@ -196,6 +210,7 @@ function editMenu(): string {
     item('Undo', 'undo', 'Ctrl+Z'), item('Redo', 'redo', 'Ctrl+Y'), '<div class="sep"></div>',
     item('Cut', 'cut', 'Ctrl+X'), item('Copy', 'copy', 'Ctrl+C'), item('Copy Merged', 'copy-merged', 'Ctrl+Shift+C'),
     item('Paste', 'paste', 'Ctrl+V'), item('Paste Into New Layer', 'paste-layer', 'Ctrl+Shift+V'), item('Paste Into New Image', 'paste-image'), '<div class="sep"></div>',
+    item('Convert to Object', 'convert-object'), '<div class="sep"></div>',
     item('Erase Selection', 'erase-selection'), item('Fill Selection', 'fill-selection'), item('Invert Selection', 'invert-selection'), item('Offset Selection…', 'offset-selection'), '<div class="sep"></div>',
     item('Select All', 'select-all', 'Ctrl+A'), item('Deselect', 'deselect', 'Ctrl+D'), '<div class="sep"></div>',
     item('Adjust Last Stroke', 'adjust-stroke'),
@@ -314,7 +329,8 @@ function commandText(id: string): string {
     'fill-selection': 'Fill Selection', 'invert-selection': 'Invert Selection', 'offset-selection': 'Offset Selection…', 'select-all': 'Select All',
     deselect: 'Deselect', 'adjust-stroke': 'Adjust Last Stroke', 'zoom-in': 'Zoom In', 'zoom-out': 'Zoom Out', 'zoom-100': 'Normal Size',
     'zoom-fit': 'Best Fit', 'zoom-selection': 'Zoom to Selection', 'toggle-rulers': 'Rulers', 'toggle-status': 'Status Bar', 'toggle-tools': 'Tool Box',
-    'toggle-toolbar': 'Tool Options', 'toggle-docks': 'Layers and History', 'toggle-tabs': 'Image Tabs', 'toggle-grid': 'Pixel Grid',
+    'toggle-toolbar': 'Tool Options', 'toggle-docks': 'Layers and History', 'toggle-tabs': 'Image Tabs', 'toggle-timeline': 'Timeline', 'toggle-grid': 'Pixel Grid',
+    'convert-object': 'Convert to Object',
     'toggle-selection': 'Selection Outline', 'toggle-assistant': 'Assistant', 'canvas-size': 'Resize Canvas…', 'image-size': 'Resize Image…',
     'crop-canvas': 'Crop to Selection', flatten: 'Flatten', rotate: 'Rotate 90° Clockwise', 'flip-horizontal': 'Flip Horizontal', 'flip-vertical': 'Flip Vertical',
     'layer-add': 'Add Layer', 'layer-delete': 'Delete Layer', 'layer-duplicate': 'Duplicate Layer', 'layer-merge': 'Merge Down', 'layer-import': 'Import from File…',
@@ -353,7 +369,7 @@ function fileAccessButton(): string {
 }
 
 function windowMenu(): string {
-  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Status Bar', 'toggle-status'), item('Customize', 'customize'), '<div class="sep"></div>', fileAccessButton(), '<button type="button" data-command="install" disabled>Install Pinta</button>', '<div class="sep"></div>', item('Import Config', 'import-config'), item('Export Config', 'export-config'), '<div class="sep"></div>', '<button type="button" class="menu-danger" data-command="restore-defaults">Restore to default</button>'].join('');
+  return [item('Tool Box', 'toggle-tools'), item('Tool Options', 'toggle-toolbar'), item('Layers and History', 'toggle-docks'), item('Image Tabs', 'toggle-tabs'), item('Timeline', 'toggle-timeline'), item('Status Bar', 'toggle-status'), item('Customize', 'customize'), '<div class="sep"></div>', fileAccessButton(), '<button type="button" data-command="install" disabled>Install Pinta</button>', '<div class="sep"></div>', item('Import Config', 'import-config'), item('Export Config', 'export-config'), '<div class="sep"></div>', '<button type="button" class="menu-danger" data-command="restore-defaults">Restore to default</button>'].join('');
 }
 
 type InstallEvent = Event & { prompt: () => Promise<void> };
@@ -719,6 +735,13 @@ function wire(editor: Editor, tools: ToolController): void {
     event.preventDefault();
   });
   document.addEventListener('drop', event => {
+    const objectId = event.dataTransfer?.getData('pinta/object');
+    if (objectId && editor.doc) {
+      event.preventDefault();
+      const point = editor.imagePoint(event as unknown as PointerEvent) ?? { x: 0, y: 0 };
+      editor.placeObjectInstance(Number(objectId), point.x, point.y);
+      return;
+    }
     const images = imageFiles(event.dataTransfer);
     if (!images.length) return;
     event.preventDefault();
@@ -988,6 +1011,7 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   else if (command === 'paste') await pasteBitmap(editor, editor.clipboard, 'layer');
   else if (command === 'paste-layer') await pasteBitmap(editor, editor.clipboard, 'new-layer');
   else if (command === 'paste-image') await pasteBitmap(editor, editor.clipboard, 'new-image');
+  else if (command === 'convert-object') editor.convertSelectionToObject();
   else if (command === 'erase-selection') editor.eraseSelection();
   else if (command === 'fill-selection') editor.fillSelection();
   else if (command === 'invert-selection') editor.invertSelection();
@@ -1009,6 +1033,7 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   else if (command === 'toggle-toolbar') toggleShow(editor, 'toolbar');
   else if (command === 'toggle-docks') toggleShow(editor, 'docks');
   else if (command === 'toggle-tabs') toggleShow(editor, 'tabs');
+  else if (command === 'toggle-timeline') toggleShow(editor, 'timeline');
   else if (command === 'toggle-cursor') {
     brushCursor = !brushCursor;
     try { localStorage.setItem('pinta-brush-cursor', brushCursor ? '1' : '0'); } catch { /* storage unavailable */ }
@@ -1099,7 +1124,7 @@ async function run(editor: Editor, tools: ToolController, command: string): Prom
   tools.commitText();
 }
 
-function toggleShow(editor: Editor, key: 'rulers' | 'status' | 'tools' | 'toolbar' | 'docks' | 'tabs'): void {
+function toggleShow(editor: Editor, key: 'rulers' | 'status' | 'tools' | 'toolbar' | 'docks' | 'tabs' | 'timeline'): void {
   editor.show[key] = !editor.show[key];
   editor.notify();
 }
@@ -1314,6 +1339,10 @@ async function save(editor: Editor, saveAs: boolean): Promise<boolean> {
   let filename = doc.name.includes('.') ? doc.name : `${doc.fileBase}${EXT[mime]}`;
   if (saveAs || !doc.fileMime) {
     $<HTMLInputElement>('export-name').value = doc.fileBase;
+    const multi = doc.anim.frameCount > 1;
+    document.querySelectorAll<HTMLOptionElement>('#export-format [data-anim-only]').forEach(option => {
+      option.hidden = !multi;
+    });
     $<HTMLSelectElement>('export-format').value = mime;
     if (await ask('export-dialog') !== 'ok') return false;
     mime = $<HTMLSelectElement>('export-format').value;
@@ -1322,8 +1351,67 @@ async function save(editor: Editor, saveAs: boolean): Promise<boolean> {
   }
   if (mime === 'application/pinta') await editor.exportPinta(filename);
   else if (mime === 'image/openraster') await editor.exportOra(filename);
-  else await editor.exportImage(mime, filename);
+  else if (mime === 'image/gif' || mime === 'application/png-sequence' || mime === 'image/sprite-sheet') {
+    await exportAnimation(editor, mime, filename);
+  } else await editor.exportImage(mime, filename);
   return true;
+}
+
+async function exportAnimation(editor: Editor, mime: string, filename: string): Promise<void> {
+  const doc = editor.doc;
+  if (!doc) return;
+  if (doc.anim.playing) editor.stopPlayback();
+  editor.flushCurrentFrame();
+  const frames: ImageData[] = [];
+  const start = doc.anim.frame;
+  for (let frame = 0; frame < doc.anim.frameCount; frame++) {
+    doc.anim.frame = frame;
+    editor.loadCurrentFrame();
+    const canvas = editor.composite();
+    frames.push(canvas.getContext('2d')!.getImageData(0, 0, doc.width, doc.height));
+  }
+  doc.anim.frame = start;
+  editor.loadCurrentFrame();
+  editor.invalidateStack();
+  editor.renderSceneNow();
+  editor.notify();
+  if (mime === 'image/gif') {
+    const { encodeGif } = await import('./gif.ts');
+    downloadBlob(encodeGif(frames, doc.anim.fps), filename);
+  } else if (mime === 'application/png-sequence') {
+    const files: { name: string; data: Uint8Array }[] = [];
+    const base = filename.replace(/\.zip$/i, '') || doc.fileBase;
+    for (let i = 0; i < frames.length; i++) {
+      const canvas = document.createElement('canvas');
+      canvas.width = frames[i].width;
+      canvas.height = frames[i].height;
+      canvas.getContext('2d')!.putImageData(frames[i], 0, 0);
+      files.push({
+        name: `${base}-${String(i + 1).padStart(4, '0')}.png`,
+        data: new Uint8Array(await (await canvasToPng(canvas)).arrayBuffer()),
+      });
+    }
+    downloadBlob(await zipStore(files), filename.endsWith('.zip') ? filename : `${filename}.zip`);
+  } else {
+    const cols = Math.ceil(Math.sqrt(frames.length));
+    const rows = Math.ceil(frames.length / cols);
+    const sheet = document.createElement('canvas');
+    sheet.width = cols * doc.width;
+    sheet.height = rows * doc.height;
+    const ctx = sheet.getContext('2d')!;
+    frames.forEach((frame, index) => {
+      const x = (index % cols) * doc.width;
+      const y = Math.floor(index / cols) * doc.height;
+      const temp = document.createElement('canvas');
+      temp.width = frame.width;
+      temp.height = frame.height;
+      temp.getContext('2d')!.putImageData(frame, 0, 0);
+      ctx.drawImage(temp, x, y);
+    });
+    downloadBlob(await canvasToPng(sheet), filename);
+  }
+  doc.savedCursor = doc.cursor;
+  editor.notify();
 }
 
 async function saveAll(editor: Editor): Promise<void> {
@@ -1546,8 +1634,17 @@ function onKey(event: KeyboardEvent, editor: Editor, tools: ToolController): voi
     event.stopPropagation();
   }
   if (event.key === ' ' && !editing()) {
-    editor.space = true;
     event.preventDefault();
+    if (editor.show.timeline && editor.doc) {
+      editor.togglePlayback();
+      return;
+    }
+    editor.space = true;
+  }
+  if (!editing() && editor.doc && (event.key === ',' || event.key === '.')) {
+    event.preventDefault();
+    editor.setFrame(editor.doc.anim.frame + (event.key === '.' ? 1 : -1));
+    return;
   }
   if (editing() && event.key !== 'Escape') return;
   if (event.key.startsWith('Arrow') && editor.doc?.selection && editor.tool === 'move-pixels') {
@@ -1938,6 +2035,10 @@ function sync(editor: Editor): void {
   app.dataset.toolbar = editor.show.toolbar ? '1' : '0';
   app.dataset.docks = editor.show.docks ? '1' : '0';
   app.dataset.tabs = editor.show.tabs ? '1' : '0';
+  app.dataset.timeline = editor.show.timeline ? '1' : '0';
+  const animOnly = document.querySelectorAll<HTMLOptionElement>('#export-format [data-anim-only]');
+  const multi = (editor.doc?.anim.frameCount ?? 1) > 1;
+  animOnly.forEach(option => { option.hidden = !multi; });
   if (!$('document-name').querySelector('input')) $('document-name').textContent = doc ? `${doc.name}${editor.dirty ? ' •' : ''}` : 'Pinta';
   document.title = doc ? `${doc.name} — Pinta` : 'Pinta';
   $<HTMLButtonElement>('undo').disabled = !doc || doc.cursor <= 0;
@@ -2008,6 +2109,14 @@ function extraOptions(editor: Editor): string {
   const tool = editor.tool;
   const drawing = ['brush', 'pen', 'pencil', 'eraser', 'random', 'recolor', 'line', 'rectangle', 'rounded', 'ellipse', 'lasso-draw', 'text', 'lighten', 'darken', 'dither'].includes(tool);
   const parts: string[] = [];
+  if (editor.selectedTween && editor.doc) {
+    const instance = editor.doc.anim.instances.find(item => item.id === editor.selectedTween!.instanceId);
+    const tween = instance?.tweens.find(item => item.from === editor.selectedTween!.from && item.to === editor.selectedTween!.to);
+    if (tween) {
+      parts.push(`<label class="option">Ease <select id="tween-ease">${easeOptions(tween.ease)}</select></label>`);
+      parts.push(`<details class="option"><summary>Curve</summary><input id="tween-curve" type="range" min="0" max="100" value="50" /></details>`);
+    }
+  }
   if (drawing || tool === 'bucket' || tool === 'gradient') {
     parts.push(`<label class="option">Opacity <input id="opacity-slider" type="range" min="1" max="100" value="${editor.opacity}" /></label>`);
   }
@@ -2070,6 +2179,21 @@ function bindExtra(editor: Editor): void {
     document.getElementById(id)?.addEventListener('change', event => apply((event.target as HTMLInputElement).value));
   };
   listen('opacity-slider', value => { editor.opacity = Number(value); });
+  listen('tween-ease', value => {
+    const selected = editor.selectedTween;
+    if (!selected) return;
+    editor.setTweenEase(selected.instanceId, selected.from, selected.to, value as EaseName);
+  });
+  listen('tween-curve', value => {
+    const selected = editor.selectedTween;
+    if (!selected) return;
+    const t = Number(value) / 100;
+    const curve = Array.from({ length: 17 }, (_, i) => {
+      const x = i / 16;
+      return x * x * (1 - t) + (1 - (1 - x) * (1 - x)) * t;
+    });
+    editor.setTweenEase(selected.instanceId, selected.from, selected.to, 'custom', curve);
+  });
   document.getElementById('adjust-stroke')?.addEventListener('click', () => {
     startAdjust(editor);
     editor.paintOverlay();
