@@ -3255,3 +3255,64 @@ test.describe('touchscreen', () => {
     await expect.poll(async () => (await pixel(page, 0.5, 0.5))[0]).toBeLessThan(40);
   });
 });
+
+test('animation timeline, frames, onion, playback keys, and object convert', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 64, 64);
+  await expect(page.locator('#timeline')).toBeHidden();
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="toggle-timeline"]').click();
+  await expect(page.locator('#timeline')).toBeVisible();
+  await page.locator('#tl-blank').click();
+  await expect(page.locator('#timeline')).toBeVisible();
+  await expect(page.locator('#tl-frame')).toHaveValue('2');
+  await expect(page.locator('#layer-list .layer-name')).toHaveCount(1);
+  await page.locator('[data-tool="pencil"]').click();
+  await page.locator('#size-slider').fill('10');
+  await drag(page, 0.3, 0.3, 0.7, 0.7);
+  await page.locator('#tl-prev').click();
+  await expect(page.locator('#tl-frame')).toHaveValue('1');
+  const first = await pixel(page, 0.5, 0.5);
+  expect(first[0]).toBeGreaterThan(200);
+  await page.keyboard.press('.');
+  await expect(page.locator('#tl-frame')).toHaveValue('2');
+  const second = await pixel(page, 0.5, 0.5);
+  expect(second[0]).toBeLessThan(40);
+  await page.locator('#tl-onion').check();
+  await expect(page.locator('#tl-onion')).toBeChecked();
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="toggle-timeline"]').click();
+  await expect(page.locator('#timeline')).toBeHidden();
+  await page.keyboard.press(' ');
+  await page.mouse.move(200, 200);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.up({ button: 'middle' });
+
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="toggle-timeline"]').click();
+  await page.locator('[data-tool="rect-select"]').click();
+  await drag(page, 0.2, 0.2, 0.6, 0.6);
+  await page.locator('#menu-edit').click();
+  await page.locator('[data-command="convert-object"]').click();
+  await expect(page.locator('#library-list .library-row')).toHaveCount(1);
+  await expect(page.locator('#history-list .history-item').last()).toHaveText('Convert to Object');
+});
+
+test('animation export formats appear for multi-frame docs', async ({ page }) => {
+  await ready(page);
+  await newCanvas(page, 32, 32);
+  await page.locator('#menu-window').click();
+  await page.locator('[data-command="toggle-timeline"]').click();
+  await page.locator('#tl-blank').click();
+  await page.locator('#menu-file').click();
+  await page.locator('[data-command="save-as"]').click();
+  await expect(page.locator('#export-format option[value="image/gif"]')).not.toHaveAttribute('hidden');
+  await expect(page.locator('#export-format option[value="application/png-sequence"]')).not.toHaveAttribute('hidden');
+  await expect(page.locator('#export-format option[value="image/sprite-sheet"]')).not.toHaveAttribute('hidden');
+  await page.locator('#export-format').selectOption('image/sprite-sheet');
+  await page.locator('#export-name').fill('clip');
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#confirm-export').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toContain('clip');
+});

@@ -10,6 +10,12 @@ import {
 import { unzip, zipStore } from './zip.ts';
 import type { Guide } from './adjust.ts';
 import {
+  blankAnim, blankImage, cloneAnim, cloneImage, deleteFrame, duplicateFrame, ensureKeyAt, extendFrames,
+  frameMask, framePixels, insertBlankKey, insertKeyframe, resolveKeyIndex, type AnimState, type FrameCell,
+  type InstanceTransform, type ObjectInstance, type AnimObject, type Bone, type EaseName, type MotionTween,
+  transformAt, tipOf, deformByBones, defaultBone,
+} from './animation.ts';
+import {
   boundsOf, combineMask, DEFAULT_PALETTE, MAX_PIXELS, shiftMask, TOOLS,
   type AssistantKind, type Bounds, type BrushId, type GradientKind, type GridKind, type Point, type SelectMode, type ShapeStyle, type SmoothTool, type Symmetry, type TextStyle, type ToolId, type Unit,
 } from './types.ts';
@@ -59,6 +65,8 @@ export interface Layer {
   ctx: CanvasRenderingContext2D;
   mask?: HTMLCanvasElement;
   maskCtx?: CanvasRenderingContext2D;
+  /** Per-frame bitmaps; length matches doc.anim.frameCount. */
+  frames: FrameCell[];
   /** Bumped when layer pixels change; used by incremental autosave. */
   revision: number;
   lastSavedRevision: number;
@@ -101,6 +109,7 @@ interface SnapshotLayer {
   alphaLock: boolean;
   data: ImageData;
   mask: ImageData | null;
+  frames: FrameCell[];
 }
 
 interface Snapshot {
@@ -110,6 +119,7 @@ interface Snapshot {
   selection: Uint8Array | null;
   groups: SnapshotGroup[];
   layers: SnapshotLayer[];
+  anim: AnimState;
 }
 
 function copySelection(selection: Uint8Array | null): Uint8Array | null {
@@ -141,6 +151,7 @@ export interface Doc {
   fileBase: string;
   fileMime: string | null;
   fileHandle: FileSystemFileHandle | null;
+  anim: AnimState;
 }
 
 export interface FloatState {
@@ -381,7 +392,14 @@ export class Editor {
   private soloMemory: boolean[] | null = null;
   private swappedCtx: CanvasRenderingContext2D | null = null;
   unit: Unit = 'px';
-  show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false };
+  show = { rulers: true, status: true, tools: true, toolbar: true, docks: true, tabs: true, grid: false, timeline: false };
+  /** Fired when the app should commit text / bake floats before a frame change. */
+  onBeforeFrameChange: (() => void) | null = null;
+  frameClipboard: { data: ImageData; mask: ImageData | null; transform?: InstanceTransform } | null = null;
+  boneMode: 'pose' | 'weight' = 'pose';
+  selectedBone: number | null = null;
+  selectedInstance: number | null = null;
+  selectedTween: { instanceId: number; from: number; to: number } | null = null;
   gridSize = 16;
   docs: Doc[] = [];
   index = -1;
@@ -560,9 +578,12 @@ export class Editor {
     canvas.height = data?.height ?? doc?.height ?? 1;
     const ctx = context2d(canvas);
     if (data) ctx.putImageData(data, 0, 0);
+    const frameData = data ? cloneImage(data) : blankImage(canvas.width, canvas.height);
+    const count = doc?.anim.frameCount ?? 1;
+    const frames = extendFrames([{ kind: 'key', data: frameData, mask: null }], count, canvas.width, canvas.height);
     return {
       id: this.layerSerial++, name, visible, opacity, blend: 'normal', clip: false, tag: DEFAULT_TAG, parent: null, alphaLock: false,
-      canvas, ctx, revision: 1, lastSavedRevision: 0, maskRevision: 0, lastSavedMaskRevision: 0,
+      canvas, ctx, frames, revision: 1, lastSavedRevision: 0, maskRevision: 0, lastSavedMaskRevision: 0,
     };
   }
 
@@ -645,6 +666,7 @@ export class Editor {
   private capture(): Snapshot {
     const doc = this.doc;
     if (!doc) throw new Error('No image is open.');
+    this.flushCurrentFrame();
     return {
       width: doc.width,
       height: doc.height,
@@ -668,7 +690,11 @@ export class Editor {
         alphaLock: layer.alphaLock,
         data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
         mask: layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null,
+        frames: layer.frames.map(cell => (cell.kind === 'key'
+          ? { kind: 'key' as const, data: cloneImage(cell.data), mask: cell.mask ? cloneImage(cell.mask) : null }
+          : { kind: 'hold' as const, from: cell.from })),
       })),
+      anim: cloneAnim(doc.anim),
     };
   }
 
@@ -677,10 +703,12 @@ export class Editor {
     if (!doc) return;
     this.float = null;
     this.discardWatch();
+    this.stopPlayback();
     doc.width = snapshot.width;
     doc.height = snapshot.height;
     doc.active = Math.max(0, Math.min(snapshot.active, snapshot.layers.length - 1));
     doc.selection = snapshot.selection ? new Uint8Array(snapshot.selection) : null;
+    doc.anim = snapshot.anim ? cloneAnim(snapshot.anim) : blankAnim();
     doc.groups = (snapshot.groups ?? []).map(group => ({
       id: this.layerSerial++,
       name: group.name,
@@ -699,6 +727,12 @@ export class Editor {
       created.tag = layer.tag ?? null;
       created.parent = layer.parent == null ? null : doc.groups[layer.parent]?.id ?? null;
       created.alphaLock = !!layer.alphaLock;
+      created.frames = layer.frames?.length
+        ? layer.frames.map(cell => (cell.kind === 'key'
+          ? { kind: 'key' as const, data: cloneImage(cell.data), mask: cell.mask ? cloneImage(cell.mask) : null }
+          : { kind: 'hold' as const, from: cell.from }))
+        : [{ kind: 'key', data: cloneImage(layer.data), mask: layer.mask ? cloneImage(layer.mask) : null }];
+      created.frames = extendFrames(created.frames, doc.anim.frameCount, snapshot.width, snapshot.height);
       if (layer.mask) {
         const mask = document.createElement('canvas');
         mask.width = snapshot.width;
@@ -712,6 +746,7 @@ export class Editor {
       }
       return created;
     });
+    this.loadCurrentFrame();
     this.syncSize();
     this.rebuildEdges();
   }
@@ -804,6 +839,7 @@ export class Editor {
       fileBase: name.replace(/\.[^.]+$/, '') || 'pinta-image',
       fileMime: null,
       fileHandle: null,
+      anim: blankAnim(),
     };
   }
 
@@ -811,6 +847,14 @@ export class Editor {
     this.docs.push(doc);
     this.index = this.docs.length - 1;
     this.syncSize();
+    for (const layer of doc.layers) {
+      layer.frames = extendFrames(
+        [{ kind: 'key', data: layer.ctx.getImageData(0, 0, doc.width, doc.height), mask: layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null }],
+        doc.anim.frameCount,
+        doc.width,
+        doc.height,
+      );
+    }
     doc.snapshots = [this.capture()];
     doc.labels = [label];
     doc.cursor = 0;
@@ -819,6 +863,519 @@ export class Editor {
     this.renderSceneNow();
     this.scheduleSave();
     this.notify();
+  }
+
+  flushCurrentFrame(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const frame = doc.anim.frame;
+    for (const layer of doc.layers) {
+      layer.frames = extendFrames(layer.frames, doc.anim.frameCount, doc.width, doc.height);
+      const cell = layer.frames[frame];
+      if (!cell || cell.kind !== 'key') continue;
+      cell.data = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+      cell.mask = layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null;
+    }
+  }
+
+  loadCurrentFrame(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const frame = Math.max(0, Math.min(doc.anim.frame, doc.anim.frameCount - 1));
+    doc.anim.frame = frame;
+    for (const layer of doc.layers) {
+      layer.frames = extendFrames(layer.frames, doc.anim.frameCount, doc.width, doc.height);
+      const pixels = framePixels(layer.frames, frame);
+      const mask = frameMask(layer.frames, frame);
+      if (pixels) layer.ctx.putImageData(pixels, 0, 0);
+      else layer.ctx.clearRect(0, 0, doc.width, doc.height);
+      this.bumpPixels(layer);
+      if (mask && layer.mask && layer.maskCtx) {
+        layer.maskCtx.putImageData(mask, 0, 0);
+        this.bumpMask(layer);
+      } else if (!mask && layer.mask) {
+        layer.maskCtx?.clearRect(0, 0, doc.width, doc.height);
+        this.bumpMask(layer);
+      }
+    }
+  }
+
+  /** Before painting: turn a hold into a key so other held frames stay unchanged. */
+  ensurePaintKey(): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    if (!doc || !layer || doc.anim.frameCount < 2) return;
+    const frame = doc.anim.frame;
+    const result = ensureKeyAt(layer.frames, frame, doc.width, doc.height);
+    if (!result.created) return;
+    layer.frames = result.frames;
+    const pixels = framePixels(layer.frames, frame);
+    if (pixels) layer.ctx.putImageData(pixels, 0, 0);
+  }
+
+  setFrame(frame: number, record = false): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const next = Math.max(0, Math.min(Math.round(frame), doc.anim.frameCount - 1));
+    if (next === doc.anim.frame && !record) {
+      this.loadCurrentFrame();
+      this.invalidateStack();
+      this.renderSceneNow();
+      this.notify();
+      return;
+    }
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    doc.selection = null;
+    this.edges = null;
+    this.float = null;
+    doc.anim.frame = next;
+    this.loadCurrentFrame();
+    this.invalidateStack();
+    this.renderSceneNow();
+    if (record) this.checkpoint('Go to Frame');
+    else {
+      this.scheduleSave();
+      this.notify();
+    }
+  }
+
+  private syncFrameCount(count: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    doc.anim.frameCount = Math.max(1, count);
+    doc.anim.frame = Math.min(doc.anim.frame, doc.anim.frameCount - 1);
+    for (const layer of doc.layers) {
+      layer.frames = extendFrames(layer.frames, doc.anim.frameCount, doc.width, doc.height);
+    }
+  }
+
+  insertBlankKeyframe(at?: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    // Bar "+" inserts after the playhead; cell menu passes an explicit index.
+    const index = at == null ? doc.anim.frame + 1 : Math.max(0, Math.min(at, doc.anim.frameCount));
+    for (const layer of doc.layers) {
+      layer.frames = insertBlankKey(layer.frames, index, doc.width, doc.height);
+    }
+    this.syncFrameCount(Math.max(doc.anim.frameCount + 1, index + 1));
+    doc.anim.frame = index;
+    this.show.timeline = true;
+    this.loadCurrentFrame();
+    this.checkpoint('Insert Blank Keyframe');
+  }
+
+  insertKeyframeAt(at = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    const index = Math.max(0, Math.min(at, doc.anim.frameCount));
+    for (const layer of doc.layers) {
+      layer.frames = insertKeyframe(layer.frames, index, doc.width, doc.height);
+    }
+    this.syncFrameCount(Math.max(doc.anim.frameCount + 1, index + 1));
+    doc.anim.frame = index;
+    this.show.timeline = true;
+    this.loadCurrentFrame();
+    this.checkpoint('Insert Keyframe');
+  }
+
+  duplicateKeyframe(at = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    const index = Math.max(0, Math.min(at, doc.anim.frameCount - 1));
+    for (const layer of doc.layers) {
+      layer.frames = duplicateFrame(layer.frames, index, doc.width, doc.height);
+    }
+    this.syncFrameCount(doc.anim.frameCount + 1);
+    doc.anim.frame = index + 1;
+    this.show.timeline = true;
+    this.loadCurrentFrame();
+    this.checkpoint('Duplicate Frame');
+  }
+
+  deleteKeyframe(at = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    if (!doc) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    const index = Math.max(0, Math.min(at, doc.anim.frameCount - 1));
+    for (const layer of doc.layers) {
+      layer.frames = deleteFrame(layer.frames, index, doc.width, doc.height);
+    }
+    const nextCount = Math.max(1, doc.anim.frameCount - 1);
+    this.syncFrameCount(nextCount);
+    doc.anim.frame = Math.min(index, nextCount - 1);
+    this.loadCurrentFrame();
+    this.checkpoint('Delete Frame');
+  }
+
+  copyFrameCell(at = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    if (!doc || !layer) return;
+    this.flushCurrentFrame();
+    const pixels = framePixels(layer.frames, at);
+    if (!pixels) {
+      this.toast('Nothing to copy.');
+      return;
+    }
+    this.frameClipboard = { data: cloneImage(pixels), mask: frameMask(layer.frames, at) ? cloneImage(frameMask(layer.frames, at)!) : null };
+  }
+
+  pasteFrameCell(at = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    const clip = this.frameClipboard;
+    if (!doc || !layer || !clip) {
+      this.toast('The frame clipboard is empty.');
+      return;
+    }
+    this.flushCurrentFrame();
+    const result = ensureKeyAt(layer.frames, at, doc.width, doc.height);
+    layer.frames = result.frames;
+    const key = layer.frames[at];
+    if (key.kind === 'key') {
+      key.data = cloneImage(clip.data);
+      key.mask = clip.mask ? cloneImage(clip.mask) : null;
+    }
+    if (at === doc.anim.frame) this.loadCurrentFrame();
+    this.checkpoint('Paste Frame');
+  }
+
+  setFps(value: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const fps = Math.max(1, Math.min(60, Math.round(value) || doc.anim.fps));
+    doc.anim.fps = fps;
+    this.notify();
+  }
+
+  setOnion(on: boolean, count?: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    doc.anim.onion = on;
+    if (count != null) doc.anim.onionCount = Math.max(1, Math.min(5, Math.round(count)));
+    this.renderSceneNow();
+    this.notify();
+  }
+
+  private playTimer = 0;
+
+  togglePlayback(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    if (doc.anim.playing) this.stopPlayback();
+    else this.startPlayback();
+  }
+
+  startPlayback(): void {
+    const doc = this.doc;
+    if (!doc || doc.anim.frameCount < 1) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    doc.anim.playing = true;
+    this.notify();
+    const tick = () => {
+      const current = this.doc;
+      if (!current?.anim.playing) return;
+      const next = current.anim.frame + 1;
+      if (next >= current.anim.frameCount) {
+        if (current.anim.loop) current.anim.frame = 0;
+        else {
+          this.stopPlayback();
+          return;
+        }
+      } else current.anim.frame = next;
+      this.loadCurrentFrame();
+      this.invalidateStack();
+      this.renderSceneNow();
+      this.notify();
+      this.playTimer = window.setTimeout(tick, 1000 / current.anim.fps);
+    };
+    this.playTimer = window.setTimeout(tick, 1000 / doc.anim.fps);
+  }
+
+  stopPlayback(): void {
+    const doc = this.doc;
+    window.clearTimeout(this.playTimer);
+    this.playTimer = 0;
+    if (doc) doc.anim.playing = false;
+    this.notify();
+  }
+
+  convertSelectionToObject(): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    if (!doc || !layer) return;
+    if (doc.anim.editingObject != null) {
+      this.toast('Finish editing this object first.');
+      return;
+    }
+    const bounds = doc.selection ? boundsOf(doc.selection, doc.width, doc.height) : { x: 0, y: 0, w: doc.width, h: doc.height };
+    if (!bounds) {
+      this.toast('Select pixels to convert.');
+      return;
+    }
+    this.flushCurrentFrame();
+    const source = layer.ctx.getImageData(bounds.x, bounds.y, bounds.w, bounds.h);
+    if (doc.selection) {
+      for (let y = 0; y < bounds.h; y++) {
+        for (let x = 0; x < bounds.w; x++) {
+          if (doc.selection[(y + bounds.y) * doc.width + x + bounds.x] === 0) source.data[(y * bounds.w + x) * 4 + 3] = 0;
+        }
+      }
+    }
+    const n = doc.anim.objects.length + 1;
+    const obj: AnimObject = {
+      id: doc.anim.objectSerial++,
+      name: n === 1 ? 'Object' : `Object ${n}`,
+      width: bounds.w,
+      height: bounds.h,
+      frames: [{ kind: 'key', data: source, mask: null }],
+      bones: [],
+    };
+    doc.anim.objects.push(obj);
+    const erased = layer.ctx.getImageData(0, 0, doc.width, doc.height);
+    for (let y = 0; y < bounds.h; y++) {
+      for (let x = 0; x < bounds.w; x++) {
+        if (!doc.selection || doc.selection[(y + bounds.y) * doc.width + x + bounds.x] > 0) {
+          const i = ((y + bounds.y) * doc.width + x + bounds.x) * 4;
+          erased.data[i + 3] = 0;
+        }
+      }
+    }
+    layer.ctx.putImageData(erased, 0, 0);
+    this.bumpPixels(layer);
+    const instance: ObjectInstance = {
+      id: doc.anim.instanceSerial++,
+      objectId: obj.id,
+      layerId: layer.id,
+      startFrame: doc.anim.frame,
+      keys: [{
+        frame: doc.anim.frame,
+        transform: { x: bounds.x, y: bounds.y, scaleX: 1, scaleY: 1, rotation: 0, opacity: 100 },
+      }],
+      tweens: [],
+    };
+    doc.anim.instances.push(instance);
+    this.selectedInstance = instance.id;
+    doc.selection = null;
+    this.edges = null;
+    this.float = null;
+    this.show.timeline = true;
+    this.checkpoint('Convert to Object');
+  }
+
+  placeObjectInstance(objectId: number, x: number, y: number, frame = this.doc?.anim.frame ?? 0): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    const obj = doc?.anim.objects.find(item => item.id === objectId);
+    if (!doc || !layer || !obj) return;
+    const instance: ObjectInstance = {
+      id: doc.anim.instanceSerial++,
+      objectId: obj.id,
+      layerId: layer.id,
+      startFrame: frame,
+      keys: [{
+        frame,
+        transform: { x, y, scaleX: 1, scaleY: 1, rotation: 0, opacity: 100 },
+      }],
+      tweens: [],
+    };
+    doc.anim.instances.push(instance);
+    this.selectedInstance = instance.id;
+    this.checkpoint('Place Object');
+  }
+
+  editObject(objectId: number): void {
+    const doc = this.doc;
+    const obj = doc?.anim.objects.find(item => item.id === objectId);
+    if (!doc || !obj) return;
+    this.onBeforeFrameChange?.();
+    this.flushCurrentFrame();
+    doc.anim.editingObject = objectId;
+    this.selectedBone = null;
+    this.notify();
+    this.renderSceneNow();
+  }
+
+  leaveObjectEdit(): void {
+    const doc = this.doc;
+    if (!doc || doc.anim.editingObject == null) return;
+    this.onBeforeFrameChange?.();
+    doc.anim.editingObject = null;
+    this.selectedBone = null;
+    this.boneMode = 'pose';
+    this.notify();
+    this.renderSceneNow();
+  }
+
+  deleteObject(objectId: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    doc.anim.objects = doc.anim.objects.filter(item => item.id !== objectId);
+    doc.anim.instances = doc.anim.instances.filter(item => item.objectId !== objectId);
+    if (doc.anim.editingObject === objectId) doc.anim.editingObject = null;
+    this.checkpoint('Delete Object');
+  }
+
+  removeInstance(instanceId: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    doc.anim.instances = doc.anim.instances.filter(item => item.id !== instanceId);
+    if (this.selectedInstance === instanceId) this.selectedInstance = null;
+    this.checkpoint('Remove Instance');
+  }
+
+  setInstanceTransform(instanceId: number, transform: InstanceTransform): void {
+    const doc = this.doc;
+    const instance = doc?.anim.instances.find(item => item.id === instanceId);
+    if (!doc || !instance) return;
+    const frame = doc.anim.frame;
+    const existing = instance.keys.find(key => key.frame === frame);
+    if (existing) existing.transform = { ...transform };
+    else instance.keys.push({ frame, transform: { ...transform } });
+    instance.keys.sort((a, b) => a.frame - b.frame);
+    this.checkpoint('Transform Object');
+  }
+
+  createMotionTween(instanceId: number, from: number, to: number): void {
+    const doc = this.doc;
+    const instance = doc?.anim.instances.find(item => item.id === instanceId);
+    if (!doc || !instance) {
+      this.toast('Convert to an object to tween it');
+      return;
+    }
+    const a = Math.min(from, to);
+    const b = Math.max(from, to);
+    if (!instance.keys.some(key => key.frame === a) || !instance.keys.some(key => key.frame === b)) {
+      this.toast('Motion tween needs two keys.');
+      return;
+    }
+    instance.tweens = instance.tweens.filter(item => !(item.from === a && item.to === b));
+    instance.tweens.push({ from: a, to: b, ease: 'ease-in-out' });
+    this.selectedTween = { instanceId, from: a, to: b };
+    this.checkpoint('Create Motion Tween');
+  }
+
+  clearMotionTween(instanceId: number, from: number, to: number): void {
+    const doc = this.doc;
+    const instance = doc?.anim.instances.find(item => item.id === instanceId);
+    if (!doc || !instance) return;
+    instance.tweens = instance.tweens.filter(item => !(item.from === from && item.to === to));
+    this.selectedTween = null;
+    this.checkpoint('Clear Tween');
+  }
+
+  setTweenEase(instanceId: number, from: number, to: number, ease: EaseName, curve?: number[]): void {
+    const doc = this.doc;
+    const instance = doc?.anim.instances.find(item => item.id === instanceId);
+    const tween = instance?.tweens.find(item => item.from === from && item.to === to);
+    if (!tween) return;
+    tween.ease = ease;
+    tween.curve = ease === 'custom' ? curve : undefined;
+    this.renderSceneNow();
+    this.notify();
+  }
+
+  addBone(x0: number, y0: number, x1: number, y1: number): void {
+    const doc = this.doc;
+    if (!doc) return;
+    let objectId = doc.anim.editingObject;
+    if (objectId == null) {
+      this.convertSelectionToObject();
+      objectId = doc.anim.objects[doc.anim.objects.length - 1]?.id ?? null;
+      if (objectId != null) this.editObject(objectId);
+    }
+    const obj = doc.anim.objects.find(item => item.id === objectId);
+    if (!obj) return;
+    const length = Math.hypot(x1 - x0, y1 - y0);
+    if (length < 4) return;
+    const angle = Math.atan2(y1 - y0, x1 - x0) * 180 / Math.PI;
+    let parent: number | null = null;
+    for (const bone of obj.bones) {
+      const tip = tipOf(bone);
+      if (Math.hypot(x0 - tip.x, y0 - tip.y) < 8 || Math.hypot(x0 - bone.x, y0 - bone.y) < 8) {
+        parent = bone.id;
+        break;
+      }
+    }
+    const bone = defaultBone(doc.anim.boneSerial++, x0, y0, length, angle, parent);
+    obj.bones.push(bone);
+    this.selectedBone = bone.id;
+    this.checkpoint('Add Bone');
+  }
+
+  deleteBone(boneId: number): void {
+    const doc = this.doc;
+    const obj = doc?.anim.objects.find(item => item.id === doc.anim.editingObject);
+    if (!doc || !obj) return;
+    const doomed = obj.bones.find(item => item.id === boneId);
+    if (!doomed) return;
+    for (const bone of obj.bones) {
+      if (bone.parent === boneId) bone.parent = doomed.parent;
+    }
+    obj.bones = obj.bones.filter(item => item.id !== boneId);
+    if (this.selectedBone === boneId) this.selectedBone = null;
+    this.checkpoint('Delete Bone');
+  }
+
+  poseBone(boneId: number, angle: number): void {
+    const doc = this.doc;
+    const obj = doc?.anim.objects.find(item => item.id === doc.anim.editingObject);
+    const bone = obj?.bones.find(item => item.id === boneId);
+    if (!doc || !obj || !bone) return;
+    bone.angle = angle;
+    const instance = doc.anim.instances.find(item => item.objectId === obj.id);
+    if (instance) {
+      let key = instance.keys.find(item => item.frame === doc.anim.frame);
+      if (!key) {
+        key = { frame: doc.anim.frame, transform: transformAt(instance, doc.anim.frame), bones: [] };
+        instance.keys.push(key);
+        instance.keys.sort((a, b) => a.frame - b.frame);
+      }
+      key.bones = obj.bones.map(item => ({
+        id: item.id,
+        angle: item.angle,
+        bend: item.bend,
+        stretch: 1 + item.stretch / 100,
+      }));
+    }
+    this.renderSceneNow();
+    this.notify();
+  }
+
+  breakApartInstance(instanceId: number): void {
+    const doc = this.doc;
+    const layer = this.layer;
+    const instance = doc?.anim.instances.find(item => item.id === instanceId);
+    const obj = instance ? doc?.anim.objects.find(item => item.id === instance.objectId) : null;
+    if (!doc || !layer || !instance || !obj) return;
+    const transform = transformAt(instance, doc.anim.frame);
+    const local = Math.max(0, doc.anim.frame - instance.startFrame);
+    const pixels = framePixels(obj.frames, Math.min(local, obj.frames.length - 1));
+    if (!pixels) return;
+    const temp = document.createElement('canvas');
+    temp.width = pixels.width;
+    temp.height = pixels.height;
+    context2d(temp).putImageData(pixels, 0, 0);
+    layer.ctx.save();
+    layer.ctx.translate(transform.x + pixels.width / 2, transform.y + pixels.height / 2);
+    layer.ctx.rotate(transform.rotation * Math.PI / 180);
+    layer.ctx.scale(transform.scaleX, transform.scaleY);
+    layer.ctx.globalAlpha = transform.opacity / 100;
+    layer.ctx.drawImage(temp, -pixels.width / 2, -pixels.height / 2);
+    layer.ctx.restore();
+    this.bumpPixels(layer);
+    doc.anim.instances = doc.anim.instances.filter(item => item.id !== instanceId);
+    this.selectedInstance = null;
+    this.checkpoint('Break Apart');
   }
 
   newDocument(width: number, height: number, background: string, name = 'Untitled'): boolean {
@@ -1041,14 +1598,102 @@ export class Editor {
     paint.globalAlpha = 1;
     paint.globalCompositeOperation = 'source-over';
     paint.clearRect(0, 0, doc.width, doc.height);
-    this.blitStack(paint, doc, this.splitReady(doc));
+    if (doc.anim.onion && !doc.anim.playing) this.paintOnion(paint, doc);
+    this.blitStack(paint, doc, this.splitReady(doc) && !doc.anim.onion);
+    this.paintInstances(paint, doc);
     paint.restore();
     if (rect && target !== this.view) {
       this.partialPaints++;
       ctx.putImageData(paint.getImageData(rect.x, rect.y, rect.w, rect.h), rect.x, rect.y);
     }
     this.paintOverlay();
+    this.paintBonesOverlay();
     this.onScene?.();
+  }
+
+  private paintOnion(ctx: CanvasRenderingContext2D, doc: Doc): void {
+    const count = doc.anim.onionCount;
+    const frame = doc.anim.frame;
+    const drawSide = (offset: number, tint: string) => {
+      const index = frame + offset;
+      if (index < 0 || index >= doc.anim.frameCount || index === frame) return;
+      for (const layer of doc.layers) {
+        if (!this.layerShown(layer)) continue;
+        const pixels = framePixels(layer.frames, index);
+        if (!pixels) continue;
+        const temp = document.createElement('canvas');
+        temp.width = doc.width;
+        temp.height = doc.height;
+        context2d(temp).putImageData(pixels, 0, 0);
+        ctx.save();
+        ctx.globalAlpha = 0.28;
+        ctx.drawImage(temp, 0, 0);
+        ctx.globalCompositeOperation = 'source-atop';
+        ctx.fillStyle = tint;
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(0, 0, doc.width, doc.height);
+        ctx.restore();
+      }
+    };
+    for (let i = count; i >= 1; i--) drawSide(-i, '#4a90d9');
+    for (let i = 1; i <= count; i++) drawSide(i, '#d94a4a');
+  }
+
+  private paintInstances(ctx: CanvasRenderingContext2D, doc: Doc): void {
+    for (const instance of doc.anim.instances) {
+      const obj = doc.anim.objects.find(item => item.id === instance.objectId);
+      if (!obj) continue;
+      const local = Math.max(0, doc.anim.frame - instance.startFrame);
+      const pixels = framePixels(obj.frames, Math.min(local, obj.frames.length - 1));
+      if (!pixels) continue;
+      const transform = transformAt(instance, doc.anim.frame);
+      const key = instance.keys.find(item => item.frame === doc.anim.frame);
+      let image = pixels;
+      if (obj.bones.length) {
+        const deformed = blankImage(pixels.width, pixels.height);
+        deformByBones(pixels, obj.bones, key?.bones, deformed);
+        image = deformed;
+      }
+      const temp = document.createElement('canvas');
+      temp.width = image.width;
+      temp.height = image.height;
+      context2d(temp).putImageData(image, 0, 0);
+      ctx.save();
+      ctx.globalAlpha = transform.opacity / 100;
+      ctx.translate(transform.x + image.width / 2, transform.y + image.height / 2);
+      ctx.rotate(transform.rotation * Math.PI / 180);
+      ctx.scale(transform.scaleX, transform.scaleY);
+      ctx.drawImage(temp, -image.width / 2, -image.height / 2);
+      ctx.restore();
+    }
+  }
+
+  private paintBonesOverlay(): void {
+    const doc = this.doc;
+    if (!doc || !this.overlay || !doc.anim.editingObject) return;
+    const obj = doc.anim.objects.find(item => item.id === doc.anim.editingObject);
+    if (!obj?.bones.length) return;
+    const ctx = this.overlay.getContext('2d');
+    if (!ctx) return;
+    for (const bone of obj.bones) {
+      const tip = tipOf(bone);
+      ctx.save();
+      ctx.strokeStyle = bone.id === this.selectedBone ? '#1c71d8' : '#888';
+      ctx.lineWidth = bone.soft ? 2 : 3;
+      ctx.beginPath();
+      ctx.moveTo(bone.x, bone.y);
+      if (bone.soft) {
+        const midX = (bone.x + tip.x) / 2 + Math.sin(bone.angle * Math.PI / 180) * 6;
+        const midY = (bone.y + tip.y) / 2 - Math.cos(bone.angle * Math.PI / 180) * 6;
+        ctx.quadraticCurveTo(midX, midY, tip.x, tip.y);
+      } else ctx.lineTo(tip.x, tip.y);
+      ctx.stroke();
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.beginPath();
+      ctx.arc(bone.x, bone.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
   }
 
   rememberTool(): void {
@@ -2503,6 +3148,7 @@ export class Editor {
     }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
+    this.paintInstances(ctx, doc);
     return canvas;
   }
 
@@ -2584,6 +3230,23 @@ export class Editor {
       const layer = snapshot.layers[layerIndex];
       const file = `history/${step}/${layerIndex}.png`;
       files.push({ name: file, data: await this.imagePng(layer.data) });
+      const frameMeta = [];
+      for (let frame = 0; frame < (layer.frames?.length ?? 0); frame++) {
+        const cell = layer.frames[frame];
+        if (cell.kind === 'hold') {
+          frameMeta.push({ kind: 'hold', from: cell.from });
+          continue;
+        }
+        const frameFile = `history/${step}/${layerIndex}/f${frame}.png`;
+        files.push({ name: frameFile, data: await this.imagePng(cell.data) });
+        const entry: Record<string, unknown> = { kind: 'key', file: frameFile };
+        if (cell.mask) {
+          const maskFile = `history/${step}/${layerIndex}/f${frame}-mask.png`;
+          files.push({ name: maskFile, data: await this.imagePng(cell.mask) });
+          entry.mask = maskFile;
+        }
+        frameMeta.push(entry);
+      }
       const record: Record<string, unknown> = {
         name: layer.name,
         visible: layer.visible,
@@ -2594,6 +3257,7 @@ export class Editor {
         parent: layer.parent ?? null,
         alphaLock: !!layer.alphaLock,
         file,
+        frames: frameMeta,
       };
       if (layer.mask) {
         const mask = `history/${step}/${layerIndex}-mask.png`;
@@ -2610,6 +3274,32 @@ export class Editor {
       selection: snapshot.selection ? bytesToBase64(snapshot.selection) : null,
       groups: snapshot.groups ?? [],
       layers,
+      anim: this.animRecord(snapshot.anim),
+    };
+  }
+
+  private animRecord(anim: AnimState): Record<string, unknown> {
+    return {
+      frame: anim.frame,
+      frameCount: anim.frameCount,
+      fps: anim.fps,
+      loop: anim.loop,
+      onion: anim.onion,
+      onionCount: anim.onionCount,
+      timelineZoom: anim.timelineZoom,
+      objectSerial: anim.objectSerial,
+      instanceSerial: anim.instanceSerial,
+      boneSerial: anim.boneSerial,
+      editingObject: anim.editingObject,
+      objects: anim.objects.map(obj => ({
+        id: obj.id,
+        name: obj.name,
+        width: obj.width,
+        height: obj.height,
+        bones: obj.bones,
+        frames: obj.frames.map(cell => cell.kind === 'hold' ? { kind: 'hold', from: cell.from } : { kind: 'key' }),
+      })),
+      instances: anim.instances,
     };
   }
 
@@ -2644,6 +3334,36 @@ export class Editor {
         mask,
       });
     }
+    this.flushCurrentFrame();
+    const animLayers = [];
+    for (const layer of doc.layers) {
+      const frames = [];
+      for (let frame = 0; frame < layer.frames.length; frame++) {
+        const cell = layer.frames[frame];
+        if (cell.kind === 'hold') {
+          frames.push({ kind: 'hold', from: cell.from });
+          continue;
+        }
+        const file = `frames/${layer.id}/${frame}.png`;
+        files.push({ name: file, data: await this.imagePng(cell.data) });
+        const entry: Record<string, unknown> = { kind: 'key', file };
+        if (cell.mask) {
+          const mask = `frames/${layer.id}/${frame}-mask.png`;
+          files.push({ name: mask, data: await this.imagePng(cell.mask) });
+          entry.mask = mask;
+        }
+        frames.push(entry);
+      }
+      animLayers.push({ id: layer.id, frames });
+    }
+    for (const obj of doc.anim.objects) {
+      for (let frame = 0; frame < obj.frames.length; frame++) {
+        const cell = obj.frames[frame];
+        if (cell.kind !== 'key') continue;
+        const file = `objects/${obj.id}/${frame}.png`;
+        files.push({ name: file, data: await this.imagePng(cell.data) });
+      }
+    }
     const history = [];
     for (let step = 0; step < doc.snapshots.length; step++) {
       history.push(await this.historyRecord(doc, step, files));
@@ -2663,6 +3383,7 @@ export class Editor {
       settings: this.settingsRecord(),
       groups: doc.groups.map(group => ({ ...group })),
       layers: layerFiles,
+      animation: { ...this.animRecord(doc.anim), layers: animLayers },
       history: { cursor: doc.cursor, steps: history },
     };
     files.unshift({ name: 'manifest.json', data: new TextEncoder().encode(JSON.stringify(manifest)) });
@@ -2870,7 +3591,7 @@ export class Editor {
     if (typeof data.snap === 'boolean') this.snap = data.snap;
     if (data.show && typeof data.show === 'object') {
       const show = data.show as Record<string, unknown>;
-      for (const key of ['rulers', 'status', 'tools', 'toolbar', 'docks', 'tabs', 'grid'] as const) {
+      for (const key of ['rulers', 'status', 'tools', 'toolbar', 'docks', 'tabs', 'grid', 'timeline'] as const) {
         if (typeof show[key] === 'boolean') this.show[key] = show[key];
       }
     }
@@ -2937,6 +3658,25 @@ export class Editor {
       const item = row as Record<string, unknown>;
       const file = typeof item.file === 'string' ? files.get(item.file) : undefined;
       const mask = typeof item.mask === 'string' ? files.get(item.mask) : undefined;
+      const data = file ? await imageFromPng(file) : new ImageData(width, height);
+      const maskData = mask ? await imageFromPng(mask) : null;
+      const frameRows = Array.isArray(item.frames) ? item.frames : [];
+      const frames: FrameCell[] = [];
+      for (const frameRow of frameRows) {
+        if (!frameRow || typeof frameRow !== 'object') continue;
+        const cell = frameRow as Record<string, unknown>;
+        if (cell.kind === 'hold') {
+          frames.push({ kind: 'hold', from: Number(cell.from) || 0 });
+          continue;
+        }
+        const frameFile = typeof cell.file === 'string' ? files.get(cell.file) : undefined;
+        const frameMask = typeof cell.mask === 'string' ? files.get(cell.mask) : undefined;
+        frames.push({
+          kind: 'key',
+          data: frameFile ? await imageFromPng(frameFile) : cloneImage(data),
+          mask: frameMask ? await imageFromPng(frameMask) : null,
+        });
+      }
       layers.push({
         name: typeof item.name === 'string' ? item.name : 'Layer',
         visible: item.visible !== false,
@@ -2946,10 +3686,14 @@ export class Editor {
         tag: typeof item.tag === 'string' ? item.tag : null,
         parent: typeof item.parent === 'number' ? item.parent : null,
         alphaLock: !!item.alphaLock,
-        data: file ? await imageFromPng(file) : new ImageData(width, height),
-        mask: mask ? await imageFromPng(mask) : null,
+        data,
+        mask: maskData,
+        frames: frames.length ? frames : [{ kind: 'key', data: cloneImage(data), mask: maskData ? cloneImage(maskData) : null }],
       });
     }
+    const anim = record.anim && typeof record.anim === 'object'
+      ? this.parseAnimMeta(record.anim as Record<string, unknown>)
+      : blankAnim();
     return {
       width,
       height,
@@ -2957,7 +3701,86 @@ export class Editor {
       selection: this.selectionText(record.selection),
       groups,
       layers,
+      anim,
     };
+  }
+
+  private parseAnimMeta(raw: Record<string, unknown>): AnimState {
+    const anim = blankAnim();
+    anim.frame = Number(raw.frame) || 0;
+    anim.frameCount = Math.max(1, Number(raw.frameCount) || 1);
+    anim.fps = Math.max(1, Math.min(60, Number(raw.fps) || 12));
+    anim.loop = !!raw.loop;
+    anim.onion = !!raw.onion;
+    anim.onionCount = Math.max(1, Math.min(5, Number(raw.onionCount) || 1));
+    anim.timelineZoom = Number(raw.timelineZoom) || 1;
+    anim.objectSerial = Number(raw.objectSerial) || 1;
+    anim.instanceSerial = Number(raw.instanceSerial) || 1;
+    anim.boneSerial = Number(raw.boneSerial) || 1;
+    anim.editingObject = typeof raw.editingObject === 'number' ? raw.editingObject : null;
+    if (Array.isArray(raw.instances)) anim.instances = raw.instances as AnimState['instances'];
+    if (Array.isArray(raw.objects)) {
+      anim.objects = (raw.objects as Array<Record<string, unknown>>).map(obj => ({
+        id: Number(obj.id) || 0,
+        name: typeof obj.name === 'string' ? obj.name : 'Object',
+        width: Number(obj.width) || 1,
+        height: Number(obj.height) || 1,
+        bones: Array.isArray(obj.bones) ? obj.bones as Bone[] : [],
+        frames: [{ kind: 'key' as const, data: blankImage(Number(obj.width) || 1, Number(obj.height) || 1), mask: null }],
+      }));
+    }
+    return anim;
+  }
+
+  private async installAnimation(doc: Doc, raw: unknown, files: Map<string, Uint8Array>): Promise<void> {
+    if (!raw || typeof raw !== 'object') {
+      for (const layer of doc.layers) {
+        layer.frames = [{
+          kind: 'key',
+          data: layer.ctx.getImageData(0, 0, doc.width, doc.height),
+          mask: layer.maskCtx ? layer.maskCtx.getImageData(0, 0, doc.width, doc.height) : null,
+        }];
+      }
+      doc.anim = blankAnim();
+      return;
+    }
+    const record = raw as Record<string, unknown>;
+    doc.anim = this.parseAnimMeta(record);
+    const layerRows = Array.isArray(record.layers) ? record.layers : [];
+    for (const row of layerRows) {
+      if (!row || typeof row !== 'object') continue;
+      const item = row as Record<string, unknown>;
+      const layer = doc.layers.find(entry => entry.id === Number(item.id));
+      if (!layer || !Array.isArray(item.frames)) continue;
+      const frames: FrameCell[] = [];
+      for (const frameRow of item.frames) {
+        if (!frameRow || typeof frameRow !== 'object') continue;
+        const cell = frameRow as Record<string, unknown>;
+        if (cell.kind === 'hold') {
+          frames.push({ kind: 'hold', from: Number(cell.from) || 0 });
+          continue;
+        }
+        const file = typeof cell.file === 'string' ? files.get(cell.file) : undefined;
+        const mask = typeof cell.mask === 'string' ? files.get(cell.mask) : undefined;
+        frames.push({
+          kind: 'key',
+          data: file ? await imageFromPng(file) : blankImage(doc.width, doc.height),
+          mask: mask ? await imageFromPng(mask) : null,
+        });
+      }
+      if (frames.length) layer.frames = extendFrames(frames, doc.anim.frameCount, doc.width, doc.height);
+    }
+    for (const obj of doc.anim.objects) {
+      const frames: FrameCell[] = [];
+      for (let frame = 0; ; frame++) {
+        const file = files.get(`objects/${obj.id}/${frame}.png`);
+        if (!file) break;
+        frames.push({ kind: 'key', data: await imageFromPng(file), mask: null });
+      }
+      if (frames.length) obj.frames = frames;
+    }
+    this.loadCurrentFrame();
+    if (doc.anim.frameCount > 1) this.show.timeline = true;
   }
 
   private async installHistory(doc: Doc, history: { cursor?: number; steps?: unknown[] } | undefined, files: Map<string, Uint8Array>): Promise<void> {
@@ -3149,6 +3972,7 @@ export class Editor {
       }
       if (!doc.layers.length) doc.layers = [this.makeLayer('Layer 1', true, 100)];
       doc.active = Math.max(0, Math.min(Number(info.active) || 0, doc.layers.length - 1));
+      await this.installAnimation(doc, (manifest as { animation?: unknown }).animation, files);
       await this.installHistory(doc, manifest.history, files);
       return true;
     } catch {
